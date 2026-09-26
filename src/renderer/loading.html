@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;"
+    />
+    <title>DSH Desktop</title>
+    <style>
+      :root {
+        --bg: #f6f7f9;
+        --card: #ffffff;
+        --text: #1b1d22;
+        --muted: #6b7280;
+        --faint: #9ca3af;
+        --line: #e8eaee;
+        --brand: #4d6bfe;
+        --brand-2: #8a6bff;
+        --brand-soft: rgba(77, 107, 254, 0.1);
+        --ok: #16a34a;
+        --ok-soft: rgba(22, 163, 74, 0.12);
+        --danger: #d92d20;
+        --danger-soft: rgba(217, 45, 32, 0.08);
+        --code: #f3f4f6;
+        --shadow: 0 24px 70px rgba(24, 39, 75, 0.08), 0 2px 8px rgba(24, 39, 75, 0.04);
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14161b;
+          --card: #1e2127;
+          --text: #ecedf0;
+          --muted: #9aa1ad;
+          --faint: #6b7280;
+          --line: #2c3038;
+          --brand: #7b90ff;
+          --brand-2: #a68bff;
+          --brand-soft: rgba(123, 144, 255, 0.14);
+          --ok: #4ade80;
+          --ok-soft: rgba(74, 222, 128, 0.14);
+          --danger: #ff6b5e;
+          --danger-soft: rgba(255, 107, 94, 0.12);
+          --code: #262a31;
+          --shadow: 0 24px 70px rgba(0, 0, 0, 0.4), 0 2px 8px rgba(0, 0, 0, 0.3);
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      /* 背景光斑：给素底一点纵深 */
+      .blob {
+        position: fixed; border-radius: 50%; filter: blur(90px);
+        opacity: 0.5; pointer-events: none;
+      }
+      .blob.a { width: 480px; height: 480px; left: -140px; bottom: -180px;
+        background: radial-gradient(circle, var(--brand-soft), transparent 70%); }
+      .blob.b { width: 420px; height: 420px; right: -120px; top: -160px;
+        background: radial-gradient(circle, rgba(138, 107, 255, 0.12), transparent 70%); }
+
+      .wrap { position: relative; width: 100%; max-width: 560px; padding: 32px; }
+
+      .brand { display: flex; align-items: center; gap: 13px; margin-bottom: 24px; }
+      .mark {
+        width: 44px; height: 44px; border-radius: 12px; flex: none;
+        background: linear-gradient(135deg, #4d6bfe, #6d8aff);
+        display: grid; place-items: center;
+        box-shadow: 0 8px 22px rgba(77, 107, 254, 0.32);
+        animation: breathe 3.2s ease-in-out infinite;
+      }
+      .mark svg { width: 22px; height: 22px; }
+      @keyframes breathe {
+        0%, 100% { transform: scale(1); }
+        50% { transform: scale(1.05); }
+      }
+      .brand h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: 0.2px; }
+      .brand p { margin: 1px 0 0; font-size: 12px; color: var(--muted); }
+
+      .card {
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        padding: 24px 26px;
+        box-shadow: var(--shadow);
+      }
+
+      /* ── 启动中 ─────────────────────────────────────────────── */
+      .row { display: flex; align-items: center; gap: 14px; }
+      .spinner {
+        width: 22px; height: 22px; flex: none; border-radius: 50%;
+        background: conic-gradient(from 0deg, var(--brand-soft), var(--brand));
+        -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2.5px));
+        mask: radial-gradient(farthest-side, transparent calc(100% - 2.5px), #000 calc(100% - 2.5px));
+        animation: spin 0.9s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .status-main { font-size: 15px; font-weight: 600; transition: opacity 0.2s; }
+      .status-sub { color: var(--muted); font-size: 12.5px; margin-top: 3px; }
+
+      .bar {
+        margin-top: 20px; height: 4px; border-radius: 999px;
+        background: var(--brand-soft); overflow: hidden; position: relative;
+      }
+      .bar span {
+        position: absolute; top: 0; left: 0; height: 100%; width: 36%;
+        border-radius: 999px;
+        background: linear-gradient(90deg, transparent, var(--brand) 40%, var(--brand-2) 80%, transparent);
+        animation: slide 1.6s cubic-bezier(0.45, 0, 0.55, 1) infinite;
+      }
+      @keyframes slide {
+        0% { transform: translateX(-110%); }
+        100% { transform: translateX(310%); }
+      }
+
+      /* 竖向步骤条：圆点 + 连接线 */
+      .steps { margin: 18px 2px 0; padding: 0; list-style: none; font-size: 13px; }
+      .step { position: relative; padding: 0 0 18px 30px; color: var(--muted); transition: color 0.25s; }
+      .step:last-child { padding-bottom: 2px; }
+      .step::before {
+        /* 连接线 */
+        content: ""; position: absolute; left: 9px; top: 18px; bottom: -2px;
+        width: 2px; background: var(--line); border-radius: 2px;
+      }
+      .step:last-child::before { display: none; }
+      .step .dot {
+        position: absolute; left: 0; top: 1px;
+        width: 20px; height: 20px; border-radius: 50%;
+        display: grid; place-items: center;
+        border: 2px solid var(--line); background: var(--card);
+        color: transparent; font-size: 11px; font-weight: 700;
+        box-sizing: border-box; transition: all 0.25s;
+      }
+      .step.done { color: var(--text); }
+      .step.done .dot { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); }
+      .step.done::before { background: var(--ok-soft); }
+      .step.active { color: var(--text); font-weight: 600; }
+      .step.active .dot { border-color: var(--brand); color: transparent; }
+      .step.active .dot::after {
+        content: ""; position: absolute; inset: 0; margin: auto;
+        width: 8px; height: 8px; border-radius: 50%;
+        background: var(--brand); animation: pulse 1.2s ease-in-out infinite;
+      }
+      @keyframes pulse {
+        0%, 100% { transform: scale(1); opacity: 1; }
+        50% { transform: scale(1.35); opacity: 0.55; }
+      }
+
+      .chip {
+        display: none; margin-left: 10px; vertical-align: 1px;
+        font-size: 11.5px; color: var(--brand); background: var(--brand-soft);
+        border-radius: 999px; padding: 1px 9px; font-weight: 600;
+        font-variant-numeric: tabular-nums;
+      }
+      .chip.show { display: inline-block; }
+
+      /* ── 错误态 ─────────────────────────────────────────────── */
+      .err-head { display: flex; gap: 12px; align-items: flex-start; }
+      .err-icon {
+        width: 36px; height: 36px; border-radius: 10px; flex: none;
+        background: var(--danger-soft); color: var(--danger);
+        display: grid; place-items: center;
+      }
+      .err-icon svg { width: 20px; height: 20px; }
+      .err-head h2 { margin: 0; font-size: 15px; }
+      .err-msg {
+        margin-top: 14px; font-size: 13px; line-height: 1.7;
+        background: var(--code); border-radius: 10px; padding: 10px 14px;
+        word-break: break-all;
+      }
+      .block { margin-top: 16px; }
+      .block h3 { margin: 0 0 6px; font-size: 12px; color: var(--muted); font-weight: 600; letter-spacing: 0.4px; }
+      .block ul { margin: 0; padding-left: 18px; font-size: 13px; }
+      .block li { margin: 3px 0; }
+      .block code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+      .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 22px; }
+      button {
+        font: inherit; font-size: 13px; padding: 8px 16px; border-radius: 9px;
+        border: 1px solid var(--line); background: var(--card); color: var(--text);
+        cursor: pointer; transition: all 0.15s;
+      }
+      button:hover { border-color: var(--brand); color: var(--brand); }
+      button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+      button.primary:hover { filter: brightness(1.08); color: #fff; }
+
+      .foot { margin-top: 16px; font-size: 12px; color: var(--faint); text-align: center; }
+    </style>
+  </head>
+  <body>
+    <div class="blob a"></div>
+    <div class="blob b"></div>
+
+    <div class="wrap">
+      <div class="brand">
+        <div class="mark">
+          <svg viewBox="0 0 24 24" fill="none" aria-label="DeepSeek"><path d="M23.748 4.651c-.254-.124-.364.113-.512.233-.051.04-.094.09-.137.137-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.155-.708-.311-.955-.65-.172-.24-.219-.509-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.094.172.187.129.323-.082.28-.18.553-.266.833-.055.179-.137.218-.328.14a5.5 5.5 0 0 1-1.737-1.179c-.857-.828-1.631-1.743-2.597-2.46a12 12 0 0 0-.689-.47c-.985-.957.13-1.743.387-1.836.27-.098.094-.433-.778-.428-.872.003-1.67.295-2.687.685a3 3 0 0 1-.465.136 9.6 9.6 0 0 0-2.883-.101c-1.885.21-3.39 1.1-4.497 2.622C.082 8.776-.231 10.854.152 13.02c.403 2.284 1.568 4.175 3.36 5.653 1.857 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.132-.284 4.994-1.86.47.234.962.328 1.78.398.629.058 1.235-.031 1.705-.129.735-.155.684-.836.418-.961-2.155-1.004-1.682-.595-2.112-.926 1.095-1.295 2.768-3.598 3.284-6.733.05-.346.115-.834.108-1.114-.004-.171.035-.238.23-.257a4.2 4.2 0 0 0 1.545-.475c1.397-.763 1.96-2.016 2.093-3.517.02-.23-.004-.467-.247-.588M11.58 18.168c-2.088-1.642-3.101-2.183-3.52-2.16-.39.024-.32.472-.234.763.09.288.207.487.371.74.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.168-1.361-.801-2.5-1.86-3.301-3.306-.775-1.393-1.225-2.888-1.299-4.482-.02-.385.094-.522.477-.592a4.7 4.7 0 0 1 1.53-.038c2.131.311 3.946 1.264 5.467 2.774.868.86 1.525 1.887 2.202 2.89.72 1.066 1.494 2.082 2.48 2.915.348.291.626.513.892.677-.802.09-2.14.109-3.055-.615zm1.001-6.44a.306.306 0 0 1 .415-.287.3.3 0 0 1 .113.074.3.3 0 0 1 .086.214c0 .17-.136.307-.308.307a.303.303 0 0 1-.306-.307m3.11 1.596c-.2.081-.4.151-.591.16a1.25 1.25 0 0 1-.798-.254c-.274-.23-.47-.358-.551-.758a1.7 1.7 0 0 1 .015-.588c.07-.327-.007-.537-.238-.727-.188-.156-.426-.199-.689-.199a.6.6 0 0 1-.254-.078.253.253 0 0 1-.114-.358 1 1 0 0 1 .192-.21c.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.392.451.462.576.685.915.176.264.336.536.446.848.066.194-.02.353-.25.45" fill="#ffffff"/></svg>
+        </div>
+        <div>
+          <h1>DSH Desktop</h1>
+          <p>DeepSeek Harness 桌面版</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <!-- 启动中 -->
+        <div id="loading">
+          <div class="row">
+            <div class="spinner" id="spin"></div>
+            <div>
+              <div class="status-main" id="loading-main">正在启动本地服务…</div>
+              <div class="status-sub">
+                <span id="loading-sub">首次启动可能需要十几秒</span><span class="chip" id="elapsed"></span>
+              </div>
+            </div>
+          </div>
+          <div class="bar"><span></span></div>
+          <ul class="steps">
+            <li id="step-env" class="step done"><span class="dot">✓</span>校验运行环境</li>
+            <li id="step-spawn" class="step active"><span class="dot">✓</span>启动 Harness 服务进程</li>
+            <li id="step-ui" class="step"><span class="dot">✓</span>加载 Web 界面</li>
+          </ul>
+        </div>
+
+        <!-- 错误 -->
+        <div id="error" hidden>
+          <div class="err-head">
+            <div class="err-icon">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M12 8.5v5m0 3.4v.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/>
+              </svg>
+            </div>
+            <div>
+              <h2 id="err-title">启动失败</h2>
+              <div class="status-sub">本地服务未能就绪</div>
+            </div>
+          </div>
+          <div class="err-msg" id="err-msg"></div>
+
+          <div class="block" id="err-problems-wrap" hidden>
+            <h3>可能的原因</h3>
+            <ul id="err-problems"></ul>
+          </div>
+
+          <div class="block" id="err-hints-wrap" hidden>
+            <h3>修复建议</h3>
+            <ul id="err-hints"></ul>
+          </div>
+
+          <div class="actions">
+            <button class="primary" id="btn-retry">重试</button>
+            <button id="btn-logs">打开日志目录</button>
+            <button id="btn-data">打开数据目录</button>
+            <button id="btn-copy">复制诊断信息</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="foot" id="foot"></div>
+    </div>
+
+    <script>
+      (function () {
+        var api = window.dshDesktop;
+        var $ = function (id) { return document.getElementById(id); };
+        var lastState = '';
+
+        function setSteps(state) {
+          var env = $('step-env'), spawn = $('step-spawn'), ui = $('step-ui');
+          var cls = ['step', 'step', 'step'];
+          if (state === 'starting') cls = ['step done', 'step active', 'step'];
+          else if (state === 'ready') cls = ['step done', 'step done', 'step active'];
+          else cls = ['step done', 'step done', 'step done'];
+          [env, spawn, ui].forEach(function (el, i) { el.className = cls[i]; });
+          // 就绪时把 spinner 换成绿色对勾
+          var spin = $('spin');
+          if (state === 'ready') {
+            spin.style.animation = 'none';
+            spin.style.background = 'var(--ok-soft)';
+            spin.style.webkitMask = 'none';
+            spin.style.mask = 'none';
+            spin.innerHTML = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none">' +
+              '<path d="M5 12.5 10 17.5 19 7" stroke="#16a34a" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+          } else {
+            spin.style.animation = '';
+            spin.style.background = '';
+            spin.style.webkitMask = '';
+            spin.style.mask = '';
+            spin.innerHTML = '';
+          }
+        }
+
+        function render(status) {
+          if (!status) return;
+          lastState = status.state;
+          setSteps(status.state);
+
+          if (status.state === 'failed') {
+            $('loading').hidden = true;
+            $('error').hidden = false;
+            $('err-msg').textContent = status.message || '未知错误';
+
+            var probs = status.problems || [];
+            $('err-problems-wrap').hidden = probs.length === 0;
+            $('err-problems').innerHTML = probs.map(function (p) {
+              return '<li>' + escapeHtml(p) + '</li>';
+            }).join('');
+
+            var hints = status.hints || [];
+            $('err-hints-wrap').hidden = hints.length === 0;
+            $('err-hints').innerHTML = hints.map(function (h) {
+              return '<li>' + escapeHtml(h) + '</li>';
+            }).join('');
+            return;
+          }
+
+          $('error').hidden = true;
+          $('loading').hidden = false;
+
+          if (status.state === 'starting') {
+            $('loading-main').textContent = '正在启动本地服务…';
+            $('loading-sub').textContent = status.message || '首次启动可能需要十几秒';
+            tick();
+          } else if (status.state === 'ready') {
+            $('loading-main').textContent = '服务已就绪，正在加载界面…';
+            $('loading-sub').textContent = '端口 ' + (status.port || '') + ' · 本机私有连接';
+          } else if (status.state === 'stopping') {
+            $('loading-main').textContent = '正在停止服务…';
+          }
+        }
+
+        // 慢盘 / 杀软实时扫描环境下，首次初始化可能持续数分钟。
+        // 已等待时间用小徽章持续显示（不覆盖状态消息），让用户确知进程仍在工作。
+        var startedAt = Date.now();
+        function tick() {
+          if (lastState !== 'starting') { $('elapsed').classList.remove('show'); return; }
+          var secs = Math.round((Date.now() - startedAt) / 1000);
+          if (secs < 20) return;
+          var mins = Math.floor(secs / 60);
+          var rest = secs % 60;
+          var shown = mins > 0 ? mins + '′' + (rest > 0 ? rest + '″' : '') : secs + 's';
+          var chip = $('elapsed');
+          chip.textContent = '已等待 ' + shown;
+          chip.classList.add('show');
+        }
+        setInterval(tick, 1000);
+
+        function escapeHtml(s) {
+          return String(s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+          });
+        }
+
+        if (api) {
+          api.onStatus(render);
+          api.getStatus().then(render).catch(function () {});
+          $('btn-retry').onclick = function () { api.retry(); };
+          $('btn-logs').onclick = function () { api.openLogs(); };
+          $('btn-data').onclick = function () { api.openDataDir(); };
+          $('btn-copy').onclick = function () { api.copyDiagnostics(); };
+        }
+
+        // 窗口隐藏到托盘时暂停动画，避免后台空转
+        document.addEventListener('visibilitychange', function () {
+          document.body.style.animationPlayState = document.hidden ? 'paused' : 'running';
+        });
+      })();
+    </script>
+  </body>
+</html>

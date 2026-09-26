@@ -1,0 +1,20 @@
+{
+  "_readme": [
+    "w7 线专用更新源模板（通道方案 v2）。构建 w7 安装包前把本文件覆盖到 resources/update-config.json，构建后还原。",
+    "{channel} 占位符由壳展开（feedUrlForChannel 原生支持）：",
+    "  stable -> latest-w7.json / beta -> latest-w7-beta.json / dev -> latest-w7-dev.json",
+    "w7 用户在应用内切通道，只在 w7 线自己的三个 feed 之间轮换，永远碰不到主线 10.x。"
+  ],
+  "feedUrl": "https://dl.666-xrc.cc.cd/latest-w7{channel}.json",
+  "channel": "stable",
+  "checkOnStartup": true,
+  "checkIntervalHours": 6,
+  "autoDownload": false,
+  "allowInsecureHttp": false,
+  "_何时重启": [
+    "默认绝不自动重启：更新就绪后只提示，托盘菜单里由用户决定何时重启。",
+    "选「稍后」也不丢：热更新已落位，下次启动应用时自动生效。"
+  ],
+  "autoRestart": false,
+  "restartDelaySeconds": 60
+}

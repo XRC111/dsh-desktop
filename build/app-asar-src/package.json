@@ -1,0 +1,125 @@
+{
+  "name": "dsh-desktop",
+  "productName": "DSH Desktop",
+  "version": "1.1.14",
+  "description": "DeepSeek Harness desktop shell — 开箱即用的 Windows 桌面封装",
+  "author": "DSH Desktop",
+  "license": "MIT",
+  "private": true,
+  "main": "out/main/index.js",
+  "config": {
+    "dshVersion": "0.1.5-rc.2",
+    "hotMinBaseVersion": "1.1.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
+    "prepare:runtime": "node scripts/fetch-dsh.mjs",
+    "rebuild:native": "node scripts/rebuild-native.mjs",
+    "verify:runtime": "node scripts/verify-runtime.mjs",
+    "gen:assets": "node scripts/gen-assets.mjs",
+    "pack:runtime": "node scripts/pack-runtime.mjs",
+    "pack:hot": "node scripts/pack-hot.mjs",
+    "gen:update": "node scripts/gen-update-json.mjs",
+    "deploy:r2": "node scripts/deploy-r2.mjs",
+    "gen:manifest": "node scripts/gen-runtime-manifest.mjs",
+    "start": "npm run build && electron .",
+    "pack": "npm run build && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs",
+    "dist": "npm run build && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs && electron-builder --win nsis --x64 --prepackaged dist/win-unpacked",
+    "clean": "node scripts/clean.mjs"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "4.2.0",
+    "@types/node": "22.20.2",
+    "electron": "44.3.0",
+    "electron-builder": "26.15.3",
+    "typescript": "5.9.3"
+  },
+  "build": {
+    "appId": "com.dshdesktop.app",
+    "productName": "DSH Desktop",
+    "copyright": "Copyright © 2026 DSH Desktop",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": "build/dsh-runtime.tar",
+        "to": "dsh-runtime.tar"
+      },
+      {
+        "from": "build/dsh-runtime-manifest.json",
+        "to": "dsh-runtime-manifest.json"
+      },
+      {
+        "from": "resources/extract-runtime.cjs",
+        "to": "extract-runtime.cjs"
+      },
+      {
+        "from": "resources/extract-runtime.cmd",
+        "to": "extract-runtime.cmd"
+      },
+      {
+        "from": "resources/update-config.json",
+        "to": "update-config.json"
+      },
+      {
+        "from": "resources/desktop-patch.yml",
+        "to": "desktop-patch.yml"
+      },
+      {
+        "from": "resources/dsh-plugins",
+        "to": "dsh-plugins"
+      },
+      {
+        "from": "build/tray.png",
+        "to": "tray.png"
+      },
+      {
+        "from": "build/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico",
+      "artifactName": "DSH-Desktop-Setup-${version}.${ext}",
+      "requestedExecutionLevel": "asInvoker",
+      "legalTrademarks": "",
+      "signAndEditExecutable": true
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "DSH Desktop",
+      "menuCategory": false,
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": true,
+      "include": "build/installer.nsh",
+      "uninstallDisplayName": "DSH Desktop",
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "license": "build/license.txt"
+    },
+    "compression": "normal",
+    "asar": true,
+    "npmRebuild": false
+  }
+}

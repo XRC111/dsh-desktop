@@ -1,0 +1,4 @@
+# DSH Desktop 更新面板：把「版本 + 检查更新」作为一节挂进 Harness 设置页。
+- insert:
+    - id: dsh-desktop-updater
+      name: '@dsh-desktop/updater'

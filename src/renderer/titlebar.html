@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<!--
+  外壳自绘标题栏（BaseWindow + WebContentsView 架构的顶条视图）。
+  - 整条都是拖拽区（-webkit-app-region: drag），双击最大化/拖动由系统处理；
+  - 右侧 padding 留给 titleBarOverlay 画的原生 最小化/最大化/关闭 按钮；
+  - 深浅色跟随系统（与 window backgroundColor、WCO 颜色同步切换）。
+-->
+<title>DSH Desktop</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; }
+  body {
+    -webkit-app-region: drag;
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    padding: 0 150px 0 14px; /* 右侧留白 = WCO 三个系统按钮的宽度 */
+    background: #16181d;
+    color: #e4e4e7;
+    font: 500 12.5px/1 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+    user-select: none;
+    cursor: default;
+  }
+  @media (prefers-color-scheme: light) {
+    body {
+      background: #f6f7f9;
+      color: #1f2328;
+      border-bottom-color: rgba(0, 0, 0, 0.09);
+    }
+  }
+  .dot {
+    flex: none;
+    width: 8px;
+    height: 8px;
+    margin-right: 9px;
+    border-radius: 50%;
+    background: #4f7cff;
+    box-shadow: 0 0 7px rgba(79, 124, 255, 0.55);
+  }
+  .name { letter-spacing: 0.2px; opacity: 0.92; white-space: nowrap; }
+  .sep { margin: 0 9px; opacity: 0.32; }
+  #title {
+    opacity: 0.55;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 46vw;
+  }
+  /* 会话名为空（或只有品牌名）时不显示结尾悬空的分隔点 */
+  body:has(#title:empty) .sep,
+  body:has(#title:empty) #title {
+    display: none;
+  }
+</style>
+</head>
+<body>
+  <span class="dot"></span><span class="name">DSH Desktop</span><span class="sep">·</span><span id="title"></span>
+</body>
+</html>

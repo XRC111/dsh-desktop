@@ -1,0 +1,109 @@
+# DSH Desktop 桌面适配补丁
+#
+# 由桌面外壳通过 `dsh --patch <此文件>` 叠加在 web profile 之上。
+# 依据 dsh 的组合规则：profile 根 → 各 bundle 补丁 → profile 的
+# cordis.patch.yml → --patch 覆盖层（本文件），后者按 id 定向覆盖，最后写入者生效。
+#
+# 设计原则：不改动 Harness 任何源码，只以其内置的补丁层机制调整组合。
+#
+# 注意：补丁会「整体替换」目标行的 config，而不是合并。只想关掉某行时
+# 写 `disabled: true` 即可，无需重述它的 config。
+
+# ── 1) 关闭模块热重载（HMR） ────────────────────────────────────────────────
+# - 桌面版面向最终用户，没有开发期的热重载需求。
+# - 该插件要求 Node 以 --expose-internals 启动；关掉后启动条件更宽松，
+#   少一个可能让进程直接退出的环节。
+# - dsh-base 的注释确认：`patchReload: live` 的配置监听走 launcher 的
+#   watch-only fallback，不依赖这一行，因此关闭它是安全的。
+- id: hmr
+  disabled: true
+
+# ── 2) 关闭会话遥测 ────────────────────────────────────────────────────────
+# - 该插件默认向 https://harness-telemetry.deepseeksvc.com/v1/logs 上报使用数据；
+#   桌面版按默认关闭，不把用户环境信息发往远端。
+# - 同时移除对 @opentelemetry/* 深层嵌套文件的运行时依赖。这类路径在安装解压
+#   环节最容易因杀软实时扫描而丢文件，一旦缺失会让 dsh 整个启动失败。
+# - 需要开启时可设置环境变量并改用配置覆盖，而不是依赖本补丁。
+- id: session-telemetry-otel
+  disabled: true
+
+# ── 3) 目录选择：应用内浏览 + 可换盘符 ──────────────────────────────────────
+#
+# 这个交互由「一对」插件组成，两边都必须挂上：
+#   Host 后端   —— 在主机侧提供 ctx.directoryPicker 能力（数据原语）
+#   Client 表面 —— 在浏览器侧占据 ui-workspace 的 directoryFlow 座位（界面）
+#
+# 两个都不能用默认值，原因如下。
+#
+# 【为什么不用 native】web profile 挂的是 `directory-picker-auto`，它**不是实现
+# 而是一个选择器**：启动时按平台采样一次，再用 loader.create() 动态挂载匹配的
+# 那一对。win32 + 绑定 127.0.0.1 + 非 SSH 会解析成 native，而 native 的前端组件
+# NativeDirectoryFlow 是个**空实现**（直接 `return null`），只负责回调主机去弹
+# COM IFileOpenDialog —— 于是在一个 Harness 风格的界面里弹出 Win32 对话框。
+#
+# 【为什么不用原生 browse】改成 Harness 自带的 `dsh-host-directory-picker-browse`
+# 后界面风格统一了，但它只提供「列出某目录的直接子目录」这一种原语。Windows 上
+# 没有一个能列出全部盘符的根目录，而浏览器起点是主目录（C:\Users\…），于是
+# **用户没有任何办法换到 D:\**，只能靠对话框里的「编辑路径」手输。
+#
+# 【我们的做法】用自己写的 `@dsh-desktop/directory-picker` 替换主机侧后端：它在
+# browse 能力之上，把 Windows 探测到的盘符根（C:\、D:\ …）作为条目一并返回。
+# 盘符条目的 path 就是它自己的根路径，所以前端点一下即可切盘，**不需要任何新的
+# wire API**（DirectoryEntry 的 { name, path, hidden } 形状原样够用）。
+# 界面沿用 Harness 自带的 browse 表面：面包屑 + 可编辑路径 + 目录列表 + 新建文件夹，
+# 全部由 Harness 自己的 UI primitives 渲染；盘符作为列表最前面的行出现。
+#
+# 写法注意：不能把 `directory-picker` 那行的 name 直接改成我们的包名 —— loader 会
+# 校验并跳过，报
+#   patch: name mismatch for "directory-picker" (expected "...-auto", got "...")
+# 因此必须是「禁用原行 + insert 新行」，且新行 id 不能与原来的重复。
+#
+# 插件包本身由桌面外壳在启动时复制到 $DSH_HOME/profiles/node_modules/@dsh-desktop/ ——
+# dsh 的加载器是以 profile 目录为基准解析包名的，而且它只会把自己依赖闭包里的包
+# 链进那里，我们的包必须自己放（详见 src/main/plugin-installer.ts）。
+- id: directory-picker
+  disabled: true
+
+- insert:
+    # 主机侧后端：单层目录列举 + 创建子目录 + Windows 盘符
+    - id: directory-picker-desktop
+      name: '@dsh-desktop/directory-picker'
+
+    # 浏览器侧表面：应用内目录浏览界面，占据 ui-workspace 的 directoryFlow 座位
+    - id: ui-directory-picker-browse
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'
+
+    # 插件市场：dsh-market（社区开源，MIT），设置 → 插件市场
+    # 包本体由桌面外壳内置（resources/dsh-plugins/dshmarket，含嵌套依赖），
+    # 启动时由 plugin-installer 落位到 profiles/node_modules/dshmarket，离线可用。
+    - id: dsh-market
+      name: 'dshmarket'
+
+    # 桌面更新面板：设置 → 桌面更新
+    # 显示外壳版本 / Harness 运行时版本 / 更新源，并提供检查更新与重启应用。
+    # 与 dshmarket 同一套路：包由外壳内置并落位，界面走 settings.section 座位。
+    - id: dsh-desktop-updater
+      name: '@dsh-desktop/updater'
+
+# ── 4) Windows：命令执行改用「本地」后端，消除控制台窗口弹出 ────────────────
+#
+# 【现象】在 Windows 上让 Harness 跑命令时，会莫名其妙弹出一个控制台窗口。
+#
+# 【原因】dsh-base 在 Windows 上挂的是 `@deepseek-ai/dsh-pwsh-sandbox`
+# （PowerShell 沙箱执行器）：它把每条命令交给 `ctx.sandbox`，而 Windows 上的
+# sandbox 解析成 **ACL 受限令牌（restricted token）运行链**。在这种令牌下
+# **不能**用 CREATE_NO_WINDOW 创建子进程——子进程会以 STATUS_DLL_INIT_FAILED
+# 直接死掉（见 @deepseek-ai/dsh-sandbox-windows-acl 的说明），所以该路径只能
+# 让系统新建一个控制台 → 表现为每次执行命令都弹窗。
+#
+# 【结论：此路不通，保留原样】直接换成 dsh-pwsh-local 会被 dsh 自己拒绝：
+#   permission: the mounted bash executor does not confine (no sandboxMode) —
+#   presets bundle a sandbox mode, so composing this plugin over an unconfined
+#   executor is a misconfiguration（dsh-permission-presets 校验）
+# 即：dsh 的安全模型强制要求 Windows 命令执行器必须带沙箱。
+#
+# 【真正的解法在外壳侧】沙箱之所以弹窗，是因为受限令牌下不能 CREATE_NO_WINDOW，
+# 子进程只能由系统新建控制台；而 dsh-sandbox-windows-acl 明确写了
+# "children share the host console" —— 只要**宿主进程本身有控制台**（哪怕是隐藏的），
+# 沙箱子进程就会继承它，不再新建窗口。
+# 所以由桌面外壳在启动 dsh 前分配并隐藏一个控制台即可（见 src/main/win-console.ts）。

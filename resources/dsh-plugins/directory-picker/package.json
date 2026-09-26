@@ -1,0 +1,15 @@
+{
+  "name": "@dsh-desktop/directory-picker",
+  "version": "1.0.1",
+  "private": true,
+  "description": "DSH Desktop 的目录选择后端：在 Harness 的 browse 能力之上补上 Windows 盘符，使应用内目录浏览器可以换盘。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2"
+  }
+}

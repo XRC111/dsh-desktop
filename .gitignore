@@ -1,0 +1,33 @@
+# 依赖与构建产物
+node_modules/
+out/
+dist/
+resources/dsh-runtime/
+
+# 探测 / 临时目录
+.probe/
+*.log
+
+# 构建期生成的图标（由 scripts/gen-assets.mjs 生成）
+build/icon.ico
+build/tray.png
+build/icon-256.png
+
+# ── 发版产物与本地运行时树（大文件，永不进 git；可由 release-v2.ps1 等脚本重建）──
+build/hot-shell-*.tar
+build/dsh-runtime*.tar*
+build/dsh-runtime-patch-*.tar.gz*
+build/dsh-runtime-manifest*.json*
+build/plugins-*.tar.gz*
+build/plugins-*.meta.json
+build/plugins-*-parts/
+build/rt-next/
+build/rt-alpha/
+build/runtime-*/
+build/old-w7-asar/
+build/electron-win7/
+build/pages-deploy/
+build/*.bak
+# 插件依赖与打包产物（artifacts 由插件自身构建脚本重建，本地构建前若缺失需先生成）
+resources/dsh-plugins/*/node_modules/
+resources/dsh-plugins/*/artifacts/

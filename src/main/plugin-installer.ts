@@ -1,0 +1,188 @@
+/**
+ * 把桌面适配插件安装到 dsh 能解析到的位置。
+ *
+ * 背景（这是踩过的坑，别绕开）：
+ * dsh 的 cordis 加载器**以 profile 目录为基准**解析插件包名 —— 失败信息长这样：
+ *   Cannot find package '@dsh-desktop/directory-picker' imported from
+ *   C:\…\dsh-home\profiles\web\
+ * 也就是说，把插件放进 dsh 运行时的 node_modules **没有用**（那不是 profile 的祖先目录）。
+ *
+ * 而 dsh 自己的 `healProfilesModuleFallback()` 只把**它自身安装依赖闭包里**的包
+ * 链进 `$DSH_HOME/profiles/node_modules`（symlink 或 ESM proxy），我们的包不在那个闭包里，
+ * 永远不会被链上。所以只能由桌面外壳在每次启动、**在 dsh 起来之前**把插件放进
+ * `$DSH_HOME/profiles/node_modules/`。
+ *
+ * 落位规则（v2）：按各插件自己 package.json 的 `name` 解析目标路径 ——
+ *   * `@dsh-desktop/directory-picker` → `profiles/node_modules/@dsh-desktop/directory-picker`
+ *   * `dshmarket`（无 scope 的社区包）→ `profiles/node_modules/dshmarket`
+ * 这样内置的第三方包（如 dsh-market 插件市场）与我们的自研插件走同一条链路。
+ * 第三方包的依赖以「嵌套 node_modules」的形式随包分发（见 resources/dsh-plugins/dshmarket）。
+ *
+ * 性能：带版本戳（.dsh-desktop-managed.json），源版本没变就直接跳过复制 ——
+ * dshmarket 连依赖有数百个文件，每次启动全量复制在慢盘上会拖慢启动。
+ *
+ * 这就是「允许启动后自动配置/修复环境」这条授权的具体落地：只写我们自己的
+ * 用户数据目录，不碰安装目录、不碰 Harness 源码。
+ */
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { dshPluginsSourceDir, profileModulesDir, userPluginsDir } from './paths';
+import { log } from './logger';
+
+/** 我们自研插件的默认 scope（package.json 缺 name 时兜底用）。 */
+export const PLUGIN_SCOPE = '@dsh-desktop';
+
+/** 版本戳文件名：写在插件落位目录里，记录已安装的源版本。 */
+const MARKER_FILE = '.dsh-desktop-managed.json';
+
+export interface PluginInstallResult {
+  /** 本次确认就位的插件包名（含跳过的未变更项）。 */
+  installed: string[];
+  /** 源里已不存在、被清掉的旧插件名。 */
+  removed: string[];
+  /** 出错信息（安装失败不阻断启动，只记日志）。 */
+  problems: string[];
+}
+
+interface PkgInfo {
+  name: string;
+  version: string;
+}
+
+function readPkgInfo(dir: string, fallbackName: string): PkgInfo | null {
+  const pkgFile = path.join(dir, 'package.json');
+  if (!fs.existsSync(pkgFile)) {
+    // 没有 package.json 就不是插件：跳过，千万别兜底——否则会把
+    // 下载暂存的 staging 目录当插件装进去，往 profile 里塞一个残缺的包。
+    return null;
+  }
+  try {
+    const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf8'));
+    return {
+      name: typeof pkg.name === 'string' && pkg.name ? pkg.name : `${PLUGIN_SCOPE}/${fallbackName}`,
+      version: typeof pkg.version === 'string' ? pkg.version : '0',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** 递归复制目录；目标先清空，避免删过的文件残留。 */
+function copyDir(from: string, to: string): void {
+  fs.rmSync(to, { recursive: true, force: true });
+  fs.mkdirSync(to, { recursive: true });
+  for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+    const src = path.join(from, entry.name);
+    const dst = path.join(to, entry.name);
+    if (entry.isDirectory()) copyDir(src, dst);
+    else if (entry.isFile()) fs.copyFileSync(src, dst);
+  }
+}
+
+export function installPlugins(): PluginInstallResult {
+  const result: PluginInstallResult = { installed: [], removed: [], problems: [] };
+  const modulesRoot = profileModulesDir();
+
+  // 插件来源（后面的优先）：
+  //   1) 安装目录里随包分发的（resources/dsh-plugins）
+  //   2) 用户数据目录里的（热更新/手动安装的，见 scripts/install-plugin.ps1）
+  // 同名插件以**用户数据目录**的为准 —— 这样不用重打安装包也能换插件版本。
+  const sources: Array<{ dir: string; tag: string }> = [
+    { dir: dshPluginsSourceDir(), tag: '内置' },
+    { dir: userPluginsDir(), tag: '热更新' },
+  ];
+
+  const plan: Array<{ srcDir: string; pkg: PkgInfo; dest: string; lastSegment: string; tag: string }> = [];
+  const byName = new Map<string, (typeof plan)[number]>();
+
+  for (const { dir: source, tag } of sources) {
+    if (!fs.existsSync(source)) continue; // 开发态/未安装插件的机器可能没有
+    let names: string[];
+    try {
+      names = fs
+        .readdirSync(source, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    } catch (err) {
+      result.problems.push(`读取插件源目录失败（${source}）：${String(err)}`);
+      continue;
+    }
+    for (const name of names) {
+      const srcDir = path.join(source, name);
+      const pkg = readPkgInfo(srcDir, name);
+      if (!pkg) {
+        log(`跳过非插件目录：${name}（无 package.json）`);
+        continue;
+      }
+      const item = {
+        srcDir,
+        pkg,
+        dest: path.join(modulesRoot, ...pkg.name.split('/')),
+        lastSegment: pkg.name.split('/').pop() ?? name,
+        tag,
+      };
+      byName.set(pkg.name, item); // 后面的来源覆盖前面的
+    }
+  }
+  {
+    for (const item of byName.values()) plan.push(item);
+  }
+  if (plan.length === 0) return result;
+
+  const keepSegments = new Set(plan.map((p) => p.lastSegment));
+
+  // 清掉源里已不存在的旧插件（例如某个适配被回退）。
+  // 只清理我们管理的目录：@dsh-desktop scope 下的、或根层带版本戳的。
+  try {
+    const scopeDir = path.join(modulesRoot, PLUGIN_SCOPE);
+    if (fs.existsSync(scopeDir)) {
+      for (const entry of fs.readdirSync(scopeDir, { withFileTypes: true })) {
+        if (!entry.isDirectory() || keepSegments.has(entry.name)) continue;
+        fs.rmSync(path.join(scopeDir, entry.name), { recursive: true, force: true });
+        result.removed.push(`${PLUGIN_SCOPE}/${entry.name}`);
+      }
+    }
+    if (fs.existsSync(modulesRoot)) {
+      for (const entry of fs.readdirSync(modulesRoot, { withFileTypes: true })) {
+        if (!entry.isDirectory() || keepSegments.has(entry.name) || entry.name.startsWith('@')) continue;
+        const marker = path.join(modulesRoot, entry.name, MARKER_FILE);
+        if (!fs.existsSync(marker)) continue; // 不是我们装的，不碰
+        fs.rmSync(path.join(modulesRoot, entry.name), { recursive: true, force: true });
+        result.removed.push(entry.name);
+      }
+    }
+  } catch (err) {
+    result.problems.push(`清理旧插件失败：${String(err)}`);
+  }
+
+  for (const item of plan) {
+    const markerPath = path.join(item.dest, MARKER_FILE);
+    try {
+      // 版本没变且入口仍在 → 跳过复制（启动更快）
+      if (fs.existsSync(markerPath) && fs.existsSync(path.join(item.dest, 'package.json'))) {
+        const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { version?: string };
+        if (marker.version === item.pkg.version) {
+          result.installed.push(item.pkg.name);
+          continue;
+        }
+      }
+      copyDir(item.srcDir, item.dest);
+      fs.writeFileSync(
+        markerPath,
+        JSON.stringify({ version: item.pkg.version, managedBy: 'dsh-desktop' }),
+      );
+      result.installed.push(item.pkg.name);
+    } catch (err) {
+      result.problems.push(`安装插件 ${item.pkg.name} 失败：${String(err)}`);
+    }
+  }
+
+  if (result.installed.length > 0) {
+    log(`桌面适配插件已就位：${result.installed.join('、')}`);
+    const hot = plan.filter((p) => p.tag === '热更新').map((p) => p.pkg.name);
+    if (hot.length > 0) log(`  其中由用户数据目录提供（热更新/手动安装）：${hot.join('、')}`);
+  }
+  for (const problem of result.problems) log(problem);
+  return result;
+}

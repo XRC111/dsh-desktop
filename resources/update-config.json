@@ -1,0 +1,20 @@
+{
+  "_readme": [
+    "热更新的更新源配置。改成你自己的云端 JSON 地址后重启应用即生效；",
+    "也可以用环境变量 DSH_DESKTOP_UPDATE_URL 临时覆盖（联调时方便）。",
+    "云端 JSON 需要的字段见 README「更新」一节。",
+    "当前指向 Cloudflare Pages 免费托管：https://dl.666-xrc.cc.cd/latest.json"
+  ],
+  "feedUrl": "https://dl.666-xrc.cc.cd/latest.json",
+  "channel": "stable",
+  "checkOnStartup": true,
+  "checkIntervalHours": 6,
+  "autoDownload": false,
+  "allowInsecureHttp": false,
+  "_何时重启": [
+    "默认绝不自动重启：更新就绪后只提示，托盘菜单里由用户决定何时重启。",
+    "选「稍后」也不丢：热更新已落位，下次启动应用时自动生效。"
+  ],
+  "autoRestart": false,
+  "restartDelaySeconds": 60
+}
