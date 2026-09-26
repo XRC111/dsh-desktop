@@ -328,6 +328,78 @@ const DOWNLOAD_TIMEOUT_MS = 30 * 60_000;
 const STARTUP_DELAY_MS = 25_000;
 
 // ---------------------------------------------------------------------------
+// GitHub Releases 直链下载加速（多源融合）
+// ---------------------------------------------------------------------------
+// GitHub 的 release-assets CDN 在国内时好时坏，安装包/运行时挂上 GitHub 外链后
+// 需要加速兜底。设计：竞速探测 —— 客户端对全部镜像同时发 Range 0-0 探测，
+// 最先通过（206 且总长吻合 / 200 全量）的镜像胜出；全部镜像失败 → 回 GitHub 直连；
+// 直连下载也失败 → 不会的，直连本身就是最后兜底（镜像下载失败会再回直连重试一轮）。
+//
+// 两种拼接格式并存：
+//  - 自建镜像（路径路由）：https://gh-proxy.xrc-nb.cc.cd/<owner>/<repo>/releases/download/...
+//    即把原链的 https://github.com/ 换成镜像域（镜像内部 302 到 /release/<签名资产>）；
+//  - 公共镜像（前缀路由）：https://ghfast.top/https://github.com/<owner>/<repo>/releases/download/...
+//    即前缀 + 完整原 URL。
+// feed JSON 里也可能直接挂镜像 URL（老客户端零改动加速）——所以 expand 前先剥前缀
+// 还原出原链，再展开完整候选清单，保证新旧客户端殊途同归。
+
+const GITHUB_RELEASE_URL_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//;
+
+interface GhMirror {
+  label: string;
+  /** 由 GitHub 原链构造镜像 URL */
+  build: (origin: string) => string;
+  /** 若 url 挂在本镜像域下则还原出 GitHub 原链，否则 null */
+  strip: (url: string) => string | null;
+}
+
+const GH_MIRROR_SELF_HOST = 'https://gh-proxy.xrc-nb.cc.cd/';
+
+const GH_MIRRORS: GhMirror[] = [
+  {
+    label: '自建镜像',
+    build: (o) => GH_MIRROR_SELF_HOST + o.replace(/^https?:\/\/github\.com\//, ''),
+    strip: (u) => {
+      if (!u.startsWith(GH_MIRROR_SELF_HOST)) return null;
+      const origin = `https://github.com/${u.slice(GH_MIRROR_SELF_HOST.length).replace(/^\/+/, '')}`;
+      return GITHUB_RELEASE_URL_RE.test(origin) ? origin : null;
+    },
+  },
+  ...['ghfast.top', 'gh-proxy.com', 'ghproxy.net'].map((host) => {
+    const prefix = `https://${host}/`;
+    return {
+      label: host,
+      build: (o: string) => prefix + o,
+      strip: (u: string) => {
+        if (!u.startsWith(prefix)) return null;
+        const origin = u.slice(prefix.length);
+        return GITHUB_RELEASE_URL_RE.test(origin) ? origin : null;
+      },
+    };
+  }),
+];
+
+/** 探测候选的耗时上限：镜像挂了就快速放弃，别拖累竞速 */
+const MIRROR_PROBE_TIMEOUT_MS = 8_000;
+
+/**
+ * 剥掉 feed 里可能已挂的镜像前缀还原出原链，再展开 [镜像×N, 原链] 候选清单。
+ * 非 GitHub Releases 直链（Pages 本站文件、热更包等）原样返回，零开销直通。
+ */
+function expandDownloadCandidates(url: string): { origin: string; mirrors: Array<{ url: string; label: string }> } {
+  let origin = url;
+  for (const m of GH_MIRRORS) {
+    const stripped = m.strip(url);
+    if (stripped) {
+      origin = stripped;
+      break;
+    }
+  }
+  if (!GITHUB_RELEASE_URL_RE.test(origin)) return { origin: url, mirrors: [] };
+  return { origin, mirrors: GH_MIRRORS.map((m) => ({ url: m.build(origin), label: m.label })) };
+}
+
+// ---------------------------------------------------------------------------
 // 版本比较（支持 1.0.10 > 1.0.9、1.1.0-rc.1 < 1.1.0）
 // ---------------------------------------------------------------------------
 
@@ -1408,7 +1480,92 @@ export class Updater {
     this.setState({ phase: 'downloading', percent, message: `正在下载 ${version}… ${percent}%` });
   }
 
+  /**
+   * 下载入口（GitHub 加速融合层）：
+   *  - 对 GitHub Releases 直链：先竞速探测全部镜像（自建 + 公共），最先通过者胜出；
+   *    镜像整包下载失败 → 回退 GitHub 直连再试一轮（镜像可能中途挂，直连是最终兜底）。
+   *  - 其它 URL（Pages 本站、热更包、分片）：零开销直通。
+   * 真正的下载/分片/续传/校验逻辑全在 downloadVia，本层只管「选哪条路下载」。
+   */
   private async download(
+    version: string,
+    file: UpdateFileInfo,
+    fileName?: string,
+    progress?: { base?: number; span?: number; onProgress?: (received: number, total: number) => void },
+  ): Promise<string> {
+    const accelerated = await this.pickAcceleratedUrl(file);
+    try {
+      return await this.downloadVia(version, accelerated, fileName, progress);
+    } catch (err) {
+      if (accelerated.url === file.url) throw err; // 本来就走的直连，没有退路
+      log(`镜像下载失败（${(err as Error).message}），回退 GitHub 直连重试`);
+      return this.downloadVia(version, file, fileName, progress);
+    }
+  }
+
+  /**
+   * 竞速探测：与全部镜像同时发探测请求，最先通过（206 总长吻合 / 200 全量）的镜像胜出；
+   * 全部失败 → 回原链（file 原样返回）。expectSize 未知的文件放行 206（长度交给哈希校验）。
+   */
+  private async pickAcceleratedUrl(file: UpdateFileInfo): Promise<UpdateFileInfo> {
+    const { mirrors } = expandDownloadCandidates(file.url);
+    if (!mirrors.length) return file;
+    const expect = file.size || 0;
+    log(`GitHub 下载加速：${mirrors.length} 个镜像竞速探测中…`);
+    return new Promise((resolve) => {
+      let pending = mirrors.length;
+      let settled = false;
+      for (const m of mirrors) {
+        this.probeCandidateOk(m.url, expect)
+          .then((ok) => {
+            if (!settled && ok) {
+              settled = true;
+              log(`加速镜像选定：${m.label}（${new URL(m.url).host}）`);
+              resolve({ ...file, url: m.url });
+            }
+          })
+          .catch(() => {
+            /* 探测失败按不可用处理 */
+          })
+          .finally(() => {
+            if (--pending === 0 && !settled) {
+              settled = true;
+              log('镜像全部不可用，回退 GitHub 直连');
+              resolve(file);
+            }
+          });
+      }
+    });
+  }
+
+  /** 单个候选可用性探测：Range 0-0 必须 206 且总长吻合；200 全量也算可用（回退单流路径） */
+  private async probeCandidateOk(url: string, expectSize: number): Promise<boolean> {
+    try {
+      const res = await fetch(url, {
+        headers: { Range: 'bytes=0-0' },
+        signal: AbortSignal.timeout(MIRROR_PROBE_TIMEOUT_MS),
+      });
+      try {
+        await res.arrayBuffer();
+      } catch {
+        /* 读掉 body 便于连接复用 */
+      }
+      if (res.status === 206) {
+        const m = /\/(\d+)\s*$/.exec(res.headers.get('content-range') ?? '');
+        return expectSize <= 0 || (!!m && Number(m[1]) === expectSize);
+      }
+      if (res.status === 200) {
+        const len = Number(res.headers.get('content-length') || 0);
+        return len > 0 && (expectSize <= 0 || len === expectSize);
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }
+
+  /** 实际下载（探测 Range / 断点续传 / 多连接分片 / 单流回退 / 哈希校验） */
+  private async downloadVia(
     version: string,
     file: UpdateFileInfo,
     fileName?: string,

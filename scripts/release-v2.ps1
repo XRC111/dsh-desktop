@@ -49,6 +49,8 @@
 param(
     [switch]$SkipPack,        # 跳过全部四个构建（7.1.0 / 10.1.0 / 10.2.0 / 10.3.0）
     [switch]$SkipW7,          # 只跳过 7.1.0 重打
+    [switch]$SkipW7Beta,      # 只跳过 7.2.0（已构建过时）
+    [switch]$SkipW7Dev,       # 只跳过 7.3.0（已构建过时）
     [switch]$SkipStable,      # 只跳过 10.1.0（已构建过时）
     [switch]$SkipBeta,        # 只跳过 10.2.0
     [switch]$SkipDev,         # 只跳过 10.3.0（含 rt-alpha 重建）
@@ -72,6 +74,7 @@ param(
     [string]$SetupUrlStable = '',
     [string]$SetupUrlBeta   = '',
     [string]$SetupUrlDev    = '',
+    [string]$SetupUrlW7     = '',
     [string]$SetupUrlW7Beta = '',
     [string]$SetupUrlW7Dev  = ''
 )
@@ -430,7 +433,7 @@ if ($SkipPack -or $SkipDev) {
 # ---------------------------------------------------------------------------
 Step "4b/7 w7 beta $W7BetaVersion（fork 构建，junction -> rt-next，内嵌 dsh $NextTreeDshVersion）"
 # ---------------------------------------------------------------------------
-if ($SkipPack -or $SkipW7) {
+if ($SkipPack -or $SkipW7 -or $SkipW7Beta) {
     Info '跳过'
 } else {
     Invoke-W7Build -Version $W7BetaVersion -Tree 'rt-next' -Label 'w7 beta'
@@ -439,7 +442,7 @@ if ($SkipPack -or $SkipW7) {
 # ---------------------------------------------------------------------------
 Step "4c/7 w7 dev $W7DevVersion（fork 构建，junction -> rt-alpha，内嵌 dsh $DevDshVersion）"
 # ---------------------------------------------------------------------------
-if ($SkipPack -or $SkipW7) {
+if ($SkipPack -or $SkipW7 -or $SkipW7Dev) {
     Info '跳过'
 } else {
     if (-not (Get-TreeDshVersion $rtAlpha)) {
@@ -479,7 +482,7 @@ if ($SkipGen) {
     Invoke-Feed $StableVersion 'stable'  "$StableVersion 稳定版（dsh latest $MainDshVersion，含 beta/dev 回滚链）—— 通道方案 v2 首版" $stableExtra $SetupUrlStable
     Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" @() $SetupUrlBeta
     Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" @() $SetupUrlDev
-    Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh next $NextTreeDshVersion）"
+    Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh next $NextTreeDshVersion）" @() $SetupUrlW7
     Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" @() $SetupUrlW7Beta
     Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" @() $SetupUrlW7Dev
     foreach ($v in @($StableVersion, $BetaVersion, $DevVersion, $W7Version, $W7BetaVersion, $W7DevVersion)) {
@@ -488,6 +491,7 @@ if ($SkipGen) {
                 $StableVersion { $SetupUrlStable }
                 $BetaVersion   { $SetupUrlBeta }
                 $DevVersion    { $SetupUrlDev }
+                $W7Version     { $SetupUrlW7 }
                 $W7BetaVersion { $SetupUrlW7Beta }
                 $W7DevVersion  { $SetupUrlW7Dev }
                 default        { '' }
