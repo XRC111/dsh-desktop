@@ -1493,23 +1493,29 @@ export class Updater {
     fileName?: string,
     progress?: { base?: number; span?: number; onProgress?: (received: number, total: number) => void },
   ): Promise<string> {
-    const accelerated = await this.pickAcceleratedUrl(file);
+    const { origin, mirrors } = expandDownloadCandidates(file.url);
+    if (!mirrors.length) return this.downloadVia(version, file, fileName, progress);
+    const accelerated = await this.pickAcceleratedUrl(file, origin, mirrors);
     try {
       return await this.downloadVia(version, accelerated, fileName, progress);
     } catch (err) {
-      if (accelerated.url === file.url) throw err; // 本来就走的直连，没有退路
+      if (accelerated.url === origin) throw err; // 兜底直连本身失败，没有退路
       log(`镜像下载失败（${(err as Error).message}），回退 GitHub 直连重试`);
-      return this.downloadVia(version, file, fileName, progress);
+      // 注意兜底 url 用剥好的 origin 原链，而不是 file.url——feed 里可能挂的就是镜像前缀
+      return this.downloadVia(version, { ...file, url: origin }, fileName, progress);
     }
   }
 
   /**
    * 竞速探测：与全部镜像同时发探测请求，最先通过（206 总长吻合 / 200 全量）的镜像胜出；
-   * 全部失败 → 回原链（file 原样返回）。expectSize 未知的文件放行 206（长度交给哈希校验）。
+   * 全部失败 → 回原链 origin（file 元数据原样保留）。expectSize 未知的文件放行 206
+   * （总长交给哈希校验兜底）。
    */
-  private async pickAcceleratedUrl(file: UpdateFileInfo): Promise<UpdateFileInfo> {
-    const { mirrors } = expandDownloadCandidates(file.url);
-    if (!mirrors.length) return file;
+  private async pickAcceleratedUrl(
+    file: UpdateFileInfo,
+    origin: string,
+    mirrors: Array<{ url: string; label: string }>,
+  ): Promise<UpdateFileInfo> {
     const expect = file.size || 0;
     log(`GitHub 下载加速：${mirrors.length} 个镜像竞速探测中…`);
     return new Promise((resolve) => {
@@ -1531,7 +1537,7 @@ export class Updater {
             if (--pending === 0 && !settled) {
               settled = true;
               log('镜像全部不可用，回退 GitHub 直连');
-              resolve(file);
+              resolve({ ...file, url: origin });
             }
           });
       }
