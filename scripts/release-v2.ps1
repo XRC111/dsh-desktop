@@ -262,9 +262,7 @@ function Invoke-FullBuild {
 # 收尾恢复 7.1.0 载荷就绪态（tar/manifest/w7 模板三件），下次 --prepackaged 重打 7.1.0 不受影响。
 function Invoke-W7Build {
     param([string]$Version, [string]$Tree, [string]$Label)
-    $wuRes     = Join-Path $root 'dist\win-unpacked\resources'
-    $cfgBak    = Join-Path $root 'build\.update-config.mainline.bak'
-    $w7ManBak  = Join-Path $root 'build\dsh-runtime-manifest-0.1.7-rc.2-w7.json.bak'
+    $cfgBak = Join-Path $root 'build\.update-config.mainline.bak'
     Set-PkgVersion $Version
     Add-ElectronDist 'build/electron-win7'
     Copy-Item -LiteralPath $CfgPath  -Destination $cfgBak -Force   # 主线 update-config 备份
@@ -283,15 +281,6 @@ function Invoke-W7Build {
     $exe = Join-Path $root "dist\DSH-Desktop-Setup-$Version.exe"
     if (-not (Test-Path -LiteralPath $exe)) { throw "w7 构建产物缺失：$exe" }
     Ok "${Label}构建完成：DSH-Desktop-Setup-$Version.exe（$([math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)) MB）"
-    # ── 恢复 7.1.0 载荷就绪态（tar/manifest/w7 模板），保证步骤 1 的 --prepackaged 重打随时可跑 ──
-    if ((Test-Path -LiteralPath $w7TarBak) -and (Test-Path -LiteralPath (Join-Path $wuRes 'dsh-runtime.tar'))) {
-        Copy-Item -LiteralPath $w7TarBak -Destination (Join-Path $wuRes 'dsh-runtime.tar') -Force
-    }
-    if ((Test-Path -LiteralPath $w7ManBak) -and (Test-Path -LiteralPath (Join-Path $wuRes 'dsh-runtime-manifest.json'))) {
-        Copy-Item -LiteralPath $w7ManBak -Destination (Join-Path $wuRes 'dsh-runtime-manifest.json') -Force
-    }
-    Copy-Item -LiteralPath $CfgW7Path -Destination (Join-Path $wuRes 'update-config.json') -Force
-    Info '已恢复 win-unpacked w7 载荷就绪态（rc.2-w7 tar + manifest + w7 模板）'
 }
 
 # 收尾归位（幂等）：junction 还原 + 版本/通道回到主线 stable 态
@@ -329,36 +318,15 @@ Info "当前 package.json version = $pkgVer"
 Info "dist 现有安装包：$((@(Get-ChildItem 'dist\DSH-Desktop-Setup-*.exe' -ErrorAction SilentlyContinue) | ForEach-Object { $_.Name }) -join ', ')"
 
 # ---------------------------------------------------------------------------
-Step '1/7 重打 7.1.0（w7 修复版：载荷换 {channel} 占位符模板）'
+Step "1/7 w7 stable $W7Version（fork 完整构建，junction -> rt-next，内嵌 dsh $NextTreeDshVersion）"
 # ---------------------------------------------------------------------------
+# 废弃旧的「--prepackaged 载荷复用」路径：win-unpacked 的就绪态会被主线构建覆盖
+# （官方 44.0.0 的 V8 串与补丁后 fork 一致，指纹校验有盲区；tar 尺寸也会变），靠状态
+# 复用太脆弱。现在 7.1.0 与 7.2.0/7.3.0 走同一条完整 fork 链，任何时候重跑结果一致。
 if ($SkipPack -or $SkipW7) {
     Info '跳过'
 } else {
-    Set-PkgVersion $W7Version
-    $wu = Join-Path $root 'dist\win-unpacked'
-    if (-not (Test-Path -LiteralPath $wu)) { throw "缺少 dist\win-unpacked（w7 载荷就绪态已被破坏？）——需要重新准备 w7 载荷" }
-    $mainExe = Join-Path $wu 'DSH Desktop.exe'
-    if (-not (Test-Path -LiteralPath $mainExe)) { throw "缺少 $mainExe（注意：载荷主 exe 是 DSH Desktop.exe，不是 electron.exe）" }
-    $fp = Count-AsciiNeedle $mainExe '15.2.124.13-electron.0'
-    if ($fp -lt 4) { throw "主 exe fork 指纹仅命中 $fp 处（期望 4）——win-unpacked 可能已被主线构建覆盖，需重新准备 w7 载荷" }
-    Ok "fork 指纹校验通过（V8 串命中 $fp 处）"
-    $wuTar = Join-Path $wu 'resources\dsh-runtime.tar'
-    if ((Test-Path -LiteralPath $wuTar) -and (Test-Path -LiteralPath $w7TarBak)) {
-        if ((Get-Item -LiteralPath $wuTar).Length -ne (Get-Item -LiteralPath $w7TarBak).Length) {
-            throw "载荷 tar 尺寸与 w7 备份不一致（$((Get-Item -LiteralPath $wuTar).Length) vs $((Get-Item -LiteralPath $w7TarBak).Length)）——运行时可能被换成了非 rc.2 内容"
-        }
-        Ok "载荷 tar 尺寸与 w7 备份一致（$((Get-Item -LiteralPath $wuTar).Length) 字节）"
-    }
-    # 幂等覆盖 w7 模板进载荷（feedUrl 占位符 + channel=stable，壳零改动修复 normalizeChannel 陷阱）
-    Copy-Item -LiteralPath $CfgW7Path -Destination (Join-Path $wu 'resources\update-config.json') -Force
-    Ok '已覆盖载荷 update-config.json <- update-config.w7.json（{channel} 占位符）'
-    Remove-Item "dist\DSH-Desktop-Setup-$W7Version.exe", "dist\DSH-Desktop-Setup-$W7Version.exe.blockmap" -ErrorAction SilentlyContinue
-    Info 'NSIS 重打开始（--prepackaged，数分钟）…'
-    & (Join-Path $root 'node_modules\.bin\electron-builder.cmd') --win nsis --x64 --prepackaged dist\win-unpacked
-    if ($LASTEXITCODE -ne 0) { throw "electron-builder NSIS 失败（exit=$LASTEXITCODE）" }
-    $exe = Join-Path $root "dist\DSH-Desktop-Setup-$W7Version.exe"
-    if (-not (Test-Path -LiteralPath $exe)) { throw "重打产物缺失：$exe" }
-    Ok "7.1.0 重打完成：DSH-Desktop-Setup-$W7Version.exe（$([math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)) MB）"
+    Invoke-W7Build -Version $W7Version -Tree 'rt-next' -Label 'w7 stable'
 }
 
 # ---------------------------------------------------------------------------
