@@ -41,7 +41,9 @@
 #      build\dsh-runtime-0.1.7-rc.2-w7.tar.bak，脚本会校验它还在。
 #
 #  幂等性：所有状态切换（版本号/通道/junction）都可重入，中断后直接重跑即可。
-#  时长预估：7.1.0 重打 ~3 分钟，10.1.0 / 10.2.0 各 ~8 分钟，10.3.0 首次再 +10 分钟。
+#  时长预估：7.1.0 重打 ~3 分钟，10.1.0 / 10.2.0 / 7.2.0 / 7.3.0 各 ~8 分钟，10.3.0 首次再 +10 分钟。
+#  （w7 beta/dev 走完整 fork 构建链：electronDist -> build/electron-win7 + junction 换血，
+#   产物自带 installer.nsh 三件套清理；收尾自动恢复 7.1.0 载荷就绪态供 --prepackaged 重打。）
 # ============================================================================
 
 param(
@@ -58,6 +60,8 @@ param(
     [string]$BetaVersion       = '10.2.0',
     [string]$DevVersion        = '10.3.0',
     [string]$W7Version         = '7.1.0',
+    [string]$W7BetaVersion     = '7.2.0',
+    [string]$W7DevVersion      = '7.3.0',
     [string]$MainDshVersion    = '0.1.5-rc.3',     # 主线内嵌 dsh（latest 线）
     [string]$NextTreeDshVersion = '0.1.7-rc.2',    # build\rt-next 期望版本（next 线）
     [string]$DevDshVersion     = '0.1.7-alpha.2',  # dev 构建 / rt-alpha 树版本（alpha 线）
@@ -67,7 +71,9 @@ param(
     # token 长期有效），支持 Range 请求更佳（自动分片 + 断点续传，不支持也能单流下载）。
     [string]$SetupUrlStable = '',
     [string]$SetupUrlBeta   = '',
-    [string]$SetupUrlDev    = ''
+    [string]$SetupUrlDev    = '',
+    [string]$SetupUrlW7Beta = '',
+    [string]$SetupUrlW7Dev  = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,6 +125,29 @@ function Set-JsonField {
 function Set-PkgVersion  { param([string]$v) Set-JsonField $PkgPath '(?m)^(\s*"version":\s*")([^"]*)(")'   $v 'package.json version' }
 function Set-DshVersion  { param([string]$v) Set-JsonField $PkgPath '("dshVersion":\s*")([^"]*)(")'          $v 'config.dshVersion' }
 function Set-Channel     { param([string]$c) Set-JsonField $CfgPath '("channel":\s*")([^"]*)(")'             $c 'update-config channel' }
+
+# package.json 临时写入/移除 electronDist（w7 fork 构建专用）。
+# electron-builder 拿到 electronDist 就用本地 fork 44.2.0 发行目录当 Electron 运行时
+# （7.1.0 首打的同款机制），asar 的 version 取自根 package.json —— 壳自报版本天然正确。
+# 用完必须 Remove-ElectronDist，否则会污染后续主线构建（官方 44.0.0 会变成 fork）。
+function Add-ElectronDist {
+    param([string]$Dir)
+    $raw = [System.IO.File]::ReadAllText($PkgPath)
+    if ($raw -match '"electronDist"') { Info 'package.json electronDist 已存在（跳过插入）'; return }
+    $m = [regex]::Match($raw, '(?m)^(\s*"name":\s*"[^"]+",\s*\r?\n)')
+    if (-not $m.Success) { throw 'package.json 找不到 name 字段（electronDist 插入点）' }
+    $ins = $m.Groups[1].Value + '  "electronDist": "' + ($Dir -replace '\\', '/') + '",' + "`r`n"
+    $new = $raw.Substring(0, $m.Index) + $ins + $raw.Substring($m.Index + $m.Length)
+    [System.IO.File]::WriteAllText($PkgPath, $new, (New-Object System.Text.UTF8Encoding($false)))
+    Ok "package.json +electronDist = $Dir"
+}
+function Remove-ElectronDist {
+    $raw = [System.IO.File]::ReadAllText($PkgPath)
+    $new = [regex]::Replace($raw, '(?m)^\s*"electronDist":\s*"[^"]*",\s*\r?\n', '')
+    if ($new -eq $raw) { return }   # 幂等：本来就没有就安静返回
+    [System.IO.File]::WriteAllText($PkgPath, $new, (New-Object System.Text.UTF8Encoding($false)))
+    Ok 'package.json -electronDist（还原主线官方 Electron）'
+}
 
 # ---------------------------------------------------------------------------
 # junction 换血（幂等、崩溃可恢复）
@@ -224,8 +253,50 @@ function Invoke-FullBuild {
     Ok "${Label}构建完成：DSH-Desktop-Setup-$Version.exe（$([math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)) MB）"
 }
 
+# w7 beta/dev 完整构建（复刻 7.1.0 首打的链，非 --prepackaged 载荷复用）：
+#   electronDist -> fork 44.2.0 + 根 resources 换 w7 模板 + junction 换血到目标树
+#   + npm run dist 全链（build -> pack-runtime(透 junction) -> manifest -> dir
+#   -> prepare-payload -> NSIS）。
+# asar 的 version 取自根 package.json，壳自报版本天然正确；产物自带当前 installer.nsh
+# （含三件套清理——w7 覆盖安装的旧热壳/旧运行时残留从此根治）。
+# 收尾恢复 7.1.0 载荷就绪态（tar/manifest/w7 模板三件），下次 --prepackaged 重打 7.1.0 不受影响。
+function Invoke-W7Build {
+    param([string]$Version, [string]$Tree, [string]$Label)
+    $wuRes     = Join-Path $root 'dist\win-unpacked\resources'
+    $cfgBak    = Join-Path $root 'build\.update-config.mainline.bak'
+    $w7ManBak  = Join-Path $root 'build\dsh-runtime-manifest-0.1.7-rc.2-w7.json.bak'
+    Set-PkgVersion $Version
+    Add-ElectronDist 'build/electron-win7'
+    Copy-Item -LiteralPath $CfgPath  -Destination $cfgBak -Force   # 主线 update-config 备份
+    Copy-Item -LiteralPath $CfgW7Path -Destination $CfgPath -Force # 根 resources 换 w7 模板（electron-builder 从这复制进载荷）
+    try {
+        Swap-RuntimeTo $Tree
+        try {
+            Info "${Label}：version=$Version electronDist=fork junction->$Tree，npm run dist 开始（数分钟）…"
+            & npm run dist
+            if ($LASTEXITCODE -ne 0) { throw "w7 npm run dist 失败（exit=$LASTEXITCODE）" }
+        } finally { Restore-Runtime }
+    } finally {
+        Copy-Item -LiteralPath $cfgBak -Destination $CfgPath -Force   # 还原主线 update-config
+        Remove-ElectronDist
+    }
+    $exe = Join-Path $root "dist\DSH-Desktop-Setup-$Version.exe"
+    if (-not (Test-Path -LiteralPath $exe)) { throw "w7 构建产物缺失：$exe" }
+    Ok "${Label}构建完成：DSH-Desktop-Setup-$Version.exe（$([math]::Round((Get-Item -LiteralPath $exe).Length / 1MB, 1)) MB）"
+    # ── 恢复 7.1.0 载荷就绪态（tar/manifest/w7 模板），保证步骤 1 的 --prepackaged 重打随时可跑 ──
+    if ((Test-Path -LiteralPath $w7TarBak) -and (Test-Path -LiteralPath (Join-Path $wuRes 'dsh-runtime.tar'))) {
+        Copy-Item -LiteralPath $w7TarBak -Destination (Join-Path $wuRes 'dsh-runtime.tar') -Force
+    }
+    if ((Test-Path -LiteralPath $w7ManBak) -and (Test-Path -LiteralPath (Join-Path $wuRes 'dsh-runtime-manifest.json'))) {
+        Copy-Item -LiteralPath $w7ManBak -Destination (Join-Path $wuRes 'dsh-runtime-manifest.json') -Force
+    }
+    Copy-Item -LiteralPath $CfgW7Path -Destination (Join-Path $wuRes 'update-config.json') -Force
+    Info '已恢复 win-unpacked w7 载荷就绪态（rc.2-w7 tar + manifest + w7 模板）'
+}
+
 # 收尾归位（幂等）：junction 还原 + 版本/通道回到主线 stable 态
 function Restore-WorkingState {
+    Remove-ElectronDist
     Restore-Runtime
     Set-PkgVersion $StableVersion
     Set-DshVersion $MainDshVersion
@@ -296,7 +367,8 @@ Step "2/7 主线 stable $StableVersion（内嵌 dsh $MainDshVersion）"
 if ($SkipPack -or $SkipStable) {
     Info '跳过'
 } else {
-    Restore-Runtime   # 防上次中断残留 junction
+    Restore-Runtime        # 防上次中断残留 junction
+    Remove-ElectronDist    # 防上次中断残留 fork 指向（会污染主线构建的 Electron）
     $rtVer = Get-TreeDshVersion $RtDir
     if ($rtVer -ne $MainDshVersion) {
         throw "resources\dsh-runtime 版本异常：期望 $MainDshVersion，实为 '$rtVer'（先跑 npm run prepare:runtime）"
@@ -388,6 +460,27 @@ if ($SkipPack -or $SkipDev) {
 }
 
 # ---------------------------------------------------------------------------
+Step "4b/7 w7 beta $W7BetaVersion（fork 构建，junction -> rt-next，内嵌 dsh $NextTreeDshVersion）"
+# ---------------------------------------------------------------------------
+if ($SkipPack -or $SkipW7) {
+    Info '跳过'
+} else {
+    Invoke-W7Build -Version $W7BetaVersion -Tree 'rt-next' -Label 'w7 beta'
+}
+
+# ---------------------------------------------------------------------------
+Step "4c/7 w7 dev $W7DevVersion（fork 构建，junction -> rt-alpha，内嵌 dsh $DevDshVersion）"
+# ---------------------------------------------------------------------------
+if ($SkipPack -or $SkipW7) {
+    Info '跳过'
+} else {
+    if (-not (Get-TreeDshVersion $rtAlpha)) {
+        throw "build\rt-alpha 树不存在——先跑一次主线 dev（不带 -SkipDev）让 fetch-dsh 重建它，再补 w7 dev"
+    }
+    Invoke-W7Build -Version $W7DevVersion -Tree 'rt-alpha' -Label 'w7 dev'
+}
+
+# ---------------------------------------------------------------------------
 Step '5/7 生成六份 feed（全部 --hot-only 空骨架；Pages 整目录替换，版本号一次到位）'
 # ---------------------------------------------------------------------------
 if ($SkipGen) {
@@ -419,11 +512,18 @@ if ($SkipGen) {
     Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" @() $SetupUrlBeta
     Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" @() $SetupUrlDev
     Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh next $NextTreeDshVersion）"
-    Invoke-Feed $W7Version     'w7-beta' "$W7Version 测试版（w7）—— 占位 feed，暂未开放"
-    Invoke-Feed $W7Version     'w7-dev'  "$W7Version 开发版（w7）—— 占位 feed，暂未开放"
-    foreach ($v in @($StableVersion, $BetaVersion, $DevVersion)) {
+    Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" @() $SetupUrlW7Beta
+    Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" @() $SetupUrlW7Dev
+    foreach ($v in @($StableVersion, $BetaVersion, $DevVersion, $W7Version, $W7BetaVersion, $W7DevVersion)) {
         if (Test-Path -LiteralPath "dist\DSH-Desktop-Setup-$v.exe") {
-            $u = if ($v -eq $StableVersion) { $SetupUrlStable } elseif ($v -eq $BetaVersion) { $SetupUrlBeta } else { $SetupUrlDev }
+            $u = switch ($v) {
+                $StableVersion { $SetupUrlStable }
+                $BetaVersion   { $SetupUrlBeta }
+                $DevVersion    { $SetupUrlDev }
+                $W7BetaVersion { $SetupUrlW7Beta }
+                $W7DevVersion  { $SetupUrlW7Dev }
+                default        { '' }
+            }
             if ($u) { Ok "安装包在位 + 外链已挂 feed：DSH-Desktop-Setup-$v.exe" }
             else { Ok "安装包在位（feed 未挂外链，客户端将提示手动下载）：DSH-Desktop-Setup-$v.exe" }
         }

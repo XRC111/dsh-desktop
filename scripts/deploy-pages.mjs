@@ -92,7 +92,9 @@ function resolveLocal(name) {
 function collectUrls(feed) {
   const urls = [];
   const push = (u) => {
-    if (typeof u === 'string' && u) urls.push(u);
+    // 只收集本站（baseUrl 前缀）的文件——外链（GitHub Releases 等第三方直链）
+    // 由客户端直接下载，不进 Pages 暂存清单，否则会被 25MiB 校验拦死。
+    if (typeof u === 'string' && u && u.startsWith(baseUrl)) urls.push(u);
   };
   // 分片清单里存的是**相对整包 URL 的同级文件名**（客户端用 new URL(rel, url) 解析），
   // 这里要还原成绝对 URL 才能取 basename。

@@ -93,7 +93,8 @@ if (setupUrl && !/^https?:\/\//i.test(setupUrl)) {
 }
 let setupBuf = null;
 let setupName = '';
-if (setupFile && fs.existsSync(setupFile)) {
+// --hot-only 时 feed 根本不含安装包，别把 200MB 读进内存
+if (!hotOnly && setupFile && fs.existsSync(setupFile)) {
   setupBuf = fs.readFileSync(setupFile);
   setupName = path.basename(setupFile);
 }
@@ -369,8 +370,12 @@ fs.mkdirSync(outDir, { recursive: true });
 fs.writeFileSync(outFile, JSON.stringify(feed, null, 2), 'utf8');
 
 if (stage) {
-  // 外链模式不 stage 安装包本体（它不进 Pages 托管目录）；热更/运行时包照常
-  const stageList = [setupUrl ? null : setupFile, ...stagedHot, ...stagedRuntime].filter(Boolean);
+  // 安装包不 stage 的两种情况：外链模式（url 已指向外部）与 --hot-only（feed 不含
+  // 安装包——否则每次生成都会把 200MB+ 的包复制进 dist/update，Pages 部署直接超限）。
+  // 热更/运行时包照常（它们是要传 Pages 的）。
+  const stageList = [setupUrl || hotOnly ? null : setupFile, ...stagedHot, ...stagedRuntime].filter(
+    Boolean,
+  );
   for (const src of stageList) {
     const dst = path.join(outDir, path.basename(src));
     if (path.resolve(src) !== path.resolve(dst)) fs.copyFileSync(src, dst);
@@ -385,8 +390,10 @@ if (setupUrl) {
     `  安装包    : 外链 ${setupUrl}` +
       (setupBuf ? `（哈希取自本地 ${setupName}）` : '（本地无包，未带哈希）'),
   );
-} else {
+} else if (setupBuf) {
   console.log(`  安装包    : ${setupName}（${mb(setupBuf.length)} MB）`);
+} else {
+  console.log('  安装包    : 未包含（--hot-only 或本地无包）');
 }
 if (hotBlock) {
   const list = Array.isArray(hotBlock) ? hotBlock : [hotBlock];
