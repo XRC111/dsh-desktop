@@ -251,6 +251,8 @@ export interface UpdateState {
   mandatory?: boolean;
   /** 下载进度 0-100 */
   percent?: number;
+  /** 实时下载速度（字节/秒，EMA 平滑；采样不足时缺省 0） */
+  speed?: number;
   message?: string;
   checkedAt?: number;
   setupPath?: string;
@@ -400,6 +402,13 @@ function expandDownloadCandidates(url: string): { origin: string; mirrors: Array
   }
   if (!GITHUB_RELEASE_URL_RE.test(origin)) return { origin: url, mirrors: [] };
   return { origin, mirrors: GH_MIRRORS.map((m) => ({ url: m.build(origin), label: m.label })) };
+}
+
+/** 下载速度文案：≥1MB/s 用 MB/s（一位小数），否则 KB/s；无有效速度返回空串 */
+function fmtSpeed(bytesPerSec: number): string {
+  if (!Number.isFinite(bytesPerSec) || bytesPerSec <= 0) return '';
+  const mb = bytesPerSec / 1024 / 1024;
+  return mb >= 1 ? `${mb.toFixed(1)} MB/s` : `${Math.round(bytesPerSec / 1024)} KB/s`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1457,6 +1466,45 @@ export class Updater {
   /** 多连接下载的全局已收字节计数（downloadMulti 专用，同一时刻只有一个下载在跑） */
   private dlReceived = 0;
 
+  /** 下载速度采样状态：EMA 平滑，同一 version 内累积，换版本自动重置 */
+  private speedVersion = '';
+  private speedSampleAt = 0;
+  private speedSampleBytes = 0;
+  private speedEma = 0;
+
+  /**
+   * 实时下载速度（字节/秒）：EMA 平滑（新样本权重 0.4），起步直接取首个瞬时值。
+   *
+   * 两个刻意的保护：
+   *  - 采样间隔 <500ms 不更新：回调本身 300ms 节流一次，太密算出来的全是噪声；
+   *  - 只有字节增量 > 0 才更新 EMA：分片重试会把 dlReceived 回退（实测见 downloadMulti），
+   *    负增量混进 EMA 会把速度拖成 0 甚至负数。
+   */
+  private speedOf(version: string, received: number): number {
+    const now = Date.now();
+    if (this.speedVersion !== version) {
+      this.speedVersion = version;
+      this.speedSampleAt = 0;
+      this.speedSampleBytes = 0;
+      this.speedEma = 0;
+    }
+    if (this.speedSampleAt === 0) {
+      this.speedSampleAt = now;
+      this.speedSampleBytes = received;
+      return 0;
+    }
+    const dt = now - this.speedSampleAt;
+    if (dt < 500) return this.speedEma;
+    const db = received - this.speedSampleBytes;
+    this.speedSampleAt = now;
+    this.speedSampleBytes = received;
+    if (db > 0) {
+      const inst = (db / dt) * 1000;
+      this.speedEma = this.speedEma > 0 ? this.speedEma * 0.6 + inst * 0.4 : inst;
+    }
+    return this.speedEma;
+  }
+
   /** 下载进度上报。
    *  - 无 onProgress：直接 setState（base/span 把本文件进度映射进整体区间，300ms 节流）；
    *  - 有 onProgress：转发给调用方（分片并发时由 downloadWithParts 聚合，节流在聚合层做）。 */
@@ -1480,7 +1528,13 @@ export class Updater {
     const span = progress?.span ?? 100;
     const frac = total > 0 ? Math.min(1, received / total) : 0;
     const percent = Math.min(99, Math.round(base + frac * span));
-    this.setState({ phase: 'downloading', percent, message: `正在下载 ${version}… ${percent}%` });
+    const speed = this.speedOf(version, received);
+    this.setState({
+      phase: 'downloading',
+      percent,
+      speed,
+      message: `正在下载 ${version}… ${percent}%${speed > 0 ? `（${fmtSpeed(speed)}）` : ''}`,
+    });
   }
 
   /**
@@ -1768,10 +1822,12 @@ export class Updater {
       const percent = total > 0 ? Math.min(99, Math.round((received / total) * 100)) : 0;
       if (!force && percent === agg.lastPercent) return;
       agg.lastPercent = percent;
+      const speed = this.speedOf(version, received);
       this.setState({
         phase: 'downloading',
         percent,
-        message: `正在下载 ${version}… ${percent}%（${done}/${parts.length} 片）`,
+        speed,
+        message: `正在下载 ${version}… ${percent}%（${done}/${parts.length} 片${speed > 0 ? `，${fmtSpeed(speed)}` : ''}）`,
       });
     };
 

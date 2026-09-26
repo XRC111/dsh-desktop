@@ -74,7 +74,11 @@ export class TrayManager {
         this.updateBusy = false;
         break;
       case 'downloading':
-        this.updateLabel = `正在下载更新 ${state.percent ?? 0}%`;
+        this.updateLabel =
+          `正在下载更新 ${state.percent ?? 0}%` +
+          (state.speed && state.speed > 0
+            ? `（${state.speed >= 1024 * 1024 ? `${(state.speed / 1024 / 1024).toFixed(1)} MB/s` : `${Math.round(state.speed / 1024)} KB/s`}）`
+            : '');
         this.updateBusy = true;
         break;
       case 'downloaded':
