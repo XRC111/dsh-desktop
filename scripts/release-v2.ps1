@@ -275,12 +275,16 @@ function Invoke-W7Build {
     Copy-Item -LiteralPath $CfgPath  -Destination $cfgBak -Force   # 主线 update-config 备份
     Copy-Item -LiteralPath $CfgW7Path -Destination $CfgPath -Force # 根 resources 换 w7 模板（electron-builder 从这复制进载荷）
     try {
-        Swap-RuntimeTo $Tree
+        if ($Tree) {
+            Swap-RuntimeTo $Tree
+        } else {
+            Info "${Label}：Tree 为空 → 沿用主线运行时树（resources\dsh-runtime，latest 线），不换血"
+        }
         try {
-            Info "${Label}：version=$Version electronDist=fork junction->$Tree，npm run dist 开始（数分钟）…"
+            Info "${Label}：version=$Version electronDist=fork $(if ($Tree) { "junction->$Tree" } else { 'runtime=mainline' })，npm run dist 开始（数分钟）…"
             & npm run dist
             if ($LASTEXITCODE -ne 0) { throw "w7 npm run dist 失败（exit=$LASTEXITCODE）" }
-        } finally { Restore-Runtime }
+        } finally { if ($Tree) { Restore-Runtime } }
     } finally {
         Copy-Item -LiteralPath $cfgBak -Destination $CfgPath -Force   # 还原主线 update-config
         Remove-ElectronDist
@@ -325,15 +329,20 @@ Info "当前 package.json version = $pkgVer"
 Info "dist 现有安装包：$((@(Get-ChildItem 'dist\DSH-Desktop-Setup-*.exe' -ErrorAction SilentlyContinue) | ForEach-Object { $_.Name }) -join ', ')"
 
 # ---------------------------------------------------------------------------
-Step "1/7 w7 stable $W7Version（fork 完整构建，junction -> rt-next，内嵌 dsh $NextTreeDshVersion）"
+Step "1/7 w7 stable $W7Version（fork 完整构建，沿用主线 latest 树，内嵌 dsh $MainDshVersion）"
 # ---------------------------------------------------------------------------
 # 废弃旧的「--prepackaged 载荷复用」路径：win-unpacked 的就绪态会被主线构建覆盖
 # （官方 44.0.0 的 V8 串与补丁后 fork 一致，指纹校验有盲区；tar 尺寸也会变），靠状态
 # 复用太脆弱。现在 7.1.0 与 7.2.0/7.3.0 走同一条完整 fork 链，任何时候重跑结果一致。
+#
+# w7 stable 的 dsh 线 = latest（与主线同构，方案 v2.1）：Tree 传空 = **不换血**，
+# 直接用 resources\dsh-runtime 的原地主线树（0.1.5-rc.3）。此前误用 rt-next（0.1.7-rc.2）
+# 导致 7.1.x 与 7.2.0 的 dsh 版本相同 → 回滚时没有 runtime 差分可命中 → 切到 beta/dev
+# 后退不回 stable（2026-09-26 修）。0.1.5-rc.3 在 fork Electron 44.2.0 上已实测可跑。
 if ($SkipPack -or $SkipW7) {
     Info '跳过'
 } else {
-    Invoke-W7Build -Version $W7Version -Tree 'rt-next' -Label 'w7 stable'
+    Invoke-W7Build -Version $W7Version -Tree '' -Label 'w7 stable'
 }
 
 # ---------------------------------------------------------------------------
@@ -497,7 +506,25 @@ if ($SkipGen) {
     Invoke-Feed $StableVersion 'stable'  "$StableVersion 稳定版（dsh latest $MainDshVersion，含 beta/dev 回滚链）—— 通道方案 v2 首版" $stableExtra $SetupUrlStable
     Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" @() $SetupUrlBeta
     Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" @() $SetupUrlDev
-    Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh next $NextTreeDshVersion）" @() $SetupUrlW7
+    # w7 stable feed 与主线同构地挂降级资源：7.2.0(0.1.7-rc.2)/7.3.0(0.1.7-alpha.2) 切回
+    # stable 后轮询 latest-w7.json（壳版本 7.2.0 > feed 版本 7.1.2，不触发 shellOutdated），
+    # 全靠 runtime 差分精确命中才置 available → 热壳(7.1.2) + 运行时(0.1.5-rc.3) 一起落位，
+    # 整体回到稳定线。两个差分与主线 stable feed 是同一份产物（from/to 相同，meta 无
+    # requiresElectron → 两线通用）；热壳是 w7 专属（版本号 7.1.2）。
+    $w7Extra = @()
+    $w7Hot = @(Get-ChildItem "build\hot-shell-$W7Version-*.tar" -ErrorAction SilentlyContinue)
+    if ($w7Hot.Count) {
+        foreach ($h in $w7Hot) { $w7Extra += @('--hot', $h.FullName) }
+    } else {
+        Warn "缺 w7 热壳包 build\hot-shell-$W7Version-*.tar → 切回 stable 时壳版本不会回退（只剩运行时降级）"
+    }
+    foreach ($tag in @($NextTreeDshVersion, $DevDshVersion)) {
+        $meta = @(Get-ChildItem "dist\update\dsh-runtime-patch-$tag-to-$MainDshVersion*.meta.json" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending)
+        if ($meta.Count) { $w7Extra += @('--runtime', $meta[0].FullName) }
+        else { Warn "缺降级差分 meta：$tag -> $MainDshVersion（w7 stable feed 将不含该回滚链）" }
+    }
+    Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh latest $MainDshVersion）" $w7Extra $SetupUrlW7
     Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" @() $SetupUrlW7Beta
     Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" @() $SetupUrlW7Dev
     foreach ($v in @($StableVersion, $BetaVersion, $DevVersion, $W7Version, $W7BetaVersion, $W7DevVersion)) {
