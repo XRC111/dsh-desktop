@@ -355,17 +355,11 @@ interface GhMirror {
 
 const GH_MIRROR_SELF_HOST = 'https://gh-proxy.xrc-nb.cc.cd/';
 
+// 顺序即优先级：gh-proxy.com 实测并发 6 片最稳（2026-09-26 复现：自建镜像 Worker
+// 转发大偏移 Range 时间歇性回 200+1124B 错误页，竞速探测挡不住「探测通过、下载变卦」，
+// 因此主加速站定为直连 gh-proxy.com；自建镜像保留在候选链中，修好后自然被竞速选中）。
 const GH_MIRRORS: GhMirror[] = [
-  {
-    label: '自建镜像',
-    build: (o) => GH_MIRROR_SELF_HOST + o.replace(/^https?:\/\/github\.com\//, ''),
-    strip: (u) => {
-      if (!u.startsWith(GH_MIRROR_SELF_HOST)) return null;
-      const origin = `https://github.com/${u.slice(GH_MIRROR_SELF_HOST.length).replace(/^\/+/, '')}`;
-      return GITHUB_RELEASE_URL_RE.test(origin) ? origin : null;
-    },
-  },
-  ...['ghfast.top', 'gh-proxy.com', 'ghproxy.net'].map((host) => {
+  ...['gh-proxy.com', 'ghfast.top', 'ghproxy.net'].map((host) => {
     const prefix = `https://${host}/`;
     return {
       label: host,
@@ -377,6 +371,15 @@ const GH_MIRRORS: GhMirror[] = [
       },
     };
   }),
+  {
+    label: '自建镜像',
+    build: (o) => GH_MIRROR_SELF_HOST + o.replace(/^https?:\/\/github\.com\//, ''),
+    strip: (u) => {
+      if (!u.startsWith(GH_MIRROR_SELF_HOST)) return null;
+      const origin = `https://github.com/${u.slice(GH_MIRROR_SELF_HOST.length).replace(/^\/+/, '')}`;
+      return GITHUB_RELEASE_URL_RE.test(origin) ? origin : null;
+    },
+  },
 ];
 
 /** 探测候选的耗时上限：镜像挂了就快速放弃，别拖累竞速 */
