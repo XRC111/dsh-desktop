@@ -33,6 +33,37 @@ interface HotContext {
     };
 }
 /**
+ * Profile-scoped resolution for hot-mount rows: turn a bare package name into
+ * the absolute `file://` entry URL of the package just installed into
+ * `profileDir`.
+ *
+ * Include-tree rows reach `Include.import` as BARE names (`name:
+ * '@scope/pkg'`), and the base class resolves them against the LOADER's own
+ * location — the host closure
+ * (`closures/<fp>/node_modules/…/cordis-plugin-loader`), whose parent walk
+ * can never reach `home/profiles/<profile>/node_modules/`. Under a host whose
+ * loader sits in an immutable dependency closure, EVERY market hot mount dies
+ * with `Cannot find module '<pkg>' from '…/cordis-plugin-loader/…'` and falls
+ * back to "restart required", blaming the plugin for what is a resolution
+ * anchor problem.
+ *
+ * Resolving the row name HERE, against the profile the package was actually
+ * installed into, is anchor-independent: `require.resolve` walks
+ * `profileDir/node_modules` natively, so the tree hands the loader a
+ * `file://` URL needing no further resolution. Non-bare specifiers (relative
+ * paths, `file://`, `cordis:` builtins) and names that do not resolve under
+ * the profile pass through unchanged, preserving base-class semantics for
+ * every shape this fix does not own.
+ *
+ * The fallback keeps the name bare rather than synthesising a URL: a package
+ * whose entry cannot be located via `require.resolve` (no `main`/exports —
+ * the market's own `entryArtifactExists` heuristic covers those shapes before
+ * an install is accepted) is not something this resolver should guess about.
+ * Client-only shims never reach this function (their rows are replaced by a
+ * no-op host module before the file is written).
+ */
+export declare function resolveProfileEntry(profileDir: string, name: string): string;
+/**
  * Insert rows of a plugin's bundle patch, or null when the patch contains
  * anything beyond plain `id`/`name` insert rows (config blocks, disables,
  * expressions) — those compositions fall back to restart activation.
@@ -107,9 +138,67 @@ export interface MarketState {
     favorites?: string[];
     /** User-supplied HTTPS prefix used when the built-in GitHub routes fail. */
     githubProxy?: string;
+    /**
+     * Packages the market removed from the profile's own declarations because
+     * the build on disk can no longer compose (#663).
+     *
+     * The case this exists for: an update blocked by open files leaves the
+     * target directory incomplete, `keepLockedBuild` cannot keep the previous
+     * build, and the profile goes on declaring a package whose `package.json`
+     * is missing. The next start dies in composition — on Desktop the window
+     * never opens — and the only way out was uninstalling the plugin by hand.
+     * So the declaration is dropped instead (a rename or a delete of the
+     * directory itself cannot be attempted: the same lock that stopped pnpm
+     * refuses the market's move too), and this map is what keeps that from
+     * being silent. The plugin disappears from the installed list; this is the
+     * record saying why, and what spec to reinstall.
+     *
+     * Optional on the way in, like `notes`: several callers write a state
+     * object built from the few fields they own, and requiring this one would
+     * make every such call a way to erase every entry (#339's shape).
+     */
+    brokenPlugins?: Record<string, BrokenPlugin>;
+    /**
+     * The operator's pinned build environment (issue #336) as saved from the
+     * market's own settings card. Absent means "the composition says" — the
+     * entry's `config.buildEnv`, or nothing at all. Present (non-empty) means
+     * a saved editor state REPLACES the composition map, so clearing the
+     * field on the card inherits the composition again rather than freezing
+     * an earlier save. Read live into `config.buildEnv` by the routes; see
+     * src/dsh-cli.ts spawnEnv for the precedence once it reaches a child.
+     */
+    buildEnv?: Record<string, string>;
+}
+/** Why a package is no longer declared, and what to put back. */
+export interface BrokenPlugin {
+    /** The dependency spec it had before removal — the reinstall target. */
+    spec: string;
+    /** Machine-readable cause; the UI owns the wording. */
+    reason: 'incomplete-build-locked';
+    /** When the market removed the declaration (ISO 8601). */
+    at: string;
 }
 /** Upper bound on bookmarked catalog URLs kept in state.json (#414). */
 export declare const MAX_FAVORITES = 500;
+/**
+ * Sanitize an untrusted build-env map (state.json, or the card route's body)
+ * into the shape spawnEnv can merge.
+ *
+ * An empty map and a non-object both read as undefined: clearing the card
+ * must inherit the composition, and a blank line in state.json must not
+ * disable every pinned variable. Only the merge precedence in
+ * src/dsh-cli.ts spawnEnv — never this — protects PATH and CI, but a value
+ * a user typed for them would silently do nothing there, so it is rejected
+ * here with a reason instead.
+ *
+ * `GIT_ASKPASS` and `SSH_ASKPASS` are deliberately NOT rejected, though they
+ * are the two names that can re-open a credential prompt: pointing them at a
+ * program is the supported non-interactive way to answer one, and #587/#596
+ * close the *terminal* fallback (GIT_TERMINAL_PROMPT, BatchMode) rather than
+ * the program one. A user who pins these has already said where the answer
+ * comes from; a user who does not still gets the closed prompt.
+ */
+export declare function buildEnvFromUnknown(value: unknown): Record<string, string> | undefined;
 /**
  * Read the whole market state. Legacy `disabledSkins` (the pre-#60
  * theme-only key) still loads; every new write uses the generic `disabled`

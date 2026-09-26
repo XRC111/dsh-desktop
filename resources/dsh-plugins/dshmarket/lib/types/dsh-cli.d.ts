@@ -79,6 +79,42 @@ export declare function proxyEnvForPnpm(env?: NodeJS.ProcessEnv, region?: Region
  */
 export declare function toolSearchDirs(platform?: string, env?: NodeJS.ProcessEnv, home?: string): string[];
 /**
+ * `core.sshCommand` from the user's git configuration, or null.
+ *
+ * The third place an ssh identity hides, and the one the environment cannot
+ * show: `git config --get` answers it. Memoized for the process — a user
+ * does not reconfigure git mid-install, and this runs on every spawn.
+ *
+ * @returns the configured command, or null when git has none (including
+ *   when git is absent — an unreadable answer is not a choice).
+ */
+export declare function probeCoreSshCommand(env?: NodeJS.ProcessEnv): string | null;
+export declare function gitEnvForPnpm(env?: NodeJS.ProcessEnv, coreSshCommand?: string | null): NodeJS.ProcessEnv;
+/**
+ * Every `--config.<key>=<value>` override in the argv, repeated as the
+ * `PNPM_CONFIG_<KEY>` environment variable that pnpm 12 still reads.
+ *
+ * pnpm 12 ignores some `--config.<key>` overrides on the command line, in
+ * either spelling, without a word: `fetchTimeout` (#615; measured on
+ * 12.2.1, 12.3.0 and 12.4.1) and `auto-install-peers` (12.4.1 auto-installs
+ * the peer with the flag present and not with the variable), so the retries
+ * that carry them ran exactly like the first attempt. `PNPM_CONFIG_*` is
+ * honoured by 11.8, 11.21 and 12.4 alike, so the argument stays for the
+ * versions that read it and the variable carries the same value for the
+ * ones that do not. Scoped to the run that carries the flag; nothing is set
+ * otherwise, so a user's own values are untouched on every other run. Keys
+ * are accepted in either spelling, so respelling a constant (as #600 did
+ * for the release-age one) cannot silently drop the variable.
+ */
+export declare function pnpmConfigEnvForArgs(pluginArgs: readonly string[]): NodeJS.ProcessEnv;
+/**
+ * Point every future child spawn at the configured build environment.
+ * @param source - Live source of the config's `buildEnv` object, re-read on
+ * every spawn so a settings change reaches the next child immediately.
+ * @returns the previous source, so a caller can restore it on teardown.
+ */
+export declare function setBuildEnvSource(source: () => Readonly<Record<string, string>>): () => Readonly<Record<string, string>>;
+/**
  * Windows npm/corepack/pnpm are `.cmd` shims. Node's `spawn` without a shell
  * cannot start them (ENOENT / EINVAL). Same pattern as dsh's `plugin` forwarder.
  */
@@ -168,6 +204,19 @@ export interface PluginCommandRuntime {
     cancelActive(): boolean;
     /** Whether this host can execute an immutable rollback add target. */
     supportsExactRollbackTarget?(target: string): boolean;
+    /**
+     * Whether this runtime runs pnpm itself and therefore accepts the market's
+     * own arguments — `--config.*` overrides, `--force`, `--no-frozen-lockfile`.
+     *
+     * The official Electron profile does not (#732): its in-process manager
+     * takes exactly `add <target>` or `remove <target>` and answers any other
+     * argv with exit 127. Every recovery step that decorates a command with an
+     * option is impossible there, and sending it anyway turned a pnpm failure
+     * into "this desktop operation is not supported" — a message about an
+     * operation that is in fact supported, which sent the reporter looking for
+     * a broken profile instead of the option. Absent means "accepts".
+     */
+    acceptsMarketPnpmFlags?: boolean;
 }
 /** One running package operation, however it was started. */
 export interface DesktopPnpmHandleLike {
@@ -234,12 +283,48 @@ export declare function killChild(child: ChildProcess): void;
  * @returns true when there was one to cancel.
  */
 export declare function cancelActive(): boolean;
+/**
+ * The package manager the host itself supplies, as the launcher hands it
+ * over (`profileContext.packageManager`).
+ *
+ * This is not a PATH executable. A packaged host ships its own runtime and
+ * describes it as a whole invocation — command, args AND env — because each
+ * part carries meaning: the desktop host passes the location of its embedded
+ * Node through `env`, so an implementation that keeps only `command` reaches
+ * a tool it still cannot execute, which is the reported failure (#653).
+ */
+export interface HostPackageManager {
+    readonly command: string;
+    readonly args: readonly string[];
+    readonly env: NodeJS.ProcessEnv;
+}
+/**
+ * Register the host's package manager for this process, or clear it with
+ * `null`. Cached probe answers are dropped only when the invocation really
+ * changes, so a repeated mount does not re-probe a toolchain that works.
+ */
+export declare function setHostPackageManager(invocation: HostPackageManager | null): void;
+/** The host-supplied package manager, for callers that must name it. */
+export declare function hostPackageManagerInvocation(): HostPackageManager | null;
+/** Why the host-supplied package manager last failed, or null. */
+export declare function lastHostPackageManagerFailure(): {
+    command: string;
+    output: string;
+} | null;
 /** Why `pnpm --version` last failed, or null when it has not failed. */
 export declare function lastPnpmProbeFailure(): {
     kind: 'missing' | 'failed';
     output: string;
 } | null;
-/** Probe `pnpm --version` on PATH. */
+/**
+ * Whether a package manager is usable — the host-supplied one first.
+ *
+ * The tiers are ordered by what the machine can actually run: a packaged
+ * host's bundled runtime exists whether or not PATH was inherited from a
+ * shell, and on the reported machine only that tier can work at all (#653).
+ * A host tier that fails falls through to the PATH probe, so a host that
+ * publishes a broken invocation cannot make things worse than they were.
+ */
 export declare function probePnpm(): Promise<boolean>;
 /**
  * Provision pnpm without user involvement: corepack (ships with Node) first,

@@ -48,6 +48,15 @@ export interface RegistryPlugin {
    * package. Absent means "no npm package" — a coverage gap, not a zero.
    */
   downloads?: number | null
+  /** Source-reported download window; absent dates must not be inferred. */
+  downloadsStart?: string | null
+  downloadsEnd?: string | null
+  downloadsCheckedAt?: string | null
+  /**
+   * Catalog npm `latest` (awesome-dsh-plugin / dsh-market#348). Shown in the
+   * discover byline only when it is a non-empty string.
+   */
+  version?: string | null
   added?: string
   install?: string
   /**
@@ -57,6 +66,16 @@ export interface RegistryPlugin {
   deprecated?: boolean
   /** Catalog name of the suggested replacement plugin, when deprecated. */
   replacement?: string
+  /**
+   * Capability disclosure (#401), scanned at catalog build time from the
+   * artifact a user would install. ABSENT means "never scanned" and `[]`
+   * means "scanned, nothing detected" — the card renders those two as
+   * different sentences (未扫描 / 未检出), because only one of them is a
+   * statement about the plugin. Never a verdict: see `capabilityNote`.
+   */
+  capabilities?: string[]
+  capabilityRedLines?: string[]
+  capabilityCheckedAt?: string | null
   /** Author-curated screenshot URLs from the registry (#61); optional. */
   screenshots?: string[]
 }
@@ -104,6 +123,38 @@ export type InstalledMap = Record<string, string>
  * must keep using the dependency-only map because a Bundle supplied by the
  * dsh installation is not owned by the profile package manager.
  */
+/** Why a queued operation may no longer be run. */
+export type QueuedRowStaleReason = 'gone' | 'no-update'
+
+/**
+ * Whether a queued operation still applies — `null` when it does.
+ *
+ * A queued row drains with NO confirmation; that is what queueing means. So a
+ * row restored from an old session is a destructive operation launched from a
+ * decision the user may have taken back since: queue an uninstall at 10:00,
+ * remove the plugin by hand, open the market at 15:00 and it would run. Every
+ * kind therefore has to be true RIGHT NOW, and this is the one place that
+ * decides — the restore in MarketSection reports what it returns instead of
+ * executing it.
+ *
+ * `install` asks the catalog (the entry may have been delisted), `uninstall`
+ * asks the installed map (it may be gone, or the user may have reinstalled
+ * it), and `update` asks both plus the update check (the pending release may
+ * have landed already).
+ */
+export function queuedRowApplies(
+  row: { kind: 'install' | 'update' | 'uninstall'; name: string; url?: string },
+  world: { installed: InstalledMap; updates: Record<string, UpdateStatus>; plugins: readonly RegistryPlugin[] },
+): QueuedRowStaleReason | null {
+  if (row.kind === 'install') {
+    if (row.url === undefined) return 'gone'
+    return world.plugins.some(plugin => plugin.url === row.url) ? null : 'gone'
+  }
+  if (world.installed[row.name] === undefined) return 'gone'
+  if (row.kind === 'update' && world.updates[row.name]?.updateAvailable !== true) return 'no-update'
+  return null
+}
+
 export function installedForCatalog(installed: InstalledMap, bundles: readonly string[]): InstalledMap {
   return Object.fromEntries([
     ...bundles.map(name => [name, '*'] as const),
@@ -190,6 +241,12 @@ export interface MarketStatus {
    */
   busy?: boolean
   /**
+   * Ids of currently running agents, sampled from the same guard that refuses
+   * mutations while agents run. The client's install queue drains when this
+   * is empty and the operation lock is free; absent means idle.
+   */
+  runningAgents?: string[]
+  /**
    * The process supervisor the host detected around itself (systemd, pm2),
    * or null/absent when none. Present so the UI can explain WHY the restart
    * button is missing instead of just omitting it (#229).
@@ -211,6 +268,8 @@ export interface ActivationInfo {
   reasons: string[]
   bundle: boolean
   hot: boolean
+  /** Set when this package is a library another installed plugin pulled in (#634). */
+  dependencyOf?: string
 }
 
 /** The /dsh-market/installed payload (fields the market UI consumes). */
@@ -691,10 +750,20 @@ function entryRepoIds(plugin: RegistryPlugin): Set<string> {
  * dependency's spec pins a github repo AND the entry states one, the repos
  * decide — the loose name/npm identities only apply when at least one side
  * carries no repo evidence (npm installs, non-github entries).
+ *
+ * Repo evidence only ever decides by repository ROOT. A monorepo catalog
+ * entry states `owner/repo#path:/pkg` while an npm-installed manifest
+ * usually states the bare `owner/repo` (it rarely declares
+ * `repository.directory`), and reading that asymmetry as a source conflict
+ * kept a genuinely installed subpackage from ever reading as installed.
  */
+/** Repository root: the part before any `#path:/…` subpath selection. */
+function repoRoots(ids: ReadonlySet<string>): Set<string> {
+  return new Set([...ids].map(id => id.split('#path:/')[0]!))
+}
 function sameSourceConflict(plugin: RegistryPlugin, spec: string, repoIdentities: readonly string[] = []): boolean {
-  const entry = entryRepoIds(plugin)
-  const dep = depRepoIds(spec, repoIdentities)
+  const entry = repoRoots(entryRepoIds(plugin))
+  const dep = repoRoots(depRepoIds(spec, repoIdentities))
   if (entry.size === 0 || dep.size === 0) return false
   for (const id of dep) if (entry.has(id)) return false
   return true
@@ -968,6 +1037,34 @@ function safeScreenshot(value: unknown): string | null {
   if (parsed.protocol !== 'https:' || !SCREENSHOT_HOSTS.has(parsed.hostname)) return null
   if (/\.svg$/iu.test(parsed.pathname)) return null
   return value
+}
+
+/**
+ * Prepare a GitHub release body for the update-notes dialog's tiny markdown
+ * renderer. HTML — especially pasted `<img>` tags — must not surface as
+ * literal text; markdown syntax is left intact for the dialog to render.
+ */
+export function sanitizeReleaseNotesBody(md: string): string {
+  let s = md.replace(/<!--[\s\S]*?-->/g, '')
+  s = s.replace(/<img\b[^>]*>/gi, '')
+  // Drop remaining tags, keep inner text (`<a href=…>label</a>` → `label`).
+  s = s.replace(/<\/?[a-zA-Z][\w:-]*\b[^>]*>/g, '')
+  s = s.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n')
+  return s.trim()
+}
+
+/**
+ * A whole-line markdown image with an allowlisted https URL, or null.
+ * Relative paths and non-GitHub hosts stay out of the dialog (same gate as
+ * install screenshots).
+ */
+export function releaseNotesHttpsImage(line: string): { alt: string; src: string } | null {
+  const match = /^!\[([^\]]*)\]\(\s*(?:<(https:\/\/[^>]+)>|(https:\/\/[^\s)]+))(?:\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)$/u
+    .exec(line.trim())
+  if (match === null) return null
+  const src = safeScreenshot(match[2] ?? match[3] ?? '')
+  if (src === null) return null
+  return { alt: match[1] ?? '', src }
 }
 
 /** Keep only https URLs on allowlisted image hosts; SVG dropped (logos/badges). */
@@ -1253,6 +1350,66 @@ export function humanOutput(raw: string): string {
     }
   }
   return kept.join('\n').trim()
+}
+
+/** CJK ideographs — enough to tell a Chinese half from a Latin one. */
+const CJK_RE = /[\u3400-\u9FFF\uF900-\uFAFF]/gu
+
+/** Count CJK code points in a string. */
+function cjkCount(text: string): number {
+  return text.match(CJK_RE)?.length ?? 0
+}
+
+/**
+ * Pick one language from a `中文 / English` (or reverse) pair. Ambiguous
+ * strings stay unchanged. Callers that prepend `t(…)` must localize the
+ * server half first, then concatenate — this function does not strip UI chrome.
+ */
+function pickBilingualPair(text: string, lang: 'zh' | 'en'): string {
+  const sep = ' / '
+  const parts = text.split(sep)
+  if (parts.length < 2) return text
+
+  // Prefer the split with the largest CJK contrast when the text has more
+  // than one ` / ` (English prose can contain the same separator).
+  let bestLeft = parts[0]
+  let bestRight = parts.slice(1).join(sep)
+  let bestScore = Math.abs(cjkCount(bestLeft) - cjkCount(bestRight))
+  for (let i = 1; i < parts.length - 1; i++) {
+    const left = parts.slice(0, i + 1).join(sep)
+    const right = parts.slice(i + 1).join(sep)
+    const score = Math.abs(cjkCount(left) - cjkCount(right))
+    if (score > bestScore) {
+      bestScore = score
+      bestLeft = left
+      bestRight = right
+    }
+  }
+  if (bestScore === 0) return text
+  const zhPart = cjkCount(bestLeft) > cjkCount(bestRight) ? bestLeft : bestRight
+  const enPart = cjkCount(bestLeft) > cjkCount(bestRight) ? bestRight : bestLeft
+  return lang === 'zh' ? zhPart : enPart
+}
+
+/**
+ * Pick the locale half of a server bilingual string (`中文 / English` or
+ * `English / 中文`). Multiline input is handled line by line. Ambiguous
+ * strings are returned unchanged.
+ */
+export function localizeBilingual(text: string, lang: 'zh' | 'en'): string {
+  if (text.includes('\n')) {
+    return text.split('\n').map(line => localizeBilingual(line, lang)).join('\n')
+  }
+  return pickBilingualPair(text, lang)
+}
+
+/**
+ * Localize each bilingual reason and join for display. Reasons are separate
+ * diagnoses; do not rejoin them with ` / `, which is the bilingual separator.
+ */
+export function localizeBilingualList(parts: string[], lang: 'zh' | 'en'): string {
+  const sep = lang === 'zh' ? '；' : '; '
+  return parts.map(part => localizeBilingual(part, lang)).filter(part => part !== '').join(sep)
 }
 
 /**

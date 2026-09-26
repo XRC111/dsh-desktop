@@ -174,13 +174,31 @@ export function classifyPnpmFailure(output, exitCode) {
     if (output.includes('ERR_PNPM_UNEXPECTED_STORE')) {
         const linked = /currently linked from the store at "([^"]+)"/.exec(output)?.[1];
         const wanted = /wants to use the store at "([^"]+)"/.exec(output)?.[1];
+        const modulesDir = /The dependencies at "([^"]+)"/.exec(output)?.[1];
         const detail = linked !== undefined && wanted !== undefined
             ? `\n  node_modules → ${linked}\n  pnpm 现在想用 / pnpm now wants → ${wanted}`
             : '';
+        // DSH Desktop installs market plugins in a staging workspace under
+        // $DSH_HOME/profiles/.generations/staging/. When that staging tree
+        // carries no pnpm-workspace.yaml of its own, pnpm resolves the
+        // workspace root by walking the ancestor chain — and a
+        // pnpm-workspace.yaml ABOVE the staging tree (a home folder used as a
+        // pnpm workspace is the usual one) claims the install together with
+        // ITS store. The profile's own node_modules is not the one that
+        // mismatched, so the ordinary profile-relink advice is wrong here.
+        // Match only .generations/staging — a .generations/live path is not
+        // the disposable staging workspace.
+        if (modulesDir !== undefined && /[/\\]\.generations[/\\]staging[/\\]/.test(modulesDir)) {
+            return {
+                code: 'unexpected-store',
+                recoverable: false,
+                message: `桌面端的插件安装暂存目录（.generations/staging）被上层的 pnpm workspace 接管（通常是 ~/pnpm-workspace.yaml，它的 node_modules 链到另一个 store），pnpm 因此拒绝在暂存目录里安装。这不是 profile 的 node_modules。处理办法（任选其一）：用那个上层 workspace 自己的 pnpm 大版本重新链接它的 node_modules；或不需要那份祖先 workspace 的话，删掉它的 pnpm-workspace.yaml。暂存目录 → ${modulesDir}${detail} / the desktop client's install staging directory (.generations/staging) was claimed by a pnpm workspace above it (usually ~/pnpm-workspace.yaml, whose node_modules links a different pnpm store), so pnpm refuses to install there. This is not the profile's node_modules. Fix (any one): relink that outer workspace's node_modules with its own pnpm major; or remove that ancestor pnpm-workspace.yaml if you do not need it. Staging directory → ${modulesDir}${detail}`,
+            };
+        }
         return {
             code: 'unexpected-store',
             recoverable: false,
-            message: `这个 profile 的 node_modules 链接到的 pnpm store，和当前 pnpm 默认使用的 store 不是同一个，pnpm 因此拒绝所有安装与卸载。${detail}\n在 profile 目录里执行一次 \`pnpm install --store-dir <上面第一个路径>\` 重新链接即可（dsh 运行时可能占用文件，必要时先退出 dsh）/ this profile's node_modules is linked to a different pnpm store than the one pnpm now resolves, so pnpm refuses every install and uninstall.${detail}\nRelink by running \`pnpm install --store-dir <the first path above>\` once in the profile directory (stop dsh first if files are locked)`,
+            message: `这个 profile 的 node_modules 链接到的 pnpm store，和 pnpm 现在解析出的 store 不是同一个，pnpm 因此拒绝这个 profile 的所有安装与卸载。典型触发是把 $DSH_HOME 迁到另一个挂载点：迁盘前建的 node_modules 记着旧盘上的 store，而 pnpm 会按新的挂载点自动改选一个（#244 的另一种触发，见 #715）。${detail}\n持久的修法：把**记录里的那个** store 写进 profile 的 pnpm-workspace.yaml（顶层、驼峰）：\n\n  storeDir: <上面第一个路径>\n\n加完不用重装任何东西——包本来就在那个 store 里，直接重试即可（dsh 运行时可能占用文件，必要时先退出 dsh）。\n注意 \`pnpm install --store-dir <路径>\` **不是修复**：它只对那一次命令生效，也不会改写 node_modules/.modules.yaml 里的记录，所以下一条命令会报同样的错（pnpm 11.7 与 11.22 实测）。\n想改用 pnpm 现在解析出的那个 store 也行，但那要求清空并重装整个 node_modules（包全部重新下载），代价由你决定。 / this profile's node_modules is linked to a different pnpm store than the one pnpm now resolves, so pnpm refuses every install and uninstall for it. The usual trigger is moving $DSH_HOME to another mount point: a node_modules built before the move records the old disk's store while pnpm re-selects one for the new mount.${detail}\nDurable fix: write the store from the RECORD into the profile's pnpm-workspace.yaml (top level, camelCase):\n\n  storeDir: <the first path above>\n\nNothing has to be reinstalled — the packages are already in that store — so just retry (stop dsh first if files are locked).\nNote that \`pnpm install --store-dir <path>\` is NOT a fix: it applies to that one command and does not rewrite the record in node_modules/.modules.yaml, so the next command fails exactly the same way (measured on pnpm 11.7 and 11.22).\nSwitching to the store pnpm now resolves is also possible, but it requires purging and reinstalling the whole node_modules (every package re-downloaded) — your call, not the market's.`,
         };
     }
     // #367: pnpm verifies every tarball resolution in the lockfile before it
@@ -271,7 +289,7 @@ export function classifyPnpmFailure(output, exitCode) {
     // before ANY later mutation — uninstalling even an unrelated plugin fails
     // (MINIMUM_RELEASE_AGE_VIOLATION), and a later add can fail re-resolving
     // the young dep (NO_MATURE_MATCHING_VERSION). Recovery is a one-shot
-    // --config.minimumReleaseAge=0 retry, automated in withHoistRecovery.
+    // --config.minimum-release-age=0 retry, automated in withHoistRecovery.
     if (output.includes('ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION')
         || output.includes('ERR_PNPM_NO_MATURE_MATCHING_VERSION')) {
         return {
@@ -295,6 +313,52 @@ export function classifyPnpmFailure(output, exitCode) {
     // pnpm's FETCHER, before anything lands in node_modules — so the package
     // the user must approve is not installed yet, and pnpm's own hint names a
     // commit-pinned codeload URL that changes on every push.
+    // #701: pnpm 12's native engine (pnpm-native) aborting on an allocation it
+    // cannot get — "memory allocation of 5368709120 bytes failed", Windows exit
+    // 3221226505 (0xC0000409, how a Rust abort ends there). Reported with an
+    // A/B: on pnpm 12.5.1 every run with `autoInstallPeers: false` in the
+    // workspace file (DSH writes it into every profile) aborted at ~5 GB peak
+    // RSS, every run without it passed at ~80 MB, with free memory to spare.
+    // Nothing about the plugin being installed; not something a retry of the
+    // same command changes on the reporter's data, so none is attempted.
+    if (/memory allocation of \d+ bytes failed/.test(output) || exitCode === 3221226505) {
+        return {
+            code: 'native-oom',
+            recoverable: false,
+            message: 'pnpm 12 的原生引擎在处理这个 profile 时耗尽了内存并中止——和要安装的插件无关。在 pnpm 修复之前，请改用 pnpm 11（npm install -g pnpm@11）后再试。 / pnpm 12\'s native engine ran out of memory on this profile and aborted — the plugin being installed is not the cause. Until pnpm fixes it, switch to pnpm 11 (npm install -g pnpm@11) and try again.',
+        };
+    }
+    // #698: pnpm 10.26+ and 11.0–11.5 read an allowBuilds key as
+    // `name@<version union>`, so a git or archive source there fails the WHOLE
+    // workspace file — every pnpm command in the profile, not the one plugin.
+    // Named separately from any install failure because the cure is in the
+    // profile's own pnpm-workspace.yaml, which withHoistRecovery repairs.
+    {
+        const found = /ERR_PNPM_INVALID_VERSION_UNION[\s\S]*?Found: \\?"([^"\\]+)\\?"/.exec(output);
+        if (found !== null && /@(?:git\+|https?:)/.test(found[1].slice(1))) {
+            return {
+                code: 'unparseable-build-key',
+                recoverable: false,
+                pkg: found[1],
+                message: `这个版本的 pnpm 读不懂 allowBuilds 里的 git 来源键（${found[1]}），整个 profile 的包操作都会因此失败 / this pnpm version cannot read a git-source key in allowBuilds (${found[1]}), which fails every package operation in the profile`,
+            };
+        }
+    }
+    // #596: the ssh half of #587. git asks for a passphrase (or a host-key
+    // confirmation) on a terminal a spawned child does not have; the market
+    // closes that prompt with `BatchMode=yes` so the question becomes a fast
+    // failure instead of a fifteen-minute hang. This is that failure, and it
+    // needs its own message because git's own words send the reader to the
+    // wrong place: `Permission denied (publickey)` reads as "your key is
+    // wrong", and the key is usually fine — it wants a passphrase, and the
+    // channel that would have asked for it is exactly what was shut.
+    if (/Permission denied \(publickey\)|Could not read from remote repository/.test(output)) {
+        return {
+            code: 'ssh-auth-failed',
+            recoverable: false,
+            message: 'git 无法在无人值守的情况下完成 SSH 认证。如果你的 SSH key 设了密码，请用 ssh-agent（ssh-add），或自己设置 GIT_SSH_COMMAND 指向你的命令，市场不会覆盖它。 / git could not complete SSH authentication unattended. If your SSH key has a passphrase, use ssh-agent (ssh-add), or set GIT_SSH_COMMAND to your own command — the market leaves yours alone.',
+        };
+    }
     if (output.includes('ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED')) {
         return {
             code: 'git-prepare-not-allowed',
@@ -389,7 +453,10 @@ export function classifyPnpmFailure(output, exitCode) {
     // win, because that process is the thing holding the handles; retrying
     // would only turn one clear failure into several slow ones. So this names
     // the cause and the ways out instead of guessing.
-    if (/ERR_PNPM_EPERM|EPERM: operation not permitted, rename/i.test(output)) {
+    // pnpm 12 (the native CLI) says it differently and carries no ERR_PNPM_
+    // code: `failed to remove existing directory "…" prior to swap: …` — same
+    // refused swap over the open directory, so the same answer.
+    if (/ERR_PNPM_EPERM|EPERM: operation not permitted, rename|failed to remove existing directory .* prior to swap/i.test(output)) {
         // Read through the NDJSON reporter like the integrity classifier does:
         // in production this arrives JSON-escaped, so every separator is doubled
         // and a single-character class silently matches nothing.
@@ -402,7 +469,7 @@ export function classifyPnpmFailure(output, exitCode) {
             code: 'windows-file-locked',
             recoverable: false,
             ...(pkg === undefined ? {} : { pkg }),
-            message: `Windows 不允许替换正在被打开的文件。pnpm 要用新目录替换${zh === '' ? '一个已装好的包' : ` ${pkg}`}，而它的文件正被运行中的 DeepSeek Harness 打开着，改名因此失败，这一步没有生效——已经装好的内容没有被破坏。\n如果这个包带原生模块（.node 文件，例如 node-hid 这类），那么停用插件、甚至卸载插件都不够：原生模块一旦被加载，在进程退出前都不会释放。刚卸载完立刻重装同一个插件在 Windows 上失败，通常就是这个原因。\n可行的做法：完全退出 DeepSeek Harness（不是刷新页面），重新启动后再操作一次；或退出后在命令行执行。杀毒软件或文件索引临时占用目录也会报同样的错，若都不适用可稍后重试。 / Windows will not replace a file that is open. pnpm tried to swap a new directory over${en === '' ? ' an installed package' : en}, whose files the running DeepSeek Harness holds open, so the rename failed and this step did not apply — what was already installed is intact. If that package ships a native module (a .node file, node-hid and friends), disabling the plugin — even uninstalling it — is not enough: once a native module is loaded it is not released until the process exits, which is the usual reason reinstalling a plugin right after uninstalling it fails on Windows. What works: quit DeepSeek Harness completely (not a page refresh), start it again, and repeat the operation; or run it from the command line with the app closed. Antivirus or a file indexer holding the directory produces the same error, so a later retry is worth trying if neither applies.`,
+            message: `Windows 不允许替换正在被打开的文件。pnpm 要用新目录替换${zh === '' ? '一个已装好的包' : ` ${pkg}`}，而它的文件正被运行中的 DeepSeek Harness 打开着，改名因此失败，这一步没有生效。\n要注意的是：pnpm 在重试改名之前会尽量把目标目录清掉，所以**被占用文件旁边的内容可能已经被删**——不一定只是「没换成」而已。市场遇到这种失败时不再尝试回滚（同一个改名会撞同一批句柄），而是把 package.json 与 pnpm-lock.yaml 恢复成操作前的样子，并检查原构建的入口是否还在——结论以那次检查为准。\n如果这个包带原生模块（.node 文件，例如 node-hid 这类），那么停用插件、甚至卸载插件都不够：原生模块一旦被加载，在进程退出前都不会释放。刚卸载完立刻重装同一个插件在 Windows 上失败，通常就是这个原因。\n可行的做法：完全退出 DeepSeek Harness（不是刷新页面），重新启动后再操作一次；或退出后在命令行执行。杀毒软件或文件索引临时占用目录也会报同样的错，若都不适用可稍后重试。 / Windows will not replace a file that is open. pnpm tried to swap a new directory over${en === '' ? ' an installed package' : en}, whose files the running DeepSeek Harness holds open, so the rename failed and this step did not apply. Note that pnpm clears as much of the target directory as it can before retrying the rename, so content BESIDE the file it could not remove may already be gone — this is not always only "the swap did not happen". On this failure the market no longer attempts a rollback (the same rename would meet the same open handles); it restores package.json and pnpm-lock.yaml to how they were and then checks whether the previous build still has a loadable entry — that check is the answer. If that package ships a native module (a .node file, node-hid and friends), disabling the plugin — even uninstalling it — is not enough: once a native module is loaded it is not released until the process exits, which is the usual reason reinstalling a plugin right after uninstalling it fails on Windows. What works: quit DeepSeek Harness completely (not a page refresh), start it again, and repeat the operation; or run it from the command line with the app closed. Antivirus or a file indexer holding the directory produces the same error, so a later retry is worth trying if neither applies.`,
         };
     }
     // #83: pnpm replays the WHOLE dependency tree on every add/remove, so a

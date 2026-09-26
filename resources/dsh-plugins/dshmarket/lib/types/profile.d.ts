@@ -34,6 +34,20 @@ export declare function readInstalled(profile: string, explicitDir?: string): Re
  * a filtered view would delete @deepseek-ai/dsh-base and friends.
  */
 export declare function readManifestDeps(profile: string, explicitDir?: string): Record<string, string>;
+/**
+ * For each installed package, the OTHER installed package that declares it —
+ * as a dependency or a peer dependency — in its own manifest.
+ *
+ * pnpm's auto-install-peers writes a plugin's peers into the profile manifest
+ * as direct dependencies, so a native binding a plugin needs shows up in the
+ * installed list looking exactly like a plugin the user chose (#634). What
+ * separates them is that somebody else asked for it.
+ *
+ * Ownership is decided by the first owner in sorted order, so the answer does
+ * not depend on the manifest's key order. A package that declares itself is
+ * ignored, and so is a cycle's other half once one owner is chosen.
+ */
+export declare function readDependencyOwners(profile: string, names: readonly string[], explicitDir?: string): Record<string, string>;
 /** Exact rollback state owned by one profile package operation. */
 export interface ProfileManifestSnapshot {
     dependencies: Record<string, string>;
@@ -76,10 +90,16 @@ export declare function restoreProfileManifest(profile: string, snapshot: Profil
 export declare function dropFromManifest(profile: string, name: string, explicitDir?: string): boolean;
 /** The version actually present in the profile's node_modules, or null. */
 export declare function readInstalledVersion(profile: string, name: string, explicitDir?: string): string | null;
+/**
+ * The `name` in the package.json of the directory a dependency is installed
+ * under, or null. DSH Desktop requires it to equal the dependency key (#694).
+ */
+export declare function readInstalledPackageName(profile: string, name: string, explicitDir?: string): string | null;
 /** The installed package manifest, or null when absent or malformed. */
 export declare function readInstalledManifest(profile: string, name: string, explicitDir?: string): unknown | null;
 /**
- * Whether a package or one of its direct dependencies ships a native addon.
+ * Whether a package or one of its direct dependencies (including
+ * optionalDependencies) ships a native addon.
  *
  * The question behind it: can unloading this plugin actually free its files?
  * For ordinary JavaScript, yes — and on POSIX it does not even matter,
@@ -97,13 +117,16 @@ export declare function readInstalledManifest(profile: string, name: string, exp
  * the conventional way: node-gyp's `build/Release`, prebuild's `prebuilds/`,
  * and the `binding.gyp` that names the addon in the first place.
  *
- * Direct dependencies are included because that is where these live: the
- * plugin is JavaScript and the addon is a package it depends on, hoisted to
- * the profile root beside it.
+ * Direct `dependencies` and `optionalDependencies` are included because
+ * that is where these live: the plugin is JavaScript and the addon is a
+ * package it depends on, hoisted to the profile root beside it.
+ * optionalDependencies is the same kind of direct declaration —
+ * SinglePlayer ships node-hid there (#441), and asking only `dependencies`
+ * treated that uninstall as ordinary JavaScript.
  * @param profile - profile name.
  * @param name - the installed package to ask about.
  * @param explicitDir - resolved profile directory, when the caller has it.
- * @returns true when a native addon is present in the package or a direct dependency.
+ * @returns true when a native addon is present in the package or a direct (optional) dependency.
  */
 export declare function holdsNativeAddon(profile: string, name: string, explicitDir?: string): boolean;
 /**
@@ -147,12 +170,27 @@ export interface InstalledRepoEvidence {
  * source directory walk.
  */
 export declare function readInstalledRepoEvidence(profile: string, name: string, spec: string, explicitDir?: string): InstalledRepoEvidence;
-/** Pinned commit per `owner/repo` from the profile lockfile's codeload tarball URLs. */
+/**
+ * Pinned commit per `host/owner/repo` from the archive tarball URLs in the
+ * profile lockfile.
+ *
+ * Keyed by host, not by `owner/repo` alone: gitlab.com and bitbucket.org
+ * hand out the same short owner/repo names GitHub does, and an unqualified
+ * key would let one host's commit answer for a plugin installed from
+ * another — reporting a rollback or an update check against a repository
+ * the user never installed. `hostedRepoKey` builds the same key from a
+ * spec, and is how callers should look one up.
+ */
 export declare function readLockCommits(profile: string, explicitDir?: string): Map<string, string>;
 /**
  * Commit recorded for a non-codeload git resolution (`type: git` in pnpm's
  * lockfile). Matched against the install spec so a Gitea/GitLab URL can
  * compare HEAD without mistaking a same-named npm package (#525).
+ *
+ * Two packages of one monorepo resolve from the SAME remote and differ only
+ * by pnpm's `path:` selector, so the spec's subpath has to match too — and
+ * when the spec names no subpath while several entries of that remote do,
+ * there is no answer rather than the first sibling's commit (#632).
  */
 export declare function readGitResolutionCommit(profile: string, spec: string, explicitDir?: string): string | null;
 /** True when the installed package's manifest declares a dsh plugin surface. */
@@ -213,6 +251,21 @@ export declare function parsePatchRows(text: string): {
     ids: string[];
     insertedIds: string[];
 };
+/** Rows of the patch a package DECLARES through `dsh.bundle.patch`. */
+/**
+ * Where a package's bundle patch lives, according to the package itself.
+ *
+ * `dsh.bundle.patch` is the package's own declaration and the only place the
+ * answer is written down: the path may be a subdirectory (`aegis` declares
+ * `./extensions/dsh/cordis.patch.yml`), not just the package root. Callers
+ * that assumed the root file made a plugin with a declared patch look like
+ * one with none (#646) — so the resolution rule lives here, once.
+ *
+ * @param dir - the installed package directory.
+ * @returns the declared patch file's path, or null when the manifest names
+ *   none (or the manifest cannot be read).
+ */
+export declare function declaredBundlePatchFile(dir: string): string | null;
 /** The profile manifest's `dsh.profile.bundles` — what the CLI reconciled. */
 export declare function readProfileBundles(profileDirectory: string): string[];
 /**
@@ -275,3 +328,51 @@ export declare function pluginSubdirs(root: string): string[];
  * @returns every package now allowed.
  */
 export declare function setAllowBuilds(profile: string, packages: string[], explicitDir?: string): string[];
+/**
+ * Remove the allowBuilds keys pnpm cannot parse as a version range, and say
+ * which (#698).
+ *
+ * pnpm reads an allowBuilds key as `name@<version union>`, and on 10.26 to
+ * the latest 10.x and on 11.0 to 11.5 a git or archive source there —
+ * `name@git+https://…`, `name@https://codeload…` — is rejected as
+ * "Invalid versions union … Use exact versions only". Not the one entry: the
+ * whole workspace file, so EVERY later pnpm command in the profile fails,
+ * including installs that have nothing to do with it. Measured on 9.15,
+ * 10.0 through 10.29, 11.0 through 11.8, 11.21 and 12.4; 10.25 and below
+ * ignore allowBuilds and 11.6 and above accept these keys.
+ *
+ * Those are exactly the keys the market writes for a git source (#68, #285,
+ * #637), because the pnpm versions that need them to authorize anything
+ * read them fine. On the versions in between, a bare name is what
+ * authorizes a git dependency — measured on 10.29 — and it is kept.
+ *
+ * @returns the keys removed; empty when nothing matched, in which case the
+ *   file is left untouched.
+ */
+export declare function dropUnparseableBuildKeys(profile: string, explicitDir?: string): string[];
+/**
+ * Merge one package's several `minimumReleaseAgeExclude` entries into one
+ * (#732).
+ *
+ * pnpm 11.7.0 APPENDS an entry when it lets a version through a profile's
+ * `minimumReleaseAge` instead of folding it into the rule that already names
+ * that package — and its own `evaluateVersionPolicy` then honours only the
+ * FIRST rule per package name. The entry pnpm just wrote is therefore
+ * shadowed by the older one, the young version stays unexcluded, and pnpm
+ * fails lockfile verification with ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION on
+ * EVERY later command in that profile: installs, updates and uninstalls
+ * alike, including ones that have nothing to do with the package. Reported
+ * as #732, where the market's own self-update planted exactly that pair and
+ * every plugin operation on the desktop profile stopped working.
+ *
+ * Merging keeps the union of what the file already says, so nothing is
+ * loosened or tightened: the entries pnpm wrote were meant to be read, and
+ * after the merge they are. A file with no same-name duplicate is untouched,
+ * as is one whose block this cannot read exactly (a flow list, an inline
+ * comment, a line it would have to guess at).
+ *
+ * @returns the package names whose entries were merged; empty when the file
+ *   needed no repair or could not be repaired, in which case it is left
+ *   byte-for-byte as it was.
+ */
+export declare function mergeDuplicateReleaseAgeExcludes(profile: string, explicitDir?: string): string[];

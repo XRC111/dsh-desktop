@@ -5,14 +5,33 @@
  * parameter so tests can substitute a recording fake.
  */
 import type { InstallResult, PluginRunner } from './dsh-cli.ts';
-/** One-shot bypass for pnpm's fresh-release hold; scoped to a single command. */
-export declare const RELEASE_AGE_OVERRIDE = "--config.minimumReleaseAge=0";
+/**
+ * One-shot bypass for pnpm's fresh-release hold; scoped to a single command.
+ *
+ * Spelled like the .npmrc key, not the camelCase pnpm-workspace.yaml one:
+ * from pnpm 12.3.0 (the native CLI) `--config.minimumReleaseAge=0` is
+ * silently ignored — no unknown-option error — so the retry ran without the
+ * bypass and failed exactly like the first attempt (#600).
+ * `--config.minimum-release-age=0` is honoured by pnpm 10, 11 and 12 alike.
+ * That is specific to this key, not a rule for `--config.*`: the native CLI
+ * ignores `--config.fetch-timeout` in both spellings, which is why
+ * FETCH_TIMEOUT_OVERRIDE below is not respelled here (#615).
+ */
+export declare const RELEASE_AGE_OVERRIDE = "--config.minimum-release-age=0";
 /**
  * Longer per-request fetch timeout for one retried command. pnpm's default
  * 60-second limit aborts large tarball downloads (github: sources fetch the
  * WHOLE repo even for a `#path:` subdirectory plugin) on slow networks; a
  * plain retry fails again at the same limit, so the recovery re-runs with
  * this override once. Scoped to a single command like RELEASE_AGE_OVERRIDE.
+ *
+ * pnpm 12 ignores this flag on the command line in either spelling (#615).
+ * On the CLI runner, runDshPlugin repeats every `--config.<key>` override
+ * as PNPM_CONFIG_<KEY>, which pnpm 11 and 12 both read, so the retried
+ * command really does get the longer limit there. The Desktop runtime hands
+ * its host argv only, so on a Desktop host the retry still depends on that
+ * host's pnpm reading the flag. The flag stays: pnpm 11 and earlier read
+ * it, and it costs nothing on the versions that do not.
  */
 export declare const FETCH_TIMEOUT_OVERRIDE = "--config.fetchTimeout=600000";
 /**
@@ -31,6 +50,10 @@ export declare const FETCH_TIMEOUT_OVERRIDE = "--config.fetchTimeout=600000";
  * Verified against pnpm 10.29.3: `peerDependencyRules.ignoreMissing` does
  * NOT prevent the fetch (it only silences the warning), so this flag is the
  * only lever that actually works.
+ *
+ * pnpm 12 ignores this flag on the command line too (12.4.1 auto-installs
+ * the peer regardless); runDshPlugin repeats it as
+ * PNPM_CONFIG_AUTO_INSTALL_PEERS, which 12 reads (#615).
  */
 export declare const AUTO_INSTALL_PEERS_OFF = "--config.auto-install-peers=false";
 /**
@@ -68,8 +91,49 @@ export declare function isUnpublishedHostPeer(pkg: string | undefined, profile: 
  * Any recognized failure that survives gets its bilingual explanation
  * appended to stderr so the UI shows an actionable message instead of a
  * wall of text (#20 bug 3). Cancelled runs are never recovered.
+ *
+ * The release-age bypass can be declined (`releaseAgeBypass: false`). Its
+ * safety argument above assumes the young package is already installed; a
+ * fresh install pinned to the registry's latest (#594) is the one case
+ * where it is not — there the bypass would be what installs the young
+ * version, over a minimumReleaseAge the profile set on purpose — so the
+ * install route declines it and falls back to the bare name instead.
+ *
+ * `marketFlags: false` says the host runs pnpm itself and takes no options
+ * from us (the official Desktop bridge, #732). The four recoveries below
+ * each decorate a command with an option, so on such a host they are skipped
+ * rather than sent and refused — and because their classifier messages say
+ * the market retried, the note appended at the end says it did not.
  */
-export declare function withHoistRecovery(run: PluginRunner, profile: string, pluginArgs: string[], profileDirectory?: string): Promise<InstallResult>;
+export declare function withHoistRecovery(run: PluginRunner, profile: string, pluginArgs: string[], profileDirectory?: string, options?: {
+    releaseAgeBypass?: boolean;
+    marketFlags?: boolean;
+}): Promise<InstallResult>;
+/**
+ * The tail of the diagnostics file the dsh CLI pointed at, when it pointed at
+ * one (#672).
+ *
+ * `dsh plugin` writes pnpm's entire output to a file and prints only
+ * `dsh: pnpm failed; diagnostics: <path>`. For a failure the market cannot
+ * classify, that line is all it has — the reasons people reported (#244,
+ * #192, #138) were all "the UI shows one unhelpful line" for causes that
+ * were written down somewhere the UI never looked.
+ *
+ * Bounded on purpose: absolute paths only, a regular file, and at most the
+ * last {@link DIAGNOSTICS_TAIL_BYTES}. The path comes from our own child, but
+ * the market only ever needs the end of a log, and reading an arbitrary
+ * amount of an arbitrary file is not worth anything it could add.
+ *
+ * @returns the path and the text, or null when the output names no readable
+ *   diagnostics file.
+ */
+export declare function diagnosticsTail(result: {
+    stdout: string;
+    stderr: string;
+}): {
+    path: string;
+    text: string;
+} | null;
 /**
  * Whether pnpm never started at all, so the profile cannot have been touched.
  *
@@ -83,6 +147,21 @@ export declare function withHoistRecovery(run: PluginRunner, profile: string, pl
  * @returns true when the failure happened before pnpm could run.
  */
 export declare function pnpmNeverStarted(result: InstallResult): boolean;
+/**
+ * Whether pnpm failed because the running host holds the package's files
+ * open, so nothing pnpm runs from inside that host can replace them.
+ *
+ * Worth asking for the same reason as pnpmNeverStarted: the update route
+ * answers a failed run by reinstalling the previous build, and that reinstall
+ * performs the very rename that just failed, against the same open handles
+ * (#608 by @Euezb). It cannot win — pnpm retries the rename for about three
+ * minutes before giving up — and the route then told the user their profile
+ * might be broken and to inspect it before restarting, when nothing had been
+ * reinstalled and the previous build was still there to be checked.
+ * @param result - the failed run.
+ * @returns true when pnpm was stopped by files the host holds open.
+ */
+export declare function pnpmBlockedByOpenFiles(result: InstallResult): boolean;
 /**
  * The most specific description of a failed run available, for logs.
  *
@@ -117,7 +196,7 @@ export declare function retargetCollections(run: PluginRunner, profile: string, 
  * profile at all, which is a broken plugin-command channel rather than
  * anything wrong with the plugin (#258).
  */
-export declare function validateAddedPlugins(run: PluginRunner, profile: string, before: Set<string>, explicitDir?: string): Promise<{
+export declare function validateAddedPlugins(run: PluginRunner, profile: string, before: Set<string>, explicitDir?: string, hostDirectory?: string | null): Promise<{
     added: string[];
     keep: string[];
     removedBroken: string[];
@@ -127,6 +206,48 @@ export declare function validateAddedPlugins(run: PluginRunner, profile: string,
         owner: string;
     }[];
 }>;
+/**
+ * The node_modules root of the DSH host deployment `directory` belongs to.
+ *
+ * CLI layouts install the host as `<prefix>/node_modules/@deepseek-ai/dsh`,
+ * so the shared root is two dirname steps up; a flat Desktop layout keeps
+ * the host package at the deployment root (#662's
+ * `<desktop-app>\dependencies\dsh`), with its pnpm-managed node_modules
+ * directly beside its package.json. `dshHostInfo()` already distinguishes
+ * the two — this is pure path arithmetic on whichever directory it returned.
+ */
+export declare function hostNodeModulesRoot(directory: string): string;
+/**
+ * Normalize a link target for path comparison: restore the UNC device form
+ * (`\\?\UNC\server\share` back to `\\server\share` — stripped of its prefix
+ * it is no longer absolute and resolve() would re-root it against the
+ * cwd), then remove the NT device prefixes `\\?\` and the subst-style
+ * `\??\` mklink stores. Measured on Node 24/win32: readlinkSync returns
+ * the plain absolute path, so these branches only matter for links created
+ * outside Node — but a comparison must not silently miss because of them.
+ */
+export declare function normalizedLinkTarget(target: string): string;
+/**
+ * Remove the host-side bridge link a confirmed uninstall leaves dangling
+ * (#662). The official boot projects profile packages into the host
+ * deployment's node_modules as links (Junction or SymbolicLink — lstat
+ * reports both as symlinks) and never reclaims them, and `dsh plugin
+ * remove` knows nothing about them, so without this the link outlives the
+ * package it pointed at and every tool that lstats its way through
+ * node_modules (rg first among them) fails on it.
+ *
+ * The gate is deliberately total: only `<host node_modules>/<name>` is ever
+ * touched, only when that entry is a link whose normalized target is
+ * exactly this profile's copy of `name`, and only when that copy is really
+ * gone — a live bridge for a package that is still installed must survive.
+ * A null `hostDirectory` (no host locatable — a plain `dsh web` from a
+ * global install) is a documented no-op.
+ *
+ * @returns whether a dangling bridge was removed. Never throws: the removal
+ * this cleans up after already succeeded, and a cleanup failure must not
+ * fail the uninstall that triggered it.
+ */
+export declare function removeDanglingHostBridge(name: string, profileDirectory: string, hostDirectory: string | null): boolean;
 /**
  * Group flat `{id, owner}` conflict hits by the installed plugin that owns
  * them. What the user has to decide is which PLUGINS to uninstall, not which
@@ -164,6 +285,25 @@ export declare function isStaleUpdate(check: {
  * node_modules yet (the fetcher rejects before materialization, #68).
  */
 export declare function parsePrepareNotAllowed(stdout: string, stderr: string): string | null;
+/**
+ * The allowBuilds key pnpm itself printed for a prepare refusal, when it
+ * printed one (#698).
+ *
+ * pnpm 11 ends ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED with the exact line to
+ * add — measured on 11.8.0 against the reported plugin:
+ *
+ *     For example:
+ *     allowBuilds:
+ *       @dsh-external/dsh-super-injector@https://codeload.github.com/…/tar.gz/<sha>: true
+ *
+ * For a TRANSITIVE git dependency that key is the only knowledge anyone has
+ * of its source: the package is in neither node_modules, package.json nor
+ * the catalog. pnpm 10 prints an `onlyBuiltDependencies` example with the
+ * bare name instead, and gets null here — the bare name is what it needs.
+ *
+ * @returns the key, or null when the output carries no allowBuilds example.
+ */
+export declare function parsePrepareKey(stdout: string, stderr: string): string | null;
 /**
  * Package names pnpm reported as having their build scripts ignored
  * ("Ignored build scripts: esbuild, koffi."). Empty when none.

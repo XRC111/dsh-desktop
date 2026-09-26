@@ -76,7 +76,11 @@ param(
     [string]$SetupUrlDev    = '',
     [string]$SetupUrlW7     = '',
     [string]$SetupUrlW7Beta = '',
-    [string]$SetupUrlW7Dev  = ''
+    [string]$SetupUrlW7Dev  = '',
+    # 插件热更包 meta（scripts\pack-plugins.mjs 产物）。留空 = 自动取 build 下
+    # 最新的 plugins-dshmarket-*.meta.json；挂进六份 feed 的 plugins 段后，
+    # 在线用户（含已装的 beta/dev 壳）无需重下安装包即可升级插件。
+    [string]$PluginsMeta    = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -462,10 +466,21 @@ if ($SkipGen) {
         $nodeArgs = @('scripts\gen-update-json.mjs', '--base-url', $BaseUrl, '--version', $Version,
                       '--channel', $Channel, '--notes', $Notes) + $Extra
         if ($SetupUrl) { $nodeArgs += @('--setup-url', $SetupUrl) } else { $nodeArgs += '--hot-only' }
+        if ($pluginsMeta) { $nodeArgs += @('--plugins', $pluginsMeta) }
         Run-Node $nodeArgs
         $suffix = if ($SetupUrl) { '（安装包走外链）' } else { '' }
         Ok "已生成 dist\update\latest$(if ($Channel -ne 'stable') { '-' + $Channel }).json$suffix"
     }
+    # 插件热更包：dshmarket 的客户端捆了宿主 ui-primitives 的图标名（…14/…16），
+    # dsh 0.1.7-alpha.1 把图标改名为 …Regular/…Medium 且删了旧导出 → beta/dev 壳的
+    # 插件市场 React #130。上游 1.66.1 加了双代解析（icons.ts），换包即修。
+    $pluginsMeta = $PluginsMeta
+    if (-not $pluginsMeta) {
+        $cand = @(Get-ChildItem 'build\plugins-dshmarket-*.meta.json' -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending | Select-Object -First 1)
+        if ($cand.Count) { $pluginsMeta = $cand[0].FullName }
+    }
+    if ($pluginsMeta) { Ok "插件热更包：$pluginsMeta" } else { Info '未挂插件热更包（feed 无 plugins 段）' }
     # stable feed 额外挂降级资源（热壳变体 ×2 + 运行时降级差分 ×2）：
     # beta/dev 壳切回 stable 后轮询 latest.json，壳版本(10.2.0/10.3.0) > feed 版本(10.1.0)
     # 不触发 shellOutdated，全靠 rt 精确基线命中触发 available → hot+rt 一起落位 → 整体滚回。

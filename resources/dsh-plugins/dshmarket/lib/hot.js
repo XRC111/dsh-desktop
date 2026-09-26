@@ -24,11 +24,62 @@ var __rewriteRelativeImportExtension = (this && this.__rewriteRelativeImportExte
     return path;
 };
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { asChannel } from './channels.js';
 import { asRegion, normalizeGithubProxy } from './regions.js';
 import { logEvent } from './log.js';
+import { declaredBundlePatchFile, entryArtifactExists } from './profile.js';
+/**
+ * Profile-scoped resolution for hot-mount rows: turn a bare package name into
+ * the absolute `file://` entry URL of the package just installed into
+ * `profileDir`.
+ *
+ * Include-tree rows reach `Include.import` as BARE names (`name:
+ * '@scope/pkg'`), and the base class resolves them against the LOADER's own
+ * location — the host closure
+ * (`closures/<fp>/node_modules/…/cordis-plugin-loader`), whose parent walk
+ * can never reach `home/profiles/<profile>/node_modules/`. Under a host whose
+ * loader sits in an immutable dependency closure, EVERY market hot mount dies
+ * with `Cannot find module '<pkg>' from '…/cordis-plugin-loader/…'` and falls
+ * back to "restart required", blaming the plugin for what is a resolution
+ * anchor problem.
+ *
+ * Resolving the row name HERE, against the profile the package was actually
+ * installed into, is anchor-independent: `require.resolve` walks
+ * `profileDir/node_modules` natively, so the tree hands the loader a
+ * `file://` URL needing no further resolution. Non-bare specifiers (relative
+ * paths, `file://`, `cordis:` builtins) and names that do not resolve under
+ * the profile pass through unchanged, preserving base-class semantics for
+ * every shape this fix does not own.
+ *
+ * The fallback keeps the name bare rather than synthesising a URL: a package
+ * whose entry cannot be located via `require.resolve` (no `main`/exports —
+ * the market's own `entryArtifactExists` heuristic covers those shapes before
+ * an install is accepted) is not something this resolver should guess about.
+ * Client-only shims never reach this function (their rows are replaced by a
+ * no-op host module before the file is written).
+ */
+export function resolveProfileEntry(profileDir, name) {
+    if (!name || name.startsWith('.') || name.startsWith('cordis:') || name.startsWith('file://'))
+        return name;
+    const packageDir = join(profileDir, 'node_modules', ...name.split('/'));
+    try {
+        return pathToFileURL(createRequire(join(profileDir, 'package.json')).resolve(name)).href;
+    }
+    catch {
+        // require.resolve needs a resolvable package entry; the market's install
+        // validation accepts a broader artifact set (exports objects, index.js).
+        // Fall back to the index.js artifact so a valid mount is not refused over
+        // resolver strictness — and keep the bare name when no checkable entry
+        // exists, letting the loader produce its own (accurate) error.
+        if (entryArtifactExists(packageDir)) {
+            return pathToFileURL(join(packageDir, 'index.js')).href;
+        }
+        return name;
+    }
+}
 const HOT_DIR = '.dsh-market';
 /**
  * Ceiling for one hot-mount activation, env-overridable like the install
@@ -147,6 +198,26 @@ export function cleanHotDir(profileDir) {
 function stateFile(profileDir) {
     return join(profileDir, HOT_DIR, 'state.json');
 }
+const BROKEN_REASONS = new Set(['incomplete-build-locked']);
+/** The on-disk shape of {@link MarketState.brokenPlugins}, sanitized. */
+function brokenPluginsFromUnknown(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value))
+        return undefined;
+    const out = {};
+    for (const [name, raw] of Object.entries(value)) {
+        if (name === '' || raw === null || typeof raw !== 'object' || Array.isArray(raw))
+            continue;
+        const record = raw;
+        if (typeof record.reason !== 'string' || !BROKEN_REASONS.has(record.reason))
+            continue;
+        out[name] = {
+            spec: typeof record.spec === 'string' ? record.spec.slice(0, MAX_NOTE) : '',
+            reason: 'incomplete-build-locked',
+            at: typeof record.at === 'string' ? record.at : '',
+        };
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+}
 /** Unique non-empty strings in `value`, order preserved. */
 function uniqueStrings(value) {
     if (!Array.isArray(value))
@@ -166,6 +237,46 @@ export const MAX_FAVORITES = 500;
 /** Catalog URLs the user may favorite; http(s) only, order preserved. */
 function favoriteUrls(value) {
     return uniqueStrings(value).filter(url => url.startsWith('http://') || url.startsWith('https://'));
+}
+/** A POSIX-looking environment variable name: the name part of `KEY=value`. */
+const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/** Upper bound on one pinned env value, so state.json cannot balloon. */
+const MAX_ENV_VALUE = 4096;
+/**
+ * Sanitize an untrusted build-env map (state.json, or the card route's body)
+ * into the shape spawnEnv can merge.
+ *
+ * An empty map and a non-object both read as undefined: clearing the card
+ * must inherit the composition, and a blank line in state.json must not
+ * disable every pinned variable. Only the merge precedence in
+ * src/dsh-cli.ts spawnEnv — never this — protects PATH and CI, but a value
+ * a user typed for them would silently do nothing there, so it is rejected
+ * here with a reason instead.
+ *
+ * `GIT_ASKPASS` and `SSH_ASKPASS` are deliberately NOT rejected, though they
+ * are the two names that can re-open a credential prompt: pointing them at a
+ * program is the supported non-interactive way to answer one, and #587/#596
+ * close the *terminal* fallback (GIT_TERMINAL_PROMPT, BatchMode) rather than
+ * the program one. A user who pins these has already said where the answer
+ * comes from; a user who does not still gets the closed prompt.
+ */
+export function buildEnvFromUnknown(value) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value))
+        return undefined;
+    const out = {};
+    for (const [key, raw] of Object.entries(value)) {
+        if (!ENV_KEY_RE.test(key))
+            continue;
+        if (key === 'PATH' || key === 'CI')
+            continue;
+        if (typeof raw !== 'string')
+            continue;
+        const entry = raw.trim();
+        if (entry === '')
+            continue;
+        out[key] = entry.slice(0, MAX_ENV_VALUE);
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
 }
 /**
  * Read the whole market state. Legacy `disabledSkins` (the pre-#60
@@ -195,6 +306,7 @@ export function readMarketState(profileDir) {
             }
         }
         const githubProxy = normalizeGithubProxy(state.githubProxy);
+        const brokenPlugins = brokenPluginsFromUnknown(state.brokenPlugins);
         return {
             disabled: new Set(disabled),
             groups,
@@ -207,6 +319,8 @@ export function readMarketState(profileDir) {
             regionAuto: state.regionAuto === true && asRegion(state.region) !== null ? true : undefined,
             favorites: favoriteUrls(state.favorites),
             ...(githubProxy === null ? {} : { githubProxy }),
+            ...(brokenPlugins === undefined ? {} : { brokenPlugins }),
+            buildEnv: buildEnvFromUnknown(state.buildEnv),
         };
     }
     catch {
@@ -260,6 +374,9 @@ export function writeMarketState(profileDir, state) {
     const githubProxy = Object.prototype.hasOwnProperty.call(state, 'githubProxy')
         ? state.githubProxy
         : onDisk.githubProxy;
+    const broken = Object.prototype.hasOwnProperty.call(state, 'brokenPlugins')
+        ? state.brokenPlugins
+        : onDisk.brokenPlugins;
     writeFileSync(stateFile(profileDir), JSON.stringify({
         disabled: [...state.disabled],
         groups: state.groups,
@@ -275,6 +392,15 @@ export function writeMarketState(profileDir, state) {
         ...(region === undefined ? {} : { region }),
         ...(regionAuto === true ? { regionAuto: true } : {}),
         ...(githubProxy === undefined ? {} : { githubProxy }),
+        // Omission preserves, explicit undefined clears — the same contract as
+        // githubProxy above, and the one a repaired plugin needs: the entry
+        // exists only while the declaration is still missing.
+        ...(broken === undefined ? {} : { brokenPlugins: broken }),
+        ...(state.region === undefined ? {} : { region: state.region }),
+        ...(state.regionAuto === true ? { regionAuto: true } : {}),
+        // Omitted while not saved, so a card that was never touched keeps
+        // inheriting the composition's buildEnv on every boot.
+        ...(state.buildEnv === undefined ? {} : { buildEnv: state.buildEnv }),
     }));
 }
 /** Plugins the user switched off; skipped by the boot re-mount. */
@@ -358,12 +484,23 @@ export async function hotMount(ctx, profileDir, packageName) {
                 reason: '宿主不支持热挂载(include 插件不可导入),需重启 / the host cannot hot-mount (include plugin unavailable); restart required',
             };
         }
-        let patchText;
-        try {
-            patchText = readFileSync(join(profileDir, 'node_modules', packageName, 'cordis.patch.yml'), 'utf8');
-        }
-        catch {
-            patchText = null;
+        // Where the patch lives is the PACKAGE's decision, declared as
+        // `dsh.bundle.patch` — `aegis` keeps it in `./extensions/dsh/`. Reading
+        // only the package root made a plugin whose patch is declared elsewhere
+        // look like one with no bundle at all, and the user was told "no bundle
+        // patch … nothing to hot-mount" for a package that plainly has one
+        // (#646). The root file stays as the fallback: it is the long-standing
+        // convention, and `profile.ts` resolves the declared field for everything
+        // else, so the two now agree on where a patch is.
+        const packageRoot = join(profileDir, 'node_modules', packageName);
+        const declared = declaredBundlePatchFile(packageRoot);
+        let patchText = null;
+        for (const file of declared !== null ? [declared] : [join(packageRoot, 'cordis.patch.yml')]) {
+            try {
+                patchText = readFileSync(file, 'utf8');
+                break;
+            }
+            catch { /* try the next location */ }
         }
         let rows;
         if (patchText !== null) {
@@ -394,8 +531,14 @@ export async function hotMount(ctx, profileDir, packageName) {
         mkdirSync(dir, { recursive: true, mode: 0o700 });
         hotSequence += 1;
         const file = join(dir, `hot-${String(hotSequence)}.yml`);
+        // Rows carry ABSOLUTE file:// entry URLs, resolved against this profile:
+        // the loader's own parent-walk (from the host closure) can never reach
+        // `profileDir/node_modules`, so bare names in the file would fail to
+        // import on closure-hosted loaders. The file remains a faithful record —
+        // `cleanHotDir` wipes it on every boot and the bundle layer owns
+        // persistence, so nothing reads these files back.
         const yml = rows
-            .map(row => `- id: 'mkt-${row.id}'\n  name: '${row.name}'\n`)
+            .map(row => `- id: 'mkt-${row.id}'\n  name: '${resolveProfileEntry(profileDir, row.name)}'\n`)
             .join('');
         writeFileSync(file, yml);
         const handle = ctx.plugin(HotTree, { path: pathToFileURL(file).href });
@@ -403,16 +546,25 @@ export async function hotMount(ctx, profileDir, packageName) {
             await raceActivationTimeout(handle.await());
         }
         catch (error) {
+            // A failed or wedged mount must leave NOTHING behind: the disposed
+            // subtree stops retrying the import, and the input file is removed so
+            // it cannot be re-imported by a later boot or replay (a leftover file
+            // re-throwing the same resolve error on every composition replay
+            // produced unbounded error-log growth on a closure-hosted loader).
+            try {
+                Promise.resolve(handle.dispose()).catch(() => { });
+            }
+            catch { /* best effort */ }
+            try {
+                rmSync(file, { force: true });
+            }
+            catch { /* best effort */ }
             if (error instanceof ActivationTimeout) {
                 // A wedged activation would otherwise hold this request open forever:
                 // the route's `finally { installing = false }` never runs, so every
                 // later install/update/uninstall gets 409'd until a host restart.
                 // Unwind the half-mounted subtree best-effort; disposal never blocks
                 // the reply, and the caller falls back to restart activation.
-                try {
-                    Promise.resolve(handle.dispose()).catch(() => { });
-                }
-                catch { /* best effort */ }
             }
             throw error;
         }
