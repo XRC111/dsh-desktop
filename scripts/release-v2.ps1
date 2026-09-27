@@ -347,6 +347,14 @@ if ($SkipPack -or $SkipW7) {
     Info '跳过'
 } else {
     Invoke-W7Build -Version $W7Version -Tree '' -Label 'w7 stable'
+
+    # ── w7 前向热壳 ×1（供已装旧 w7 稳定版的用户热更上来）──────────────────────
+    # 同样是以前漏掉的：不打这个，w7 用户会卡在「永远提示有新版本、版本不变」的
+    # 死循环 —— feed 版本(7.1.3) > 壳版本(7.1.2) 触发 shellOutdated，但 pickHot 只能
+    # 挑到旧的 7.1.2 热壳（base=7.1.0 恰好满足），装上后壳版本仍是 7.1.2 → 下次检查
+    # 又提示更新。base 用默认值（w7 与主线共用 config.hotMinBaseVersion）。
+    Run-Node @('scripts\pack-hot.mjs', '--version', $W7Version)
+    Ok "w7 前向热壳完成（version=$W7Version）"
 }
 
 # ---------------------------------------------------------------------------
@@ -363,19 +371,29 @@ if ($SkipPack -or $SkipStable) {
     }
     Invoke-FullBuild -Version $StableVersion -Channel 'stable' -Label '主线 stable'
 
+    # ── 前向热壳 ×1（供**已装旧稳定版**的用户热更上来）─────────────────────────
+    # 这一步以前漏了：脚本只打「降级壳」（base=beta/dev），从不打「前向壳」，
+    # 于是装 10.1.1 的用户拿不到 10.1.2 的热更 —— 现有 hot 变体 base=10.2.0/10.3.0，
+    # pickHot 要求 installed >= base，10.1.1 全部不满足 → 只能下 156MB 安装包。
+    # base 用 pack-hot 的默认值（config.hotMinBaseVersion = 1.1.1，传送带语义：
+    # 任何 >= 1.1.1 的安装版都能直接跳到最新壳）。必须趁 out/ 还是 $StableVersion
+    # 产物时打（步骤 3 会覆盖 out/）。
+    Run-Node @('scripts\pack-hot.mjs', '--version', $StableVersion)
+    Ok "前向热壳完成（base=$((Get-Content package.json -Raw | ConvertFrom-Json).config.hotMinBaseVersion) -> version=$StableVersion）"
+
     # ── 降级热壳 ×2（供 beta/dev 壳切回 stable 时整体滚回用）─────────────────
     # pickHot 只按 baseVersion 过滤（installed >= base 即可用）不看方向，10.2.0/10.3.0
     # 的壳切回 stable 时命中这里打包的变体、套上 10.1.0 壳代码；10.1.0 用户因
     # 版本低于 base 天然隔离。必须趁 out/ 还是 10.1.0 产物时打（步骤 3 会覆盖它）。
-    $hotRollback = @(Get-ChildItem "build\hot-shell-$StableVersion-*.tar" -ErrorAction SilentlyContinue)
-    if ($hotRollback.Count -ge 2) {
-        Info "降级热壳已存在（$($hotRollback.Count) 个），跳过"
-    } else {
-        foreach ($base in @($BetaVersion, $DevVersion)) {
-            Run-Node @('scripts\pack-hot.mjs', '--version', $StableVersion, '--base', $base)
-        }
-        Ok "降级热壳完成（base=$BetaVersion / $DevVersion -> version=$StableVersion）"
+    #
+    # 注意别用「build\hot-shell-$StableVersion-*.tar 的总数」判存在：那个 glob 也会
+    # 数到上面刚打的前向壳（base=1.1.1），总数一上来就 >= 2 → 降级壳被误判为「已存在」
+    # 而永远不打。pack-hot 自身已按 (version,baseVersion) 去重，这里逐个调用即可，
+    # 已有变体会自己跳过（幂等）。
+    foreach ($base in @($BetaVersion, $DevVersion)) {
+        Run-Node @('scripts\pack-hot.mjs', '--version', $StableVersion, '--base', $base)
     }
+    Ok "降级热壳完成（base=$BetaVersion / $DevVersion -> version=$StableVersion）"
 }
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,50 @@ const version = arg('version', pkg.version);
 const baseVersion = arg('base', pkg.config?.hotMinBaseVersion ?? version);
 const staging = path.join(root, 'build', 'hot-staging');
 
+// 系统 tar（打包与读 manifest 都用它；不可用时回退到 tar npm 包）
+const tarExe =
+  process.platform === 'win32'
+    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+    : 'tar';
+
+// ── 0) 幂等：同 (version, baseVersion) 变体已存在就跳过 ──────────────────────
+// 文件名只带内容哈希、不带 base，没法从名字区分「前向壳」（base = 本线起点）
+// 与「降级壳」（base = beta/dev），所以必须读包内 hot-manifest.json 判断。
+// 不做这层去重，发版脚本每重跑一次就多一个同版本新哈希的包：feed.hot 越挂越多、
+// 每个 350KB 还要重复上传 Pages（builtAt 每次都变 → 哈希必然不同）。
+function findExistingVariant(v, base) {
+  const dir = path.join(root, 'build');
+  let names = [];
+  try {
+    names = fs.readdirSync(dir).filter((n) => n.startsWith(`hot-shell-${v}-`) && n.endsWith('.tar'));
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    try {
+      const res = spawnSync(tarExe, ['-xOf', path.join(dir, name), './hot-manifest.json'], {
+        encoding: 'utf8',
+        timeout: 10000,
+      });
+      if (res.status !== 0 || !res.stdout) continue;
+      const m = JSON.parse(res.stdout);
+      if (m.version === v && m.baseVersion === base) return path.join(dir, name);
+    } catch {
+      /* 读不出来就当没找到，继续找下一个 */
+    }
+  }
+  return null;
+}
+
+if (!process.argv.includes('--force')) {
+  const dup = findExistingVariant(version, baseVersion);
+  if (dup) {
+    console.log(`[pack-hot] 已存在同变体热壳：${path.basename(dup)}`);
+    console.log(`[pack-hot] version=${version} baseVersion=${baseVersion} → 跳过（要强制重打加 --force）`);
+    process.exit(0);
+  }
+}
+
 // ── 1) 准备暂存目录 ─────────────────────────────────────────────────────────
 if (!fs.existsSync(path.join(root, 'out', 'main', 'boot.js'))) {
   console.error('[pack-hot] 未找到 out/main/boot.js，请先执行 npm run build');
@@ -86,11 +130,6 @@ fs.writeFileSync(
 //
 // 打包方式：优先用系统 tar.exe；如果不可用（被安全软件/shim 阻断、返回 null），
 // 回退到 Node 原生 tar 打包（用 tar npm 包，客户端也用同一个库解压）。
-const tarExe =
-  process.platform === 'win32'
-    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
-    : 'tar';
-
 const tmpTar = path.join(root, 'build', `.hot-shell-${version}.tmp.tar`);
 fs.rmSync(tmpTar, { force: true });
 
