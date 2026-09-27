@@ -1,9 +1,35 @@
 {
   "name": "dsh-desktop",
   "productName": "DSH Desktop",
-  "version": "10.1.1",
+  "version": "10.1.2",
   "description": "DeepSeek Harness desktop shell — 开箱即用的 Windows 桌面封装",
   "author": "DSH Desktop",
+  "contributors": [
+    {
+      "name": "XRC111",
+      "url": "https://github.com/XRC111"
+    },
+    {
+      "name": "DeepSeek",
+      "url": "https://github.com/deepseek-ai",
+      "comment": "开发期间使用的 AI 模型"
+    },
+    {
+      "name": "GLM (Z.ai)",
+      "url": "https://github.com/zai-org",
+      "comment": "开发期间使用的 AI 模型"
+    },
+    {
+      "name": "Hunyuan (Tencent)",
+      "url": "https://github.com/Tencent-Hunyuan",
+      "comment": "开发期间使用的 AI 模型"
+    },
+    {
+      "name": "Kimi (Moonshot AI)",
+      "url": "https://github.com/MoonshotAI",
+      "comment": "开发期间使用的 AI 模型"
+    }
+  ],
   "license": "MIT",
   "private": true,
   "main": "out/main/index.js",

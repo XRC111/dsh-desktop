@@ -840,3 +840,22 @@ $env:DSH_DESKTOP_UPDATE_AUTO = '1'
 - 仅提供 **x64** 目标（Electron 44 已移除 32 位构建）
 - 未做代码签名，SmartScreen 首次运行可能提示；如需消除，请配置 `win.certificateFile` / `certificatePassword` 或走企业签名流程
 - Harness 处于 developer preview，升级 dsh 版本请修改根 `package.json` 的 `config.dshVersion` 后重新执行 `npm run prepare:runtime -- --force`
+
+---
+
+## 15. 贡献者
+
+**作者与维护者**：[XRC111](https://github.com/XRC111)
+
+开发过程中使用了以下 AI 模型（按字母序，用于代码编写、排障与文档撰写）：
+
+| 模型 | 提供方 |
+| --- | --- |
+| [DeepSeek](https://github.com/deepseek-ai) | DeepSeek |
+| [GLM](https://github.com/zai-org) | Z.ai（智谱） |
+| [Hunyuan](https://github.com/Tencent-Hunyuan) | 腾讯 |
+| [Kimi](https://github.com/MoonshotAI) | Moonshot AI（月之暗面） |
+
+> 上表是**开发期间使用的模型/工具**，不是代码贡献者；
+> 项目的设计决策、实现取舍与最终质量由维护者负责。
+
