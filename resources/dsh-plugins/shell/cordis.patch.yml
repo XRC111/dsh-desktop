@@ -1,0 +1,5 @@
+# DSH Desktop 桌面适配面板：把「桌面」一节挂进 Harness 设置页。
+# 与 @dsh-desktop/updater 同一套路（禁用/新增都靠 insert）。
+- insert:
+    - id: dsh-desktop-shell
+      name: '@dsh-desktop/shell'

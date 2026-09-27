@@ -117,9 +117,10 @@ function collectUrls(feed) {
     push(r.url);
     pushParts(r.url, r.parts);
   }
-  if (feed.plugins) {
-    push(feed.plugins.url);
-    pushParts(feed.plugins.url, feed.plugins.parts);
+  // plugins 可能是单个对象或数组（一次挂多个插件包）
+  for (const p of asArray(feed.plugins)) {
+    push(p.url);
+    pushParts(p.url, p.parts);
   }
   return urls;
 }
@@ -141,8 +142,9 @@ for (const f of feeds) {
   for (const r of asArray(f.json.runtime)) {
     if (r.parts?.length && r.url) chunkedNames.add(baseNameOf(r.url));
   }
-  const pl = f.json.plugins;
-  if (pl?.parts?.length && pl.url) chunkedNames.add(baseNameOf(pl.url));
+  for (const pl of asArray(f.json.plugins)) {
+    if (pl?.parts?.length && pl.url) chunkedNames.add(baseNameOf(pl.url));
+  }
 }
 
 for (const [name, url] of urlNames) {

@@ -136,8 +136,11 @@ export interface UpdateFeed {
    * 应用后重启，下次再从新基线继续爬。
    */
   runtime?: RuntimeUpdateInfo | RuntimeUpdateInfo[];
-  /** 插件包（可选安装，见 scripts/install-plugin.ps1） */
-  plugins?: PluginsUpdateInfo;
+  /**
+   * 插件包（可选安装）。单个对象或**数组**（一次挂多个插件）。
+   * 数组写法是本项目的扩展：老 feed 的单对象写法继续支持（客户端统一 asArray 归一化）。
+   */
+  plugins?: PluginsUpdateInfo | PluginsUpdateInfo[];
   url?: string;
   sha256?: string;
   size?: number;
@@ -693,17 +696,19 @@ export class Updater {
       // 否则「只发运行时补丁」的那种版本会被判成"已是最新"而永远推不出去。
       const rt = this.pickRuntime(feed);
       const plugins = this.pickPlugins(feed);
-      const available = shellOutdated || !!rt || !!plugins;
+      const hasPlugins = plugins.length > 0;
+      const available = shellOutdated || !!rt || hasPlugins;
 
       log(
         `更新检查：当前 ${current} / 云端 ${latest} → ${shellOutdated ? '有更新' : '已是最新'}` +
-          `${hot ? '（可用热更新）' : ''}${rt ? `（有运行时更新 ${rt.version}）` : ''}${plugins ? `（有新插件 ${plugins.name ?? plugins.version}）` : ''}` +
+          `${hot ? '（可用热更新）' : ''}${rt ? `（有运行时更新 ${rt.version}）` : ''}` +
+          `${hasPlugins ? `（有新插件 ${plugins.map((p) => p.name ?? p.version).join('、')}）` : ''}` +
           `${skipped ? '（该版本已被用户跳过）' : ''}`,
       );
 
       // 插件：新增能力，静默后台安装（不该要求用户决策）。
       // 关键是**无论有没有其它更新都要装** —— 否则外壳已是最新时插件永远推不下去。
-      if (plugins) this.installPluginsQuietly(plugins);
+      if (hasPlugins) this.installPluginsQuietly(plugins);
 
       if (!available) {
         this.setState({
@@ -711,16 +716,16 @@ export class Updater {
           latestVersion: latest,
           checkedAt: this.persisted.lastCheckAt,
           prompt: null,
-          message: plugins ? '正在安装新插件…' : `已是最新版本（${current}）`,
+          message: hasPlugins ? '正在安装新插件…' : `已是最新版本（${current}）`,
         });
         // 不再弹系统对话框：手动检查的结果用托盘气泡轻提示（设置卡片同步显示文案）
-        if (interactive && !plugins) {
+        if (interactive && !hasPlugins) {
           this.opts.notify('检查更新', `已是最新版本（${current}）`);
         }
         return this.getState();
       }
 
-      const pluginsOnly = !shellOutdated && !rt && !!plugins;
+      const pluginsOnly = !shellOutdated && !rt && hasPlugins;
       // 应用内「发现新版本」横幅（1.1.22 起取代系统对话框）：
       // 跳过的版本不再打扰（强制更新除外）——跳过语义由此真正闭环，而不是
       // 往弹窗里加一行"该版本此前被你跳过"、跳了等于没跳（1.1.20 实测翻车）。
@@ -769,7 +774,7 @@ export class Updater {
             }
           : null,
         message: pluginsOnly
-          ? `正在安装新组件 ${plugins?.name ?? ''}…`
+          ? `正在安装新组件 ${plugins.map((p) => p.name ?? p.version).join('、')}…`
           : downgrade && (hot || rt)
             ? `可回滚到稳定版 ${latest}（外壳 + 运行时一并回到稳定线，重启即生效）`
             : !shellOutdated && rt
@@ -781,7 +786,7 @@ export class Updater {
 
       // 云端有更新但当前设备什么通道都没有（如纯热更 feed 基线不匹配）：
       // 横幅按钮无从谈起，托盘提示兜底说明。
-      if (showPrompt && !hot && !rt && !hasInstaller) {
+      if (showPrompt && !hot && !rt && !hasInstaller && !hasPlugins) {
         this.opts.notify(
           'DSH Desktop 有新版本',
           `${latest} 已发布，但当前设备暂无可用更新通道，请稍后再试。`,
@@ -869,20 +874,22 @@ export class Updater {
         const hot = this.pickHot(feed);
         const rt = this.pickRuntime(feed);
         const plugins = this.pickPlugins(feed);
-        if (!hot && !rt && !plugins) {
+        if (!hot && !rt && plugins.length === 0) {
           await this.applyInstaller(feed, options.interactive);
           return;
         }
         const labels: string[] = [];
         if (hot) labels.push(`热更新 ${await this.stageHot(hot, hot.version || feed.version)}`);
         if (rt) labels.push(`运行时 ${await this.stageRuntime(rt)}`);
-        // 插件属于"新增能力"，不必让用户决策，自动落位后随其它更新一起提示重启
-        if (plugins) {
+        // 插件属于"新增能力"，不必让用户决策，自动落位后随其它更新一起提示重启。
+        // 逐个独立 try：一个插件失败不该拖垮其它插件或外壳/运行时的落位。
+        for (const plugin of plugins) {
+          const label = plugin.name ?? plugin.version;
           try {
-            await this.stagePlugins(plugins);
-            labels.push(`插件 ${plugins.name ?? plugins.version}`);
+            await this.stagePlugins(plugin);
+            labels.push(`插件 ${label}`);
           } catch (err) {
-            log(`插件安装失败（不阻断其它更新）：${String((err as Error)?.message ?? err)}`);
+            log(`插件 ${label} 安装失败（不阻断其它更新）：${String((err as Error)?.message ?? err)}`);
           }
         }
         await this.finalizeStaged(options.interactive, labels);
@@ -949,38 +956,43 @@ export class Updater {
    * 所以随包内置在 `resources/dsh-plugins/` 的新插件**到不了已安装的用户**。
    * 插件只能单独下载到用户数据目录（`plugins/`），再由 plugin-installer 落位。
    */
-  private pickPlugins(feed: UpdateFeed): PluginsUpdateInfo | null {
-    const info = feed.plugins;
-    if (!info?.url && !(info?.parts && info.parts.length)) return null;
+  private pickPlugins(feed: UpdateFeed): PluginsUpdateInfo[] {
+    const out: PluginsUpdateInfo[] = [];
+    // 一次可挂多个插件包（feed.plugins 为数组）；老 feed 的单对象写法照旧支持。
+    for (const info of asArray(feed.plugins)) {
+      if (!info?.url && !(info?.parts && info.parts.length)) continue;
 
-    // 判定「已安装」**只认 profile 落位**（profiles/node_modules/<name>）：
-    // 用户数据目录里可能有历史残留（如解压到一半的 staging 里有带 package.json 的
-    // 半成品），扫那里会把残缺目录误判成"已装好"→ 永远不再安装（实测踩过）。
-    //
-    // name 可能是独立字段，也可能合并在 version 里（"@scope/pkg@1.2.3"）——
-    // gen-update-json 目前只发合并格式，所以要从 lastIndexOf('@') 拆出来。
-    const raw = String(info.version ?? '');
-    const at = raw.lastIndexOf('@');
-    const name = info.name ?? (at > 0 ? raw.slice(0, at) : '');
-    const expectedVersion = at > 0 ? raw.slice(at + 1) : raw;
-    if (name) {
-      const landed = path.join(profilesModulesDir(), ...name.split('/'), 'package.json');
-      try {
-        const pkg = JSON.parse(fs.readFileSync(landed, 'utf8'));
-        if (String(pkg.version) === String(expectedVersion)) {
-          log(`插件 ${name} 已落位且版本一致（${pkg.version}）`);
-          return null;
+      // 判定「已安装」**只认 profile 落位**（profiles/node_modules/<name>）：
+      // 用户数据目录里可能有历史残留（如解压到一半的 staging 里有带 package.json 的
+      // 半成品），扫那里会把残缺目录误判成"已装好"→ 永远不再安装（实测踩过）。
+      //
+      // name 可能是独立字段，也可能合并在 version 里（"@scope/pkg@1.2.3"）——
+      // gen-update-json 目前只发合并格式，所以要从 lastIndexOf('@') 拆出来。
+      const raw = String(info.version ?? '');
+      const at = raw.lastIndexOf('@');
+      const name = info.name ?? (at > 0 ? raw.slice(0, at) : '');
+      const expectedVersion = at > 0 ? raw.slice(at + 1) : raw;
+      if (name) {
+        const landed = path.join(profilesModulesDir(), ...name.split('/'), 'package.json');
+        try {
+          const pkg = JSON.parse(fs.readFileSync(landed, 'utf8'));
+          if (String(pkg.version) === String(expectedVersion)) {
+            log(`插件 ${name} 已落位且版本一致（${pkg.version}）`);
+            continue;
+          }
+          log(`插件 ${name} profile 版本 ${pkg.version} → 需要 ${expectedVersion}`);
+        } catch {
+          log(`插件 ${name} 未落位到 profile，准备下载安装`);
         }
-        log(`插件 ${name} profile 版本 ${pkg.version} → 需要 ${expectedVersion}`);
-      } catch {
-        log(`插件 ${name} 未落位到 profile，准备下载安装`);
+        out.push(info);
+        continue;
       }
-      return info;
-    }
 
-    // 连 name 都解析不出来（异常 feed）：保守起见视为需要安装
-    log(`插件包待安装：${raw}`);
-    return info;
+      // 连 name 都解析不出来（异常 feed）：保守起见视为需要安装
+      log(`插件包待安装：${raw}`);
+      out.push(info);
+    }
+    return out;
   }
 
   /** 挑出可用的运行时差分补丁（dsh 本体升级，重启时套用） */
@@ -1143,29 +1155,34 @@ export class Updater {
    * 后台静默安装插件：不打扰、不弹窗、不阻塞检查流程。
    * 插件是"新增能力"，没必要让用户决策；装完只把状态置为「已就绪，重启生效」。
    */
-  private installPluginsQuietly(info: PluginsUpdateInfo): void {
+  private installPluginsQuietly(infos: PluginsUpdateInfo[]): void {
+    if (infos.length === 0) return;
     void (async () => {
-      try {
-        await this.stagePlugins(info);
-        // 明确标记：有东西等着重启动应用（哪怕外壳/运行时都已是最新）
-        this.setState({
-          phase: 'downloaded',
-          percent: 100,
-          pluginsReady: true,
-          pluginsTarget: info.name ?? info.version,
-          message: '新插件已就绪，重启应用后生效',
-        });
-        log(`插件 ${info.name ?? info.version} 已静默安装完成，等待重启生效`);
-      } catch (err) {
-        const msg = String((err as Error)?.message ?? err);
-        log(`插件安装失败（不影响其它更新）：${msg}`);
-        // 关键：状态必须复位，否则托盘会永远停在"正在下载 99%"
-        this.setState({
-          phase: 'error',
-          percent: 0,
-          message: `插件安装失败：${msg}`,
-        });
+      const done: string[] = [];
+      const failed: string[] = [];
+      for (const info of infos) {
+        const label = info.name ?? info.version;
+        try {
+          await this.stagePlugins(info);
+          done.push(label);
+          log(`插件 ${label} 已静默安装完成，等待重启生效`);
+        } catch (err) {
+          const msg = String((err as Error)?.message ?? err);
+          failed.push(`${label}（${msg}）`);
+          log(`插件 ${label} 安装失败（不影响其它插件）：${msg}`);
+        }
       }
+      // 关键：无论成败都要把状态收敛，否则托盘会永远停在"正在下载 99%"
+      this.setState({
+        phase: done.length > 0 ? 'downloaded' : 'error',
+        percent: done.length > 0 ? 100 : 0,
+        pluginsReady: done.length > 0,
+        pluginsTarget: done.length > 0 ? done.join('、') : undefined,
+        message:
+          done.length > 0
+            ? '新插件已就绪，重启应用后生效'
+            : `插件安装失败：${failed.join('；')}`,
+      });
     })();
   }
 

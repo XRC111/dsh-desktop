@@ -85,6 +85,13 @@
     - id: dsh-desktop-updater
       name: '@dsh-desktop/updater'
 
+    # 桌面适配面板：设置 → 桌面
+    # 外壳各项桌面适配的开关（外链/拖放附件/托盘状态/任务通知/无边框适配/顶条），
+    # 默认全开，可单独关掉。开关值存在用户数据目录的 shell-features.json，
+    # 由主进程 src/main/shell-features.ts 读写，页面通过 preload 桥访问。
+    - id: dsh-desktop-shell
+      name: '@dsh-desktop/shell'
+
 # ── 4) Windows：命令执行改用「本地」后端，消除控制台窗口弹出 ────────────────
 #
 # 【现象】在 Windows 上让 Harness 跑命令时，会莫名其妙弹出一个控制台窗口。

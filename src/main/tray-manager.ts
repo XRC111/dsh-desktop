@@ -25,6 +25,8 @@ export class TrayManager {
   private updateBusy = false;
   /** 当前生效的热更新壳版本（null = 内置壳） */
   private hotShellVersion: string | null = null;
+  /** 任务是否在跑（由页面注入脚本上报，见 task-reporter.client.js） */
+  private taskRunning = false;
 
   constructor(private readonly handlers: TrayHandlers) {}
 
@@ -50,16 +52,40 @@ export class TrayManager {
       failed: '启动失败',
     };
     this.statusText = map[status.state] ?? status.state;
-    this.tray?.setToolTip(
-      `DSH Desktop — ${this.statusText}${this.hotShellVersion ? `（热更新壳 ${this.hotShellVersion}）` : ''}`,
-    );
+    this.refreshTooltip();
     this.rebuildMenu();
   }
 
   /** 告知托盘当前生效的热更新壳版本（用于菜单显示与「回退」入口） */
   setHotShell(version: string | null): void {
     this.hotShellVersion = version;
+    this.refreshTooltip();
     this.rebuildMenu();
+  }
+
+  /**
+   * 任务运行状态（页面注入脚本上报）。返回「本次是否发生了切换」，
+   * 调用方据此决定要不要弹「任务完成」通知。
+   */
+  setTaskRunning(running: boolean): boolean {
+    if (this.taskRunning === running) return false;
+    this.taskRunning = running;
+    this.refreshTooltip();
+    this.rebuildMenu();
+    return true;
+  }
+
+  isTaskRunning(): boolean {
+    return this.taskRunning;
+  }
+
+  /** 托盘悬停提示：把任务状态放在最前面，一眼可见 */
+  private refreshTooltip(): void {
+    const parts = [
+      this.taskRunning ? '正在运行' : this.statusText,
+      this.hotShellVersion ? `热更新壳 ${this.hotShellVersion}` : '',
+    ].filter(Boolean);
+    this.tray?.setToolTip(`DSH Desktop — ${parts.join(' · ')}`);
   }
 
   /** 托盘里的更新条目：把当前更新阶段直接显示出来（下载进度也在这里） */
@@ -133,7 +159,9 @@ export class TrayManager {
     if (!this.tray) return;
     const template: Electron.MenuItemConstructorOptions[] = [
       {
-        label: `DSH Desktop — ${this.statusText}${this.hotShellVersion ? `（热壳 ${this.hotShellVersion}）` : ''}`,
+        label: this.taskRunning
+          ? 'DSH Desktop — 正在运行任务…'
+          : `DSH Desktop — ${this.statusText}${this.hotShellVersion ? `（热壳 ${this.hotShellVersion}）` : ''}`,
         enabled: false,
       },
       { type: 'separator' },

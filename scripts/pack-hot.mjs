@@ -54,6 +54,18 @@ for (const dir of ['main', 'preload', 'renderer', 'assets']) {
   if (fs.existsSync(from)) fs.cpSync(from, path.join(staging, dir), { recursive: true });
 }
 
+// 桌面适配补丁**必须一起打包**：热壳只能换 out/，而安装目录里的
+// desktop-patch.yml 是覆盖不掉的（Program Files 无写权限、也不该改）。
+// 不带上的话，热壳里新增的插件行（insert）永远到不了已装用户 ——
+// 表现就是「外壳升上去了，但设置页少一节、新插件不生效」。
+// 客户端侧由 paths.desktopPatchFile() 优先读热壳自带的这份。
+const patchSrc = path.join(root, 'resources', 'desktop-patch.yml');
+if (fs.existsSync(patchSrc)) {
+  fs.copyFileSync(patchSrc, path.join(staging, 'desktop-patch.yml'));
+} else {
+  console.warn('[pack-hot] 警告：找不到 resources/desktop-patch.yml，热壳将沿用安装目录里的旧补丁');
+}
+
 // 热更新包自己的元信息：客户端据此判断版本与兼容性
 fs.writeFileSync(
   path.join(staging, 'hot-manifest.json'),

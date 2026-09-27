@@ -77,10 +77,14 @@ param(
     [string]$SetupUrlW7     = '',
     [string]$SetupUrlW7Beta = '',
     [string]$SetupUrlW7Dev  = '',
-    # 插件热更包 meta（scripts\pack-plugins.mjs 产物）。留空 = 自动取 build 下
-    # 最新的 plugins-dshmarket-*.meta.json；挂进六份 feed 的 plugins 段后，
-    # 在线用户（含已装的 beta/dev 壳）无需重下安装包即可升级插件。
-    [string]$PluginsMeta    = ''
+    # 要随 feed 热更下发的插件（对应 resources\dsh-plugins 下的目录名）。
+    # 每个插件自动取 build 下**自己最新的一份** meta，全部挂进六份 feed 的 plugins 段。
+    # 为什么是白名单而不是「build 下有什么就发什么」：dsh-univer-office 有 57MB，
+    # 且历史构建的切片不完整（只有 part01）→ 全量探测会把 feed 撑爆并让部署 die。
+    # 它随安装包分发即可，不参与热更。
+    [string[]]$Plugins       = @('dshmarket', 'shell', 'updater'),
+    # 直接指定 meta 路径（优先级最高，可多个）。用于临时发某个插件的特定版本。
+    [string[]]$PluginsMeta   = @()
 )
 
 $ErrorActionPreference = 'Stop'
@@ -475,21 +479,34 @@ if ($SkipGen) {
         $nodeArgs = @('scripts\gen-update-json.mjs', '--base-url', $BaseUrl, '--version', $Version,
                       '--channel', $Channel, '--notes', $Notes) + $Extra
         if ($SetupUrl) { $nodeArgs += @('--setup-url', $SetupUrl) } else { $nodeArgs += '--hot-only' }
-        if ($pluginsMeta) { $nodeArgs += @('--plugins', $pluginsMeta) }
+        # 插件可以挂多个（--plugins 可重复）：逐个追加
+        foreach ($pm in $pluginsMetas) { $nodeArgs += @('--plugins', $pm) }
         Run-Node $nodeArgs
         $suffix = if ($SetupUrl) { '（安装包走外链）' } else { '' }
         Ok "已生成 dist\update\latest$(if ($Channel -ne 'stable') { '-' + $Channel }).json$suffix"
     }
-    # 插件热更包：dshmarket 的客户端捆了宿主 ui-primitives 的图标名（…14/…16），
-    # dsh 0.1.7-alpha.1 把图标改名为 …Regular/…Medium 且删了旧导出 → beta/dev 壳的
-    # 插件市场 React #130。上游 1.66.1 加了双代解析（icons.ts），换包即修。
-    $pluginsMeta = $PluginsMeta
-    if (-not $pluginsMeta) {
-        $cand = @(Get-ChildItem 'build\plugins-dshmarket-*.meta.json' -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending | Select-Object -First 1)
-        if ($cand.Count) { $pluginsMeta = $cand[0].FullName }
+    # 插件热更包：build 下每个插件**各取自己最新的一份 meta**，一次全挂进 feed。
+    # 历史包袱：老写法只找 plugins-dshmarket-*.meta.json → 新增插件（如
+    # @dsh-desktop/shell）永远发不出去，等于新功能到不了已装用户。现在按 $Plugins 逐个取。
+    $pluginsMetas = @()
+    if ($PluginsMeta.Count) {
+        $pluginsMetas = @($PluginsMeta)
+    } else {
+        # 每个插件取自己最新的一份 meta：用「目录名精确前缀」匹配，别从文件名 `-split '-'`
+        # 切包名 —— plugins-dsh-univer-office-… 会切出 'dsh'，把不同插件错并成一组。
+        foreach ($name in $Plugins) {
+            $cand = @(Get-ChildItem "build\plugins-$name-*.meta.json" -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1)
+            if ($cand.Count) {
+                $pluginsMetas += $cand[0].FullName
+            } else {
+                Info "插件 $name 无 meta（先跑 node scripts\pack-plugins.mjs --name $name）"
+            }
+        }
     }
-    if ($pluginsMeta) { Ok "插件热更包：$pluginsMeta" } else { Info '未挂插件热更包（feed 无 plugins 段）' }
+    if ($pluginsMetas.Count) {
+        foreach ($pm in $pluginsMetas) { Ok "插件热更包：$(Split-Path $pm -Leaf)" }
+    } else { Info '未挂插件热更包（feed 无 plugins 段）' }
     # stable feed 额外挂降级资源（热壳变体 ×2 + 运行时降级差分 ×2）：
     # beta/dev 壳切回 stable 后轮询 latest.json，壳版本(10.2.0/10.3.0) > feed 版本(10.1.0)
     # 不触发 shellOutdated，全靠 rt 精确基线命中触发 available → hot+rt 一起落位 → 整体滚回。

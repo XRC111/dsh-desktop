@@ -44,8 +44,29 @@ export function dshHomeDir(): string {
   return path.join(userDataDir(), 'dsh-home');
 }
 
-/** 桌面适配补丁（随包分发，通过 `--patch` 叠加到 web profile） */
+/**
+ * 桌面适配补丁（通过 `--patch` 叠加到 web profile）。
+ *
+ * 优先用**热壳自带的那份**：热更新只换 out/，安装目录里的 desktop-patch.yml
+ * 换不掉（打包态在 Program Files，无写权限也不该改）。若热壳引入了新的插件行
+ * （insert），不读热壳那份就永远到不了已装用户 —— 表现为「外壳升上去了，但
+ * 设置页少一节、新插件不生效」。
+ *
+ * 判定方式：本模块自身位置（__dirname = <壳目录>/main）是否落在 hotRoot() 下。
+ * 这样不依赖 hot-shell.ts，避免模块循环引用。
+ */
 export function desktopPatchFile(): string {
+  const hotDir = path.dirname(__dirname); // <壳目录>/main → <壳目录>
+  try {
+    const rel = path.relative(hotRoot(), hotDir);
+    const insideHot = !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    if (insideHot) {
+      const hotPatch = path.join(hotDir, 'desktop-patch.yml');
+      if (fs.existsSync(hotPatch)) return hotPatch;
+    }
+  } catch {
+    /* 路径异常时退回内置补丁 */
+  }
   return app.isPackaged
     ? path.join(process.resourcesPath, 'desktop-patch.yml')
     : path.join(app.getAppPath(), 'resources', 'desktop-patch.yml');

@@ -68,8 +68,15 @@ export function log(line: string): void {
   const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
   sessionLogger?.write(`[${stamp}] ${line}`);
   if (!process.env.DSH_DESKTOP_QUIET) {
-    // 开发态同步打印到控制台，方便排查
-    console.log(`[dsh-desktop] ${line}`);
+    // 开发态同步打印到控制台，方便排查。
+    // 必须包住：stdout 是管道且对端已退出时 console.log 会抛 EPIPE，
+    // 而 uncaughtException 处理器本身也调 log() → 无限递归刷爆日志
+    // （实测一次强杀刷了 6500+ 行）。日志永远不该成为崩溃源。
+    try {
+      console.log(`[dsh-desktop] ${line}`);
+    } catch {
+      /* stdout 已断：只落盘，不再尝试写控制台 */
+    }
   }
 }
 

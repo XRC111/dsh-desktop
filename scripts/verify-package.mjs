@@ -183,6 +183,9 @@ if (!fs.existsSync(patchFile)) {
   else bad('补丁已禁用默认选择器', 'directory-picker 那行没被 disabled');
   if (patch.includes('ui-directory-picker-browse')) ok('补丁已挂载浏览界面');
   else bad('补丁已挂载浏览界面', '缺少 ui-directory-picker-browse 行');
+  // 桌面适配面板：设置页「桌面」那一节（外壳功能开关）
+  if (patch.includes('@dsh-desktop/shell')) ok('补丁已挂载桌面适配面板');
+  else bad('补丁已挂载桌面适配面板', '补丁里找不到 @dsh-desktop/shell —— 设置页会少「桌面」一节');
 }
 
 const pluginIndex = path.join(resources, 'dsh-plugins', 'directory-picker', 'lib', 'index.js');
@@ -192,6 +195,27 @@ if (!fs.existsSync(pluginIndex)) {
   const src = fs.readFileSync(pluginIndex, 'utf8');
   if (src.includes('export const COMPUTER')) ok('插件为最新版（含 此电脑 虚拟根）');
   else bad('插件为最新版', 'index.js 里没有 COMPUTER 虚拟根 —— 是修复前的旧版本');
+}
+
+// 桌面适配面板（外壳功能开关）：宿主入口 + 客户端 + 补丁三件套都要在
+for (const [label, rel] of [
+  ['桌面面板宿主入口', path.join('shell', 'lib', 'index.js')],
+  ['桌面面板客户端', path.join('shell', 'client', 'client.js')],
+  ['桌面面板补丁', path.join('shell', 'cordis.patch.yml')],
+  ['桌面面板清单', path.join('shell', 'package.json')],
+]) {
+  const f = path.join(resources, 'dsh-plugins', rel);
+  if (fs.existsSync(f)) ok(label);
+  else bad(label, f);
+}
+// 客户端必须注册 settings.section，否则设置页不会出现「桌面」
+const shellClient = path.join(resources, 'dsh-plugins', 'shell', 'client', 'client.js');
+if (fs.existsSync(shellClient)) {
+  const c = fs.readFileSync(shellClient, 'utf8');
+  if (c.includes('settings.section')) ok('桌面面板注册到设置页');
+  else bad('桌面面板注册到设置页', 'client.js 里找不到 settings.section');
+  if (c.includes('getFeatures') && c.includes('setFeature')) ok('桌面面板已接功能开关接口');
+  else bad('桌面面板已接功能开关接口', 'client.js 缺少 getFeatures/setFeature 调用');
 }
 
 // ── 5) 图标等杂项 ────────────────────────────────────────────────────────────

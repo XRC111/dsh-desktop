@@ -62,6 +62,22 @@ const api = {
   attachmentList: (dir?: string) => ipcRenderer.invoke('attachment:list', dir),
   /** 读取选中的文件字节（附件窗口确认时用） */
   attachmentRead: (paths: string[]) => ipcRenderer.invoke('attachment:read', paths),
+  /**
+   * 外壳功能开关（设置页「桌面」面板读写）。
+   * 注入脚本用它判断某个适配要不要装监听；页面脚本一律以「拿不到就按开启」兜底。
+   */
+  getFeatures: () => ipcRenderer.invoke('app:get-features'),
+  /** 写入单个开关，返回写入后的完整快照 */
+  setFeature: (id: string, enabled: boolean) =>
+    ipcRenderer.invoke('app:set-feature', { id, enabled }),
+  /** 同步查询单个开关（注入脚本启动时用，避免异步竞态） */
+  isFeatureEnabled: (id: string) => ipcRenderer.sendSync('app:feature-enabled', id) === true,
+  /**
+   * 页面把「任务在不在跑」上报给外壳（托盘状态 + 任务完成通知）。
+   * 单向通知，不需要返回值；外壳侧按功能开关决定怎么用。
+   */
+  reportTaskState: (state: { running: boolean; unloading?: boolean }) =>
+    ipcRenderer.send('app:task-state', state),
 };
 
 contextBridge.exposeInMainWorld('dshDesktop', api);

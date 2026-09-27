@@ -86,6 +86,15 @@ const required = [
   ['应用图标', 'icon.ico'],
 ];
 const missing = required.filter(([, f]) => !fs.existsSync(path.join(resources, f)));
+
+// 桌面适配插件必须随包分发（热更只换 out/，插件到不了已装用户，所以装机这份是基线）
+for (const [label, rel] of [
+  ['目录选择插件', path.join('dsh-plugins', 'directory-picker', 'package.json')],
+  ['桌面适配面板', path.join('dsh-plugins', 'shell', 'package.json')],
+  ['更新面板', path.join('dsh-plugins', 'updater', 'package.json')],
+]) {
+  if (!fs.existsSync(path.join(resources, rel))) missing.push([label, rel]);
+}
 if (missing.length > 0) {
   die(
     'win-unpacked/resources 缺以下载荷（检查 package.json 的 build.extraResources）：\n' +

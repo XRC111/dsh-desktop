@@ -31,3 +31,8 @@ build/*.bak
 # 插件依赖与打包产物（artifacts 由插件自身构建脚本重建，本地构建前若缺失需先生成）
 resources/dsh-plugins/*/node_modules/
 resources/dsh-plugins/*/artifacts/
+
+# 插件旧版本备份（如 dshmarket.1.46.0.bak）：换版本时留的本地回滚副本，
+# 154 个文件且可随时用 npm 重新取回，不入库。
+resources/dsh-plugins/*.bak/
+resources/dsh-plugins/*.bak

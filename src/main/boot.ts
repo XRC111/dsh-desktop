@@ -42,6 +42,8 @@ import {
 } from './runtime-installer';
 import { pickPort } from './port';
 import { installPlugins } from './plugin-installer';
+import { guardPatch } from './patch-guard';
+import { SHELL_FEATURES, ShellFeatures } from './shell-features';
 import { WindowManager, redactToken } from './window-manager';
 import { TrayManager } from './tray-manager';
 import { Updater, UpdateState } from './updater';
@@ -96,6 +98,8 @@ app.commandLine.appendSwitch('disable-component-update');
 const service = new DshService();
 let windowManager: WindowManager | null = null;
 let trayManager: TrayManager | null = null;
+/** 外壳功能开关（用户数据目录持久化；见 shell-features.ts） */
+let shellFeatures: ShellFeatures | null = null;
 let updater: Updater | null = null;
 let quitting = false;
 let lastStatus: DshStatus = { state: 'idle' };
@@ -281,13 +285,22 @@ async function startService(): Promise<void> {
   const { port, fallback } = await pickPort(PREFERRED_PORT);
   if (fallback) log(`首选端口 ${PREFERRED_PORT} 被占用，改用系统分配端口`);
 
+  // 补丁防护（必须在 installPlugins() 之后，才能看到刚落位的插件）：
+  // 补丁里 insert 的插件只要有一个解析不到，dsh 会整体起不来
+  // （plugin tree failed to load，实测 exit=1）→ 剔除未就绪的行再交给 dsh。
+  // 解析根：profile 共享 node_modules（外壳落位插件的地方）+ 运行时自带 node_modules。
+  const patchGuard = guardPatch(desktopPatchFile(), path.join(userDataDir(), 'desktop-patch.effective.yml'), [
+    path.join(dshHomeDir(), 'profiles', 'node_modules'),
+    path.join(install.runtimeDir, 'node_modules'),
+  ]);
+
   const status = await service.start({
     install,
     preferredPort: PREFERRED_PORT,
     listenPort: port,
     portFallback: fallback,
     dshHome: dshHomeDir(),
-    patchFile: desktopPatchFile(),
+    patchFile: patchGuard.file,
     version: install.version,
     // 首次启动 dsh 会在 DSH_HOME/profiles 下建立 profile 依赖（数百个符号链接/文件）。
     // 在启用实时防护的机械盘或企业管控机器上，这一步实测可能持续数分钟，
@@ -430,6 +443,38 @@ function setupSystemIntegration(): void {
   });
 }
 
+/**
+ * 开关变化后重新应用。
+ * 能立刻生效的就立刻生效；需要重建视图的交给 WindowManager（顶条）。
+ * 外链/拖放/托盘这些是「读开关时现查」，无需额外动作。
+ */
+function applyFeatureChange(id: string, enabled: boolean): void {
+  log(`应用功能开关：${id} = ${enabled}`);
+  if (id === 'showTitleBar' || id === 'framelessFit') {
+    // 顶条的显示/隐藏与右上角安全边距都由 WindowManager 重算
+    windowManager?.setTitleBarEnabled(shellFeatures?.isEnabled('showTitleBar') ?? true);
+    return;
+  }
+  if (id === 'trayStatus' && !enabled) {
+    // 关掉托盘状态：立刻清运行态，免得托盘停在「正在运行」
+    trayManager?.setTaskRunning(false);
+    return;
+  }
+  if (id === 'dragDropAttach') {
+    // 脚本自带撤装（见 __dshDesktopDragDropTeardown）：立刻重注入一次即可生效，不必重启
+    const view = windowManager?.content;
+    if (view && !view.webContents.isDestroyed()) {
+      injectClientScript(view, 'drag-drop-attach.client.js', '拖放附件');
+      try {
+        const code = fs.readFileSync(path.join(rendererDir(), 'drag-drop-attach.client.js'), 'utf8');
+        void view.webContents.executeJavaScript(code, false).catch(() => {});
+      } catch {
+        /* 读不到就算了：下次 dom-ready 仍会注入 */
+      }
+    }
+  }
+}
+
 function registerIpc(): void {
   ipcMain.handle('app:get-status', () => lastStatus);
   ipcMain.handle('app:retry', async () => {
@@ -449,6 +494,45 @@ function registerIpc(): void {
     clipboard.writeText(buildDiagnostics());
     return true;
   });
+  // ── 功能开关（设置页「桌面」面板）─────────────────────────────────────────
+  ipcMain.handle('app:get-features', () => shellFeatures?.snapshot() ?? { values: {}, defs: [] });
+  ipcMain.handle('app:set-feature', (_e, payload: unknown) => {
+    const p = (payload ?? {}) as { id?: unknown; enabled?: unknown };
+    if (typeof p.id !== 'string' || typeof p.enabled !== 'boolean') {
+      return shellFeatures?.snapshot() ?? { values: {}, defs: [] };
+    }
+    const changed = shellFeatures?.set(p.id, p.enabled) ?? false;
+    if (changed) applyFeatureChange(p.id, p.enabled);
+    return shellFeatures?.snapshot() ?? { values: {}, defs: [] };
+  });
+  // 同步查询：注入脚本在启动时用它决定要不要装监听（异步会有竞态）
+  ipcMain.on('app:feature-enabled', (event, id: unknown) => {
+    event.returnValue =
+      typeof id === 'string' ? (shellFeatures?.isEnabled(id) ?? true) : false;
+  });
+  // 页面上报任务运行状态（托盘 + 任务完成通知）
+  ipcMain.on('app:task-state', (_e, payload: unknown) => {
+    const p = (payload ?? {}) as { running?: unknown; unloading?: unknown };
+    const running = p.running === true;
+    const unloading = p.unloading === true;
+    if (unloading) {
+      // 页面要走了：立刻清掉运行态，别让托盘卡在「正在运行」
+      trayManager?.setTaskRunning(false);
+      return;
+    }
+    if (shellFeatures && !shellFeatures.isEnabled('trayStatus')) {
+      trayManager?.setTaskRunning(false);
+      return;
+    }
+    const flipped = trayManager?.setTaskRunning(running) ?? false;
+    // 任务跑完 → 窗口不在前台时通知（前台时不打扰）
+    if (flipped && !running && shellFeatures?.isEnabled('taskNotify')) {
+      if (!windowManager?.isVisible()) {
+        trayManager?.notify('任务已完成', 'DSH Desktop：Harness 任务已跑完，点击托盘图标回到窗口。');
+      }
+    }
+  });
+
   // ── 更新 ──────────────────────────────────────────────────────────────────
   ipcMain.handle('app:get-update-state', () => updater?.getState() ?? null);
   /**
@@ -554,13 +638,23 @@ app.whenReady().then(async () => {
   log(`用户数据目录：${userDataDir()}`);
   log(`渲染资源目录：${rendererDir()}`);
 
-  windowManager = new WindowManager(userDataDir());
+  // 功能开关要在建窗口之前读好：顶条/圆角是建窗时就要决定的
+  shellFeatures = new ShellFeatures(userDataDir());
+  log(
+    '功能开关：' +
+      SHELL_FEATURES.map((f) => `${f.id}=${shellFeatures?.isEnabled(f.id)}`).join(' '),
+  );
+
+  windowManager = new WindowManager(userDataDir(), shellFeatures);
   windowManager.create(); // 立刻出窗口（本地加载页），不阻塞主线程
 
   registerIpc();
   registerAttachmentPickerHandlers();
   injectAttachmentPicker(windowManager.content);
   injectClientScript(windowManager.content, 'update-banner.client.js', '更新横幅');
+  // 拖放附件与任务状态上报：都是页面侧脚本，各自读开关决定要不要生效
+  injectClientScript(windowManager.content, 'drag-drop-attach.client.js', '拖放附件');
+  injectClientScript(windowManager.content, 'task-reporter.client.js', '任务状态上报');
   setupSystemIntegration();
 
   trayManager = new TrayManager({
@@ -654,6 +748,11 @@ process.on('uncaughtException', (err) => {
     String(err?.stack ?? '').includes('undici')
   ) {
     log(`忽略 undici 收尾断言（响应已完整，无实际影响）：${err?.message}`);
+    return;
+  }
+  // EPIPE：stdout/stderr 的对端（管道、终端）已经走了。这不是应用故障，
+  // 重试也没意义——只记一行，绝不弹窗（否则每次写日志都会再弹一次）。
+  if ((err as NodeJS.ErrnoException)?.code === 'EPIPE') {
     return;
   }
   log(`未捕获异常：${err?.stack ?? String(err)}`);

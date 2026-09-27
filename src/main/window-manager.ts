@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { rendererDir } from './paths';
 import { log } from './logger';
+import type { ShellFeatures } from './shell-features';
 
 export interface WindowState {
   width: number;
@@ -42,9 +43,17 @@ export class WindowManager {
   private dshUrl: string | null = null;
   private quitting = false;
   private readonly stateFile: string;
+  /** 功能开关：窗口相关的适配（外链/圆角/顶条）都按它决定要不要生效 */
+  private readonly features: ShellFeatures | null;
 
-  constructor(userDataDir: string) {
+  constructor(userDataDir: string, features: ShellFeatures | null = null) {
     this.stateFile = path.join(userDataDir, 'window-state.json');
+    this.features = features;
+  }
+
+  /** 开关查询：没注入开关实例时按「全开」处理，保持老行为 */
+  private on(id: string): boolean {
+    return this.features ? this.features.isEnabled(id) : true;
   }
 
   /** 窗口本体（托盘显隐/进度条/关闭行为都用它） */
@@ -132,14 +141,19 @@ export class WindowManager {
         ...this.overlayColors(),
         height: TITLEBAR_HEIGHT,
       },
+      // 无边框窗口默认是直角，与系统其它窗口不一致；roundedCorners 让它跟随系统圆角。
+      // 关掉该开关即恢复 Electron 默认（直角）。
+      ...(this.on('framelessFit') ? { roundedCorners: true } : {}),
     });
 
-    // ---- 顶条视图（外壳自绘标题栏）----
-    this.titleBarView = new WebContentsView({
-      webPreferences: { sandbox: true, spellcheck: false },
-    });
-    this.win.contentView.addChildView(this.titleBarView);
-    void this.titleBarView.webContents.loadFile(path.join(rendererDir(), 'titlebar.html'));
+    // ---- 顶条视图（外壳自绘标题栏；关掉开关即沉浸模式，不创建它）----
+    if (this.on('showTitleBar')) {
+      this.titleBarView = new WebContentsView({
+        webPreferences: { sandbox: true, spellcheck: false },
+      });
+      this.win.contentView.addChildView(this.titleBarView);
+      void this.titleBarView.webContents.loadFile(path.join(rendererDir(), 'titlebar.html'));
+    }
 
     // ---- 内容视图（加载页 → Harness UI）----
     this.contentView = new WebContentsView({
@@ -192,6 +206,7 @@ export class WindowManager {
     this.contentView.webContents.once('did-finish-load', () => {
       if (state.maximized) this.win?.maximize();
       this.win?.show();
+      this.applyContentInset();
     });
 
     // 关闭 = 最小化到托盘（除非用户选择完全退出）
@@ -209,9 +224,11 @@ export class WindowManager {
       this.contentView = null;
     });
 
-    // 外部链接交给系统浏览器，应用内不新开窗口
+    // 外部链接交给系统浏览器，应用内不新开窗口。
+    // 关掉 externalLinks 时不再拦截：交回 Chromium 默认行为（target=_blank 会被
+    // 下面 will-navigate 的允许列表挡住，等于「点了没反应」，这正是「关掉适配」的语义）。
     this.contentView.webContents.setWindowOpenHandler(({ url }) => {
-      if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+      if (this.on('externalLinks') && /^https?:\/\//i.test(url)) void shell.openExternal(url);
       return { action: 'deny' };
     });
 
@@ -221,7 +238,7 @@ export class WindowManager {
       if (!allowed) {
         event.preventDefault();
         log(`已拦截外部导航：${url}`);
-        if (/^https?:\/\//i.test(url)) void shell.openExternal(url);
+        if (this.on('externalLinks') && /^https?:\/\//i.test(url)) void shell.openExternal(url);
       }
     });
 
@@ -248,7 +265,8 @@ export class WindowManager {
     const width = size[0];
     const height = size[1];
     const fullscreen = this.win.isFullScreen();
-    const barH = fullscreen ? 0 : TITLEBAR_HEIGHT;
+    // 顶条关掉（沉浸模式）或全屏时，内容铺满整窗
+    const barH = fullscreen || !this.titleBarView ? 0 : TITLEBAR_HEIGHT;
     this.titleBarView?.setBounds({ x: 0, y: 0, width, height: barH });
     this.contentView?.setBounds({ x: 0, y: barH, width, height: Math.max(0, height - barH) });
   }
@@ -265,6 +283,49 @@ export class WindowManager {
       .catch(() => {
         /* 顶条页面尚未就绪时忽略，下次标题变化会再同步 */
       });
+  }
+
+  /**
+   * 运行期开关顶条（设置页「显示外壳顶条」）。
+   * 顶条是独立 WebContentsView，只能创建/销毁，不能只隐藏——隐藏后那条 40px
+   * 会变成一条空白带，内容并不上移。
+   */
+  setTitleBarEnabled(on: boolean): void {
+    if (!this.win || this.win.isDestroyed()) return;
+    if (on && !this.titleBarView) {
+      this.titleBarView = new WebContentsView({
+        webPreferences: { sandbox: true, spellcheck: false },
+      });
+      this.win.contentView.addChildView(this.titleBarView);
+      void this.titleBarView.webContents.loadFile(path.join(rendererDir(), 'titlebar.html'));
+    } else if (!on && this.titleBarView) {
+      this.win.contentView.removeChildView(this.titleBarView);
+      this.titleBarView.webContents.close();
+      this.titleBarView = null;
+    }
+    this.layoutViews();
+    this.applyContentInset();
+  }
+
+  /**
+   * 无边框适配：右上角那三个原生按钮（titleBarOverlay）是画在**窗口**上的，
+   * 顶条在时它们落在顶条里，不挡内容；顶条关掉后内容铺满整窗，它们就会压住
+   * Harness 自己的右上角控件。这里给页面注入一段安全边距把内容让开。
+   * 注入是幂等的（按 id 找 style 元素），关掉开关时把元素删掉。
+   */
+  private applyContentInset(): void {
+    const wc = this.contentView?.webContents;
+    if (!wc || wc.isDestroyed()) return;
+    const need = this.on('framelessFit') && !this.titleBarView;
+    const js = need
+      ? "(function(){if(document.getElementById('dsh-desktop-wco-inset'))return;" +
+        "var s=document.createElement('style');s.id='dsh-desktop-wco-inset';" +
+        "s.textContent='body{padding-top:32px!important;padding-right:150px!important;box-sizing:border-box!important}';" +
+        "document.head.appendChild(s);})()"
+      : "(function(){var n=document.getElementById('dsh-desktop-wco-inset');if(n)n.remove();})()";
+    wc.executeJavaScript(js, false).catch(() => {
+      /* 页面尚未就绪：下次布局/加载完成时会再试 */
+    });
   }
 
   private isAllowedUrl(url: string): boolean {
@@ -285,6 +346,8 @@ export class WindowManager {
     this.dshUrl = url;
     if (!this.contentView) return;
     log(`加载 Harness Web UI：${redactToken(url)}`);
+    // 每次导航到 Harness UI 都要重新注入（换页面会丢掉注入的 style）
+    this.contentView.webContents.once('did-finish-load', () => this.applyContentInset());
     void this.contentView.webContents.loadURL(url);
   }
 

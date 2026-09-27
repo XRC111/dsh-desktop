@@ -312,23 +312,30 @@ runtimeBlock =
 // ---------------------------------------------------------------------------
 // 2c) 可选：插件包（scripts/pack-plugins.mjs 生成的 meta 描述，含分片清单）
 // ---------------------------------------------------------------------------
-const pluginsArg = arg('plugins', '');
-let pluginsBlock = null;
-if (pluginsArg) {
-  const metaPath = path.resolve(pluginsArg);
+// 支持重复传入（--plugins a.meta.json --plugins b.meta.json）以一次挂多个插件包。
+// 单个时仍输出**对象**（与历史 feed 完全一致，老客户端不需要改）；
+// 多个时输出数组（客户端 asArray 归一化，老客户端会忽略多余项而不是崩）。
+const pluginsArgs = argAll('plugins');
+const pluginsBlocks = [];
+for (const raw of pluginsArgs) {
+  const metaPath = path.resolve(raw);
   if (!fs.existsSync(metaPath)) die(`找不到插件 meta 描述：${metaPath}`);
+  let block;
   try {
-    pluginsBlock = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+    block = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
   } catch {
-    die('插件 meta 描述不是合法 JSON');
+    die(`插件 meta 描述不是合法 JSON：${metaPath}`);
   }
-  if (!pluginsBlock?.sha256 || !pluginsBlock?.size) die('插件 meta 描述缺少 sha256/size');
-  const n = pluginsBlock.parts?.length ?? 0;
+  if (!block?.sha256 || !block?.size) die(`插件 meta 描述缺少 sha256/size：${metaPath}`);
+  const n = block.parts?.length ?? 0;
   console.log(
-    `[gen-update-json] 插件包：${pluginsBlock.version}` +
-      `（${(pluginsBlock.size / 1024 / 1024).toFixed(1)} MB${n ? `，${n} 个分片` : ''}）`,
+    `[gen-update-json] 插件包：${block.version}` +
+      `（${(block.size / 1024 / 1024).toFixed(1)} MB${n ? `，${n} 个分片` : ''}）`,
   );
+  pluginsBlocks.push(block);
 }
+const pluginsBlock =
+  pluginsBlocks.length === 0 ? null : pluginsBlocks.length === 1 ? pluginsBlocks[0] : pluginsBlocks;
 
 // ---------------------------------------------------------------------------
 // 3) 组装 JSON
