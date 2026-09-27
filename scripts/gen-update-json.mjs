@@ -66,16 +66,12 @@ const stage = !flag('no-stage');
 const setupArg = arg('setup', '');
 let setupFile = setupArg ? path.resolve(setupArg) : '';
 if (!setupFile) {
+  // 只认**版本号精确匹配**的安装包，绝不退回「dist 下最新的那个」。
+  // 退回最新版是个静默的错误源：发 10.2.1 时若 10.2.1.exe 还没构建，
+  // 会拿 10.1.2.exe 的 sha256/size 填进 feed —— 用户下载时哈希对不上，
+  // 或更糟：下到别的版本却被当成目标版本校验通过（实测踩过）。
   const guess = path.join(root, 'dist', `DSH-Desktop-Setup-${version}.exe`);
   if (fs.existsSync(guess)) setupFile = guess;
-  else {
-    const found = fs
-      .readdirSync(path.join(root, 'dist'))
-      .filter((n) => /^DSH-Desktop-Setup-.*\.exe$/i.test(n))
-      .map((n) => ({ n, m: fs.statSync(path.join(root, 'dist', n)).mtimeMs }))
-      .sort((a, b) => b.m - a.m)[0];
-    if (found) setupFile = path.join(root, 'dist', found.n);
-  }
 }
 
 
@@ -356,13 +352,15 @@ if (pluginsBlock) feed.plugins = pluginsBlock;
 // --hot-only：不放安装包（纯热更新 feed，可以托管在免费的静态空间里 —— 单个 tar 仅 220KB）
 // --setup-url：安装包挂外链（feed 只记 URL，包本体不进 Pages 托管目录）
 if (!flag('hot-only')) {
-  feed.files = {
-    'win32-x64': {
-      url: setupUrl || `${baseUrl}/${setupName}`,
-      sha256: setupSha,
-      size: setupBuf ? setupBuf.length : setupSizeArg,
-    },
-  };
+  const entry = { url: setupUrl || `${baseUrl}/${setupName}` };
+  // sha256 / size 都**只在确实知道时才写**。
+  // 写一个假的 0 比不写更危险：客户端会拿它当期望值做校验，必然失败，
+  // 而且报错信息会指向「大小不符」这种误导性的方向。
+  // 客户端对缺失字段本来就有兜底（HEAD 探测 content-length / 按 size 校验可选）。
+  if (setupSha) entry.sha256 = setupSha;
+  const size = setupBuf ? setupBuf.length : setupSizeArg;
+  if (size) entry.size = size;
+  feed.files = { 'win32-x64': entry };
 }
 if (!feed.minSupportedVersion) delete feed.minSupportedVersion;
 

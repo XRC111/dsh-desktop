@@ -407,6 +407,12 @@ if ($SkipPack -or $SkipBeta) {
         $treeVer = Get-TreeDshVersion $RtDir
         if ($treeVer -ne $NextTreeDshVersion) { throw "junction 后树版本异常：$treeVer" }
         Invoke-FullBuild -Version $BetaVersion -Channel 'beta' -Label '主线 beta'
+
+        # ── 前向热壳（beta 线同样需要）────────────────────────────────────────
+        # 以前 beta/dev 从不打热壳 → 这两个通道的用户只能下 230/255MB 安装包，
+        # 热更新形同虚设。趁 out/ 还是 $BetaVersion 产物时打（步骤 4 会覆盖 out/）。
+        Run-Node @('scripts\pack-hot.mjs', '--version', $BetaVersion)
+        Ok "beta 前向热壳完成（version=$BetaVersion）"
     } finally {
         Restore-Runtime
     }
@@ -444,6 +450,10 @@ if ($SkipPack -or $SkipDev) {
         Restore-Runtime
     }
 
+    # ── dev 前向热壳（Restore-Runtime 只换运行时树，不影响 out/ 仍是 dev 产物）──
+    Run-Node @('scripts\pack-hot.mjs', '--version', $DevVersion)
+    Ok "dev 前向热壳完成（version=$DevVersion）"
+
     # ── 运行时降级差分 ×2（此时 junction 已还原，resources\dsh-runtime = 主线 rc.3 树）──
     # pack-runtime-patch 方向任意：--from 高版本树 --to 主线树 → meta 里
     # baseVersion=高版本、version=主线版本。壳的 pickRuntime 按
@@ -472,6 +482,10 @@ if ($SkipPack -or $SkipW7 -or $SkipW7Beta) {
     Info '跳过'
 } else {
     Invoke-W7Build -Version $W7BetaVersion -Tree 'rt-next' -Label 'w7 beta'
+
+    # w7 beta 前向热壳（热壳只含 out/，与主线同源；w7 差异在 Electron 运行时，不在壳代码）
+    Run-Node @('scripts\pack-hot.mjs', '--version', $W7BetaVersion)
+    Ok "w7 beta 前向热壳完成（version=$W7BetaVersion）"
 }
 
 # ---------------------------------------------------------------------------
@@ -484,6 +498,10 @@ if ($SkipPack -or $SkipW7 -or $SkipW7Dev) {
         throw "build\rt-alpha 树不存在——先跑一次主线 dev（不带 -SkipDev）让 fetch-dsh 重建它，再补 w7 dev"
     }
     Invoke-W7Build -Version $W7DevVersion -Tree 'rt-alpha' -Label 'w7 dev'
+
+    # w7 dev 前向热壳
+    Run-Node @('scripts\pack-hot.mjs', '--version', $W7DevVersion)
+    Ok "w7 dev 前向热壳完成（version=$W7DevVersion）"
 }
 
 # ---------------------------------------------------------------------------
@@ -539,8 +557,21 @@ if ($SkipGen) {
         else { Warn "缺降级差分 meta：$tag -> $MainDshVersion（stable feed 将不含该回滚链）" }
     }
     Invoke-Feed $StableVersion 'stable'  "$StableVersion 稳定版（dsh latest $MainDshVersion，含 beta/dev 回滚链）—— 通道方案 v2 首版" $stableExtra $SetupUrlStable
-    Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" @() $SetupUrlBeta
-    Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" @() $SetupUrlDev
+    # beta/dev 也要挂**前向热壳**：以前这两条只传 @()（无热壳），导致 beta/dev 用户
+    # 只能下 230/255MB 安装包升级 —— 热更新在这两条通道形同虚设。
+    # 热壳与 stable 的是同一份 out/ 产物，只是版本号不同（壳代码与通道无关）。
+    $betaHot = @(Get-ChildItem "build\hot-shell-$BetaVersion-*.tar" -ErrorAction SilentlyContinue)
+    $betaExtra = @()
+    foreach ($h in $betaHot) { $betaExtra += @('--hot', $h.FullName) }
+    if (-not $betaHot.Count) { Warn "缺 beta 热壳包 build\hot-shell-$BetaVersion-*.tar（beta 用户只能走安装包）" }
+
+    $devHot = @(Get-ChildItem "build\hot-shell-$DevVersion-*.tar" -ErrorAction SilentlyContinue)
+    $devExtra = @()
+    foreach ($h in $devHot) { $devExtra += @('--hot', $h.FullName) }
+    if (-not $devHot.Count) { Warn "缺 dev 热壳包 build\hot-shell-$DevVersion-*.tar（dev 用户只能走安装包）" }
+
+    Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" $betaExtra $SetupUrlBeta
+    Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" $devExtra $SetupUrlDev
     # w7 stable feed 与主线同构地挂降级资源：7.2.0(0.1.7-rc.2)/7.3.0(0.1.7-alpha.2) 切回
     # stable 后轮询 latest-w7.json（壳版本 7.2.0 > feed 版本 7.1.2，不触发 shellOutdated），
     # 全靠 runtime 差分精确命中才置 available → 热壳(7.1.2) + 运行时(0.1.5-rc.3) 一起落位，
@@ -560,8 +591,19 @@ if ($SkipGen) {
         else { Warn "缺降级差分 meta：$tag -> $MainDshVersion（w7 stable feed 将不含该回滚链）" }
     }
     Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh latest $MainDshVersion）" $w7Extra $SetupUrlW7
-    Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" @() $SetupUrlW7Beta
-    Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" @() $SetupUrlW7Dev
+    # w7 beta/dev 同样挂前向热壳
+    $w7BetaHot = @(Get-ChildItem "build\hot-shell-$W7BetaVersion-*.tar" -ErrorAction SilentlyContinue)
+    $w7BetaExtra = @()
+    foreach ($h in $w7BetaHot) { $w7BetaExtra += @('--hot', $h.FullName) }
+    if (-not $w7BetaHot.Count) { Warn "缺 w7 beta 热壳包 build\hot-shell-$W7BetaVersion-*.tar" }
+
+    $w7DevHot = @(Get-ChildItem "build\hot-shell-$W7DevVersion-*.tar" -ErrorAction SilentlyContinue)
+    $w7DevExtra = @()
+    foreach ($h in $w7DevHot) { $w7DevExtra += @('--hot', $h.FullName) }
+    if (-not $w7DevHot.Count) { Warn "缺 w7 dev 热壳包 build\hot-shell-$W7DevVersion-*.tar" }
+
+    Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" $w7BetaExtra $SetupUrlW7Beta
+    Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" $w7DevExtra $SetupUrlW7Dev
     foreach ($v in @($StableVersion, $BetaVersion, $DevVersion, $W7Version, $W7BetaVersion, $W7DevVersion)) {
         if (Test-Path -LiteralPath "dist\DSH-Desktop-Setup-$v.exe") {
             $u = switch ($v) {
