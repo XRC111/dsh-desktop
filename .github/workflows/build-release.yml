@@ -1,0 +1,268 @@
+# 构建六个通道的 Windows 安装包，上传到 GitHub Release，并部署 feed。
+#
+# ── 为什么用 windows-latest 而不是 ubuntu ────────────────────────────────────
+# 产物是 NSIS 安装包 + Win32 原生模块（koffi / node-pty / sharp 的 win32-x64 预编译件），
+# 而且 w7 线要下载并**在 exe 上做等长字节替换**打指纹补丁 —— 这些都要求 Windows。
+#
+# ── 六个通道 ────────────────────────────────────────────────────────────────
+#   主线 stable/beta/dev  +  w7 stable/beta/dev
+#   w7 用社区 fork Electron（e3kskoy7wqk/Electron-for-windows-7 v44.2.0）
+#   + scripts/patch-w7-electron.py 把宿主指纹伪装成官方 44.0.0（否则 dsh 拒绝启动）
+#
+# ── 必需的仓库 secret ───────────────────────────────────────────────────────
+#   CLOUDFLARE_API_TOKEN   部署 feed 用（Cloudflare Pages: dsh-desktop-feed）
+#   CLOUDFLARE_ACCOUNT_ID  同上
+#   （Release 上传用内置的 GITHUB_TOKEN，不需要额外配置）
+#
+# ── 触发方式 ────────────────────────────────────────────────────────────────
+#   1) 手动：Actions → build-release → Run workflow（可填六个版本号）
+#   2) 打 tag：git tag v10.1.4 && git push origin v10.1.4
+name: build-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      stable:
+        description: '主线 stable 版本号'
+        required: true
+        default: '10.1.3'
+      beta:
+        description: '主线 beta 版本号'
+        required: true
+        default: '10.2.2'
+      dev:
+        description: '主线 dev 版本号'
+        required: true
+        default: '10.3.1'
+      w7:
+        description: 'w7 stable 版本号'
+        required: true
+        default: '7.1.4'
+      w7beta:
+        description: 'w7 beta 版本号'
+        required: true
+        default: '7.2.1'
+      w7dev:
+        description: 'w7 dev 版本号'
+        required: true
+        default: '7.3.1'
+      deploy_feed:
+        description: '是否部署 feed（需要 Cloudflare secrets）'
+        type: boolean
+        default: true
+  push:
+    tags:
+      - 'v*'
+
+# 同时只允许一个构建在跑（六通道构建很重，且都要写同一个 Release）
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 上传 Release 资产
+
+env:
+  # 让 Node 生态走国内镜像（与 .npmrc 一致；runner 在国外，但显式指定更稳）
+  NODE_OPTIONS: ''
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      # ── 0) 解析版本号（手动触发用 inputs，tag 触发从 tag 名推 stable）──────────
+      - name: 解析版本号
+        id: v
+        shell: pwsh
+        run: |
+          if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
+            $s = '${{ inputs.stable }}'
+            $b = '${{ inputs.beta }}'
+            $d = '${{ inputs.dev }}'
+            $w = '${{ inputs.w7 }}'
+            $wb = '${{ inputs.w7beta }}'
+            $wd = '${{ inputs.w7dev }}'
+            $feed = '${{ inputs.deploy_feed }}'
+          } else {
+            # tag 触发：v10.1.4 → stable=10.1.4，其余通道沿用仓库里的默认值
+            $tag = '${{ github.ref_name }}'
+            $s = $tag -replace '^v', ''
+            $b = '10.2.2'
+            $d = '10.3.1'
+            $w = '7.1.4'
+            $wb = '7.2.1'
+            $wd = '7.3.1'
+            $feed = 'true'
+          }
+          "stable=$s" >> $env:GITHUB_OUTPUT
+          "beta=$b" >> $env:GITHUB_OUTPUT
+          "dev=$d" >> $env:GITHUB_OUTPUT
+          "w7=$w" >> $env:GITHUB_OUTPUT
+          "w7beta=$wb" >> $env:GITHUB_OUTPUT
+          "w7dev=$wd" >> $env:GITHUB_OUTPUT
+          "feed=$feed" >> $env:GITHUB_OUTPUT
+          Write-Host "版本：stable=$s beta=$b dev=$d / w7=$w w7beta=$wb w7dev=$wd / feed=$feed"
+
+      - uses: actions/checkout@v4
+
+      # ── 1) 环境 ────────────────────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: 检查 Python（打 w7 指纹补丁用）
+        shell: pwsh
+        run: python --version
+
+      # ── 2) 依赖 ────────────────────────────────────────────────────────────
+      - name: 安装依赖
+        shell: pwsh
+        run: npm ci --no-audit --no-fund
+
+      # ── 3) 三棵 dsh 运行时树（被 gitignore，CI 必须自己拉）────────────────────
+      #   0.1.7-rc.2  → stable 线（resources/dsh-runtime）
+      #   0.2.0-rc.2  → beta / dev 线（build/rt-next、build/rt-alpha）
+      - name: 拉取 dsh 运行时树
+        shell: pwsh
+        run: |
+          # 主线 stable 树：装到 resources/dsh-runtime
+          node scripts/fetch-dsh.mjs --to resources/dsh-runtime --version 0.1.7-rc.2
+          # beta / dev 树：都是 0.2.0-rc.2
+          node scripts/fetch-dsh.mjs --to build/rt-next  --version 0.2.0-rc.2
+          node scripts/fetch-dsh.mjs --to build/rt-alpha --version 0.2.0-rc.2
+          # 升级差分源（老 stable 用户热更用）：0.1.5-rc.3
+          node scripts/fetch-dsh.mjs --to build/rt-015 --version 0.1.5-rc.3
+
+      - name: 校验运行时树
+        shell: pwsh
+        run: |
+          foreach ($t in @('resources/dsh-runtime','build/rt-next','build/rt-alpha','build/rt-015')) {
+            $f = Join-Path $t 'node_modules/@deepseek-ai/dsh/package.json'
+            if (-not (Test-Path $f)) { throw "树缺失：$t" }
+            $v = (Get-Content $f -Raw | ConvertFrom-Json).version
+            Write-Host "  $t = $v"
+          }
+
+      # ── 4) 生成图标等资源（被 gitignore，构建期生成）──────────────────────────
+      - name: 生成图标资源
+        shell: pwsh
+        run: npm run gen:assets
+
+      # ── 5) 构建六个通道 ─────────────────────────────────────────────────────
+      #   -SkipGen -SkipWrangler：feed 生成与部署在后面的步骤单独做
+      #   （这样能先确认六个包都构建成功，再决定要不要发布）
+      - name: 构建六通道安装包
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
+            -SkipGen -SkipWrangler -SkipNightly `
+            -StableVersion '${{ steps.v.outputs.stable }}' `
+            -BetaVersion   '${{ steps.v.outputs.beta }}' `
+            -DevVersion    '${{ steps.v.outputs.dev }}' `
+            -W7Version     '${{ steps.v.outputs.w7 }}' `
+            -W7BetaVersion '${{ steps.v.outputs.w7beta }}' `
+            -W7DevVersion  '${{ steps.v.outputs.w7dev }}'
+
+      # ── 6) 产物自检 ─────────────────────────────────────────────────────────
+      - name: 自检安装包
+        shell: pwsh
+        run: |
+          $vs = @('${{ steps.v.outputs.stable }}','${{ steps.v.outputs.beta }}','${{ steps.v.outputs.dev }}',
+                  '${{ steps.v.outputs.w7 }}','${{ steps.v.outputs.w7beta }}','${{ steps.v.outputs.w7dev }}')
+          $missing = @()
+          foreach ($v in $vs) {
+            $f = "dist/DSH-Desktop-Setup-$v.exe"
+            if (Test-Path $f) {
+              Write-Host ("  ✓ {0}  {1:N1} MB" -f $f, ((Get-Item $f).Length/1MB))
+            } else { $missing += $f; Write-Host "  ✗ $f 缺失" }
+          }
+          if ($missing.Count) { throw "有 $($missing.Count) 个安装包没构建出来" }
+
+      # ── 7) 打热壳 + 运行时差分 + 生成六份 feed（挂外链）──────────────────────
+      #   外链指向本仓库 Release 的 packages tag —— 但包还没上传，所以这里
+      #   只生成 feed 骨架；等下面上传完 Release 后**再跑一次** gen 补哈希。
+      - name: 上传安装包到 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # packages tag 是「全版本安装包」的集中存放点，feed 外链指向它。
+          # 已存在则复用，不存在则创建。
+          $exists = gh release view packages 2>$null
+          if (-not $exists) {
+            gh release create packages --title '安装包（全版本）' --notes '全部通道的安装包集中分发，feed 外链指向这里。'
+          }
+          $vs = @('${{ steps.v.outputs.stable }}','${{ steps.v.outputs.beta }}','${{ steps.v.outputs.dev }}',
+                  '${{ steps.v.outputs.w7 }}','${{ steps.v.outputs.w7beta }}','${{ steps.v.outputs.w7dev }}')
+          foreach ($v in $vs) {
+            $f = "dist/DSH-Desktop-Setup-$v.exe"
+            Write-Host "上传 $f ..."
+            gh release upload packages $f --clobber
+          }
+
+      - name: 生成六份 feed（含安装包哈希）
+        shell: pwsh
+        run: |
+          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/packages'
+          powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
+            -SkipPack -SkipNightly `
+            -StableVersion '${{ steps.v.outputs.stable }}' `
+            -BetaVersion   '${{ steps.v.outputs.beta }}' `
+            -DevVersion    '${{ steps.v.outputs.dev }}' `
+            -W7Version     '${{ steps.v.outputs.w7 }}' `
+            -W7BetaVersion '${{ steps.v.outputs.w7beta }}' `
+            -W7DevVersion  '${{ steps.v.outputs.w7dev }}' `
+            -SetupUrlStable "$base/DSH-Desktop-Setup-${{ steps.v.outputs.stable }}.exe" `
+            -SetupUrlBeta   "$base/DSH-Desktop-Setup-${{ steps.v.outputs.beta }}.exe" `
+            -SetupUrlDev    "$base/DSH-Desktop-Setup-${{ steps.v.outputs.dev }}.exe" `
+            -SetupUrlW7     "$base/DSH-Desktop-Setup-${{ steps.v.outputs.w7 }}.exe" `
+            -SetupUrlW7Beta "$base/DSH-Desktop-Setup-${{ steps.v.outputs.w7beta }}.exe" `
+            -SetupUrlW7Dev  "$base/DSH-Desktop-Setup-${{ steps.v.outputs.w7dev }}.exe"
+
+      # ── 8) 部署 feed（可选：缺 secrets 时跳过而不是失败）────────────────────
+      - name: 部署 feed 到 Cloudflare Pages
+        if: ${{ steps.v.outputs.feed == 'true' }}
+        shell: pwsh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if (-not $env:CLOUDFLARE_API_TOKEN) {
+            Write-Host '::warning::未配置 CLOUDFLARE_API_TOKEN，跳过 feed 部署'
+            exit 0
+          }
+          # deploy-pages 默认会嵌套调 wrangler；这里直接让它跑完整流程
+          # （需要 wrangler 可执行：用 npx 装一个临时的）
+          npx --yes wrangler@4 pages deploy (Get-Content dist/update/.stage-dir -Raw).Trim() `
+            --project-name dsh-desktop-feed --branch main --commit-dirty=true
+
+      # ── 9) 收尾：把 feed 与热壳/差分也存一份到 Release（便于回溯）────────────
+      - name: 归档构建产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-desktop-feed-${{ steps.v.outputs.stable }}
+          path: |
+            dist/update/latest*.json
+            build/hot-shell-*.tar
+            build/plugins-*.tar.gz
+            build/plugins-*.meta.json
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: 汇总
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host '=== 构建汇总 ==='
+          Write-Host "  主线：stable=${{ steps.v.outputs.stable }} beta=${{ steps.v.outputs.beta }} dev=${{ steps.v.outputs.dev }}"
+          Write-Host "  w7  ：stable=${{ steps.v.outputs.w7 }} beta=${{ steps.v.outputs.w7beta }} dev=${{ steps.v.outputs.w7dev }}"
+          Write-Host "  feed 部署：${{ steps.v.outputs.feed }}"
+          Write-Host ''
+          Write-Host '  产物：'
+          Get-ChildItem dist/DSH-Desktop-Setup-*.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.LastWriteTime -gt (Get-Date).AddHours(-2) } |
+            ForEach-Object { Write-Host ("    {0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB)) }

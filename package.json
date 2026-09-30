@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop",
   "productName": "DSH Desktop",
-  "version": "10.1.2",
+  "version": "10.1.3",
   "description": "DeepSeek Harness desktop shell — 开箱即用的 Windows 桌面封装",
   "author": "DSH Desktop",
   "contributors": [
@@ -40,6 +40,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
     "prepare:runtime": "node scripts/fetch-dsh.mjs",
+    "prepare:w7": "node scripts/fetch-w7-electron.mjs",
     "rebuild:native": "node scripts/rebuild-native.mjs",
     "verify:runtime": "node scripts/verify-runtime.mjs",
     "gen:assets": "node scripts/gen-assets.mjs",

@@ -44,6 +44,7 @@ import { pickPort } from './port';
 import { installPlugins } from './plugin-installer';
 import { guardPatch } from './patch-guard';
 import { ensurePluginCompatibility } from './plugin-compat';
+import { ensureScheduleBundle } from './optional-bundles';
 import { SHELL_FEATURES, ShellFeatures } from './shell-features';
 import { WindowManager, redactToken } from './window-manager';
 import { TrayManager } from './tray-manager';
@@ -312,6 +313,14 @@ async function startService(): Promise<void> {
     log(`插件兼容层：放行 ${compat.allowed.length} 个声明过时的插件（${compat.allowed.join('、')}）`);
   }
   for (const r of compat.refused) log(`插件兼容层：拒绝 ${r.key} —— ${r.reason}`);
+
+  // 可选 bundle：dsh 0.2.0 把「定时任务」剥成 @deepseek-ai/dsh-experimental-schedule-bundle，
+  // 默认不启用（官方为省 token）。我们的用户升级前本来就有这个能力，所以按通道决定：
+  // **只在 dev 启用**（试水），stable/beta 保持官方默认。详见 optional-bundles.ts。
+  const channel = updater?.getChannel() ?? 'stable';
+  const sched = ensureScheduleBundle(path.join(dshHomeDir(), 'profiles', 'web'), channel);
+  if (sched.changed) log(`可选 bundle 已按 ${channel} 通道启用（定时任务）`);
+  else if (sched.skipped) log(`可选 bundle 未启用（${channel}）：${sched.skipped}`);
 
   const status = await service.start({
     install,
@@ -637,7 +646,7 @@ function registerIpc(): void {
   /** 切换更新通道：写回 update-config.json 并立即按新通道检查一次 */
   ipcMain.handle('app:set-channel', async (_e, channel: unknown) => {
     if (!updater) return null;
-    const ok = channel === 'stable' || channel === 'beta' || channel === 'dev';
+    const ok = channel === 'stable' || channel === 'beta' || channel === 'dev' || channel === 'nightly';
     if (!ok) throw new Error(`未知更新通道：${String(channel)}`);
     return updater.setChannel(channel);
   });

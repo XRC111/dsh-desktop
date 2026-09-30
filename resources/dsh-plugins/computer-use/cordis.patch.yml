@@ -1,0 +1,6 @@
+# DSH Desktop 计算机操作（computer use）
+# 注册一组宿主侧工具：截屏 / 窗口管理 / 合成输入（鼠标键盘）。
+# 纯宿主能力，无客户端界面，所以不需要 dsh.client 段。
+- insert:
+    - id: dsh-desktop-computer-use
+      name: '@dsh-desktop/computer-use'

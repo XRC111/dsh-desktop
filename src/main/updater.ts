@@ -151,9 +151,13 @@ export interface UpdateFeed {
  *   latest.json（stable）/ latest-beta.json / latest-dev.json
  * （`?channel=` 参数对静态源无效 —— 老版本带过这个参数，服务器根本不看。）
  */
-export type UpdateChannel = 'stable' | 'beta' | 'dev';
+export type UpdateChannel = 'stable' | 'beta' | 'dev' | 'nightly';
 
-export const UPDATE_CHANNELS: UpdateChannel[] = ['stable', 'beta', 'dev'];
+export const UPDATE_CHANNELS: UpdateChannel[] = ['stable', 'beta', 'dev', 'nightly'];
+
+// nightly = 从 deepseek-harness **master 源码**编译（官方 npm 没有 nightly 标签，
+// 见 scripts/fetch-nightly.mjs）。它的 dsh 版本形如 `0.2.0-rc.2+nightly.639ed01`：
+// 加号后面是 semver 构建元数据，**不参与版本比较**，所以排序上等同于上游版本。
 
 /** 通道 → 文件名中缀。stable 为空：保持 latest.json，与老客户端完全兼容 */
 function channelSuffix(channel: UpdateChannel): string {
@@ -163,7 +167,7 @@ function channelSuffix(channel: UpdateChannel): string {
 /** 非预期值一律回落 stable（配错通道不该让更新功能消失） */
 export function normalizeChannel(raw: unknown): UpdateChannel {
   const v = String(raw ?? '').trim().toLowerCase();
-  return v === 'dev' || v === 'beta' ? v : 'stable';
+  return v === 'dev' || v === 'beta' || v === 'nightly' ? v : 'stable';
 }
 
 /**

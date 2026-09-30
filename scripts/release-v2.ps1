@@ -54,6 +54,7 @@ param(
     [switch]$SkipStable,      # 只跳过 10.1.0（已构建过时）
     [switch]$SkipBeta,        # 只跳过 10.2.0
     [switch]$SkipDev,         # 只跳过 10.3.0（含 rt-alpha 重建）
+    [switch]$SkipNightly,     # 跳过 nightly（源码编译，需要先跑 fetch-nightly）
     [switch]$SkipGen,         # 跳过 feed 生成
     [switch]$SkipWrangler,    # 跳过上传（只做本地暂存）
     [string]$BaseUrl     = 'https://dl.666-xrc.cc.cd',
@@ -64,6 +65,9 @@ param(
     [string]$W7Version         = '7.1.0',
     [string]$W7BetaVersion     = '7.2.0',
     [string]$W7DevVersion      = '7.3.0',
+    # nightly：从 harness master 源码编译（官方 npm 无 nightly 标签）。
+    # 用独立 minor 10.4.x，避免与 stable(10.1)/beta(10.2)/dev(10.3) 撞号。
+    [string]$NightlyVersion    = '10.4.0',
     # dsh 版本矩阵（2026-09-27 用户拍板：避开 0.2.0 的破坏性变更，stable 锁在 0.1.7 线）
     #   stable -> 0.1.7-rc.2   （官方**没有** 0.1.7 正式版，rc.2 是该线最后一版）
     #   beta   -> 0.2.0-rc.2   （官方 latest / next 都指向它）
@@ -83,6 +87,7 @@ param(
     [string]$SetupUrlW7     = '',
     [string]$SetupUrlW7Beta = '',
     [string]$SetupUrlW7Dev  = '',
+    [string]$SetupUrlNightly = '',
     # 要随 feed 热更下发的插件（对应 resources\dsh-plugins 下的目录名）。
     # 每个插件自动取 build 下**自己最新的一份** meta，全部挂进六份 feed 的 plugins 段。
     # 为什么是白名单而不是「build 下有什么就发什么」：dsh-univer-office 有 57MB，
@@ -90,7 +95,14 @@ param(
     # 它随安装包分发即可，不参与热更。
     [string[]]$Plugins       = @('dshmarket', 'shell', 'updater'),
     # 直接指定 meta 路径（优先级最高，可多个）。用于临时发某个插件的特定版本。
-    [string[]]$PluginsMeta   = @()
+    [string[]]$PluginsMeta   = @(),
+    # 运行时**升级**差分源：把比当前 stable 更旧的运行时树，各打一个「→ 新 stable」的差分。
+    # 客户端 pickRuntime 按 baseVersion === 当前运行时**精确命中**，所以老用户需要它才能热更。
+    # 元素形如 @{ From = 'build\rt-015'; Tag = '0.1.5-rc.3' }。
+    # 默认覆盖 0.1.5-rc.3（stable 长期停在这版，存量用户最多）。
+    [array]$UpgradeDiffSources = @(
+        @{ From = 'build\rt-015'; Tag = '0.1.5-rc.3' }
+    )
 )
 
 $ErrorActionPreference = 'Stop'
@@ -281,6 +293,40 @@ function Invoke-W7Build {
     param([string]$Version, [string]$Tree, [string]$Label)
     $cfgBak = Join-Path $root 'build\.update-config.mainline.bak'
     Set-PkgVersion $Version
+
+    # fork Electron 必须就位且**已打指纹补丁**（否则 dsh 拒绝启动）。
+    # 这两步以前是手工做的 —— CI 上无法复现，所以这里自动补上（都幂等）：
+    #   1) fetch-w7-electron.mjs：下载 + 解压（已存在则跳过）
+    #   2) patch-w7-electron.py：等长原位改宿主指纹（已打过则直接返回）
+    if (-not (Test-Path -LiteralPath (Join-Path $root 'build\electron-win7\electron.exe'))) {
+        Info 'fork Electron 缺失 → 下载 build/electron-win7'
+        Run-Node @('scripts\fetch-w7-electron.mjs')
+    }
+    $w7Exe = Join-Path $root 'build\electron-win7\electron.exe'
+    $patchPy = Join-Path $root 'scripts\patch-w7-electron.py'
+    if ((Test-Path -LiteralPath $w7Exe) -and (Test-Path -LiteralPath $patchPy)) {
+        # 幂等判定：已打补丁的 exe 里 .19 应为 0 处、.13 应为 4 处
+        $bytes = [System.IO.File]::ReadAllBytes($w7Exe)
+        $txt = [System.Text.Encoding]::ASCII.GetString($bytes)
+        $n13 = ([regex]::Matches($txt, '15\.2\.124\.13-electron\.0')).Count
+        $n19 = ([regex]::Matches($txt, '15\.2\.124\.19-electron\.0')).Count
+        Remove-Variable bytes, txt
+        if ($n19 -gt 0 -or $n13 -lt 4) {
+            Info "fork 指纹未打补丁（.13 命中 $n13 / .19 残留 $n19）→ 跑 patch-w7-electron.py"
+            & python $patchPy $w7Exe
+            if ($LASTEXITCODE -ne 0) { throw "patch-w7-electron.py 失败（exit=$LASTEXITCODE）" }
+            $bytes2 = [System.IO.File]::ReadAllBytes($w7Exe)
+            $txt2 = [System.Text.Encoding]::ASCII.GetString($bytes2)
+            $c13 = ([regex]::Matches($txt2, '15\.2\.124\.13-electron\.0')).Count
+            $c19 = ([regex]::Matches($txt2, '15\.2\.124\.19-electron\.0')).Count
+            Remove-Variable bytes2, txt2
+            if ($c19 -ne 0 -or $c13 -lt 4) { throw "补丁后指纹仍不对：.13=$c13 .19=$c19" }
+            Ok 'fork 指纹补丁完成'
+        } else {
+            Info 'fork 指纹已就绪（.13 ×4 / .19 ×0），跳过补丁'
+        }
+    }
+
     Add-ElectronDist 'build/electron-win7'
     Copy-Item -LiteralPath $CfgPath  -Destination $cfgBak -Force   # 主线 update-config 备份
     Copy-Item -LiteralPath $CfgW7Path -Destination $CfgPath -Force # 根 resources 换 w7 模板（electron-builder 从这复制进载荷）
@@ -460,6 +506,23 @@ if ($SkipPack -or $SkipDev) {
     Run-Node @('scripts\pack-hot.mjs', '--version', $DevVersion)
     Ok "dev 前向热壳完成（version=$DevVersion）"
 
+    # ── 运行时**升级**差分（老用户热更到新 stable）───────────────────────────
+    # 以前只打降级差分（beta/dev → stable），**从没打过升级差分** —— 结果是
+    # 「stable 换 dsh 版本」时老用户只能下安装包。这次跨版本（0.1.5→0.1.7）必须有。
+    # 源树：所有比当前 stable 旧的树（rt-015 等）。baseVersion 是精确基线，
+    # 客户端 pickRuntime 按 `baseVersion === 当前运行时` 精确命中。
+    foreach ($p in @($UpgradeDiffSources)) {
+        if (-not $p.From -or -not $p.Tag) { continue }
+        if (-not (Test-Path -LiteralPath (Join-Path $root $p.From))) {
+            Warn "升级差分源树缺失，跳过：$($p.From)"; continue
+        }
+        $meta = @(Get-ChildItem "dist\update\dsh-runtime-patch-$($p.Tag)-to-$MainDshVersion*.meta.json" -ErrorAction SilentlyContinue)
+        if ($meta.Count) { Info "升级差分已存在，跳过：$($p.Tag) -> $MainDshVersion"; continue }
+        Run-Node @('scripts\pack-runtime-patch.mjs', '--from', $p.From, '--to', 'resources\dsh-runtime',
+                   '--out', 'dist\update', '--chunk-mb', '20')
+        Ok "升级差分完成：$($p.Tag) -> $MainDshVersion"
+    }
+
     # ── 运行时降级差分 ×2（此时 junction 已还原，resources\dsh-runtime = 主线 rc.3 树）──
     # pack-runtime-patch 方向任意：--from 高版本树 --to 主线树 → meta 里
     # baseVersion=高版本、version=主线版本。壳的 pickRuntime 按
@@ -479,6 +542,35 @@ if ($SkipPack -or $SkipDev) {
                    '--out', 'dist\update', '--chunk-mb', '20')
         Ok "降级差分完成：$($p.Tag) -> $MainDshVersion"
     }
+}
+
+# ---------------------------------------------------------------------------
+Step "4a/7 nightly $NightlyVersion（源码编译的运行时已在 resources\dsh-runtime）"
+# ---------------------------------------------------------------------------
+# nightly 的运行时树由 scripts/fetch-nightly.mjs **从 harness master 源码编译**
+# （官方 npm 上没有 nightly 标签，实测 dist-tags 只有 alpha/latest/next）。
+# 该脚本已把产物装到 resources\dsh-runtime —— 也就是主线 stable 的位置，
+# 所以这里直接用主线构建路径，不需要 junction 换血。
+#
+# ⚠️ 跑这一步**必须**先用 fetch-nightly 覆盖 resources\dsh-runtime，
+#    否则会把 stable 的 0.1.7-rc.2 当成 nightly 发出去。这里做版本核对拦截。
+if ($SkipPack -or $SkipNightly) {
+    Info '跳过'
+} else {
+    $rtPkg = Join-Path $RtDir 'package.json'
+    $nightlyInfo = $null
+    if (Test-Path -LiteralPath $rtPkg) {
+        try { $nightlyInfo = (Get-Content -LiteralPath $rtPkg -Raw | ConvertFrom-Json).dshNightly } catch { }
+    }
+    if (-not $nightlyInfo) {
+        throw ('resources\dsh-runtime 不是 nightly 树（package.json 里没有 dshNightly 段）。' +
+               '先跑：node scripts/fetch-nightly.mjs --to resources/dsh-runtime')
+    }
+    Info ("nightly 上游 dsh = " + $nightlyInfo.upstreamVersion + ' @ ' + $nightlyInfo.commit.Substring(0,7))
+
+    Invoke-FullBuild -Version $NightlyVersion -Channel 'nightly' -Label 'nightly'
+    Run-Node @('scripts\pack-hot.mjs', '--version', $NightlyVersion)
+    Ok "nightly 前向热壳完成（version=$NightlyVersion）"
 }
 
 # ---------------------------------------------------------------------------
@@ -556,11 +648,19 @@ if ($SkipGen) {
     foreach ($h in @(Get-ChildItem "build\hot-shell-$StableVersion-*.tar" -ErrorAction SilentlyContinue)) {
         $stableExtra += @('--hot', $h.FullName)
     }
-    foreach ($tag in @($NextTreeDshVersion, $DevDshVersion)) {
-        $meta = @(Get-ChildItem "dist\update\dsh-runtime-patch-$tag-to-$MainDshVersion*.meta.json" -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending)
-        if ($meta.Count) { $stableExtra += @('--runtime', $meta[0].FullName) }
-        else { Warn "缺降级差分 meta：$tag -> $MainDshVersion（stable feed 将不含该回滚链）" }
+    # runtime 差分：**按「终点 = 当前 stable 版本」全量枚举**，不区分升级/降级。
+    # 两种方向都要挂：
+    #   升级（0.1.5-rc.3 → 0.1.7-rc.2）：老 stable 用户热更到新 stable
+    #   降级（0.2.0-rc.2 → 0.1.7-rc.2）：beta/dev 用户切回 stable 时整体滚回
+    # 客户端 pickRuntime 按 baseVersion === 当前运行时**精确命中**，
+    # 所以每种「用户可能停留的旧版本」都需要对应的一条差分。
+    $rtMetas = @(Get-ChildItem "dist\update\dsh-runtime-patch-*-to-$MainDshVersion*.meta.json" -ErrorAction SilentlyContinue |
+        Sort-Object Name -Unique)
+    if ($rtMetas.Count) {
+        foreach ($m in $rtMetas) { $stableExtra += @('--runtime', $m.FullName) }
+        Ok "stable feed 挂 $($rtMetas.Count) 条运行时差分：$((($rtMetas | ForEach-Object { $_.Name -replace '^dsh-runtime-patch-','' -replace '-to-.*$','' }) | Sort-Object -Unique) -join '、')"
+    } else {
+        Warn "没有指向 $MainDshVersion 的运行时差分 meta（stable feed 将不含运行时热更）"
     }
     Invoke-Feed $StableVersion 'stable'  "$StableVersion 稳定版（dsh latest $MainDshVersion，含 beta/dev 回滚链）—— 通道方案 v2 首版" $stableExtra $SetupUrlStable
     # beta/dev 也要挂**前向热壳**：以前这两条只传 @()（无热壳），导致 beta/dev 用户
@@ -576,8 +676,18 @@ if ($SkipGen) {
     foreach ($h in $devHot) { $devExtra += @('--hot', $h.FullName) }
     if (-not $devHot.Count) { Warn "缺 dev 热壳包 build\hot-shell-$DevVersion-*.tar（dev 用户只能走安装包）" }
 
+    # nightly feed：只挂自己的前向热壳。
+    # 刻意**不挂运行时差分** —— nightly 的运行时是每次从源码编的，
+    # 基线（baseVersion）天天变，做差分既没意义也存不下（每天几百 MB）。
+    # 想升 nightly 就整包换（安装包 or 热壳 + 手动切通道）。
+    $nightlyHot = @(Get-ChildItem "build\hot-shell-$NightlyVersion-*.tar" -ErrorAction SilentlyContinue)
+    $nightlyExtra = @()
+    foreach ($h in $nightlyHot) { $nightlyExtra += @('--hot', $h.FullName) }
+    if (-not $nightlyHot.Count) { Warn "缺 nightly 热壳包 build\hot-shell-$NightlyVersion-*.tar（nightly 用户只能走安装包）" }
+
     Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" $betaExtra $SetupUrlBeta
     Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" $devExtra $SetupUrlDev
+    Invoke-Feed $NightlyVersion 'nightly' "$NightlyVersion 每日构建（dsh master 源码编译）" $nightlyExtra $SetupUrlNightly
     # w7 stable feed 与主线同构地挂降级资源：7.2.0(0.1.7-rc.2)/7.3.0(0.1.7-alpha.2) 切回
     # stable 后轮询 latest-w7.json（壳版本 7.2.0 > feed 版本 7.1.2，不触发 shellOutdated），
     # 全靠 runtime 差分精确命中才置 available → 热壳(7.1.2) + 运行时(0.1.5-rc.3) 一起落位，
@@ -631,7 +741,7 @@ if ($SkipGen) {
 # ---------------------------------------------------------------------------
 Step '6/7 暂存 + 部署到 Cloudflare Pages（六份 feed 一次传齐）'
 # ---------------------------------------------------------------------------
-$allFeeds = @('latest.json', 'latest-beta.json', 'latest-dev.json',
+$allFeeds = @('latest.json', 'latest-beta.json', 'latest-dev.json', 'latest-nightly.json',
               'latest-w7.json', 'latest-w7-beta.json', 'latest-w7-dev.json')
 $dpArgs = New-Object System.Collections.ArrayList
 [void]$dpArgs.Add('scripts\deploy-pages.mjs')

@@ -49,6 +49,7 @@ window.__ModuleLoader__.load({
       chanStable: '稳定版',
       chanBeta: '测试版',
       chanDev: '开发版',
+      chanNightly: '每日构建',
       chanHint: '切换后会立即按该通道重新检查一次；测试版与开发版更新更频繁，可能包含未充分验证的改动。',
       chanSwitching: '正在切换通道…',
       chanDone: '已切换到',
@@ -74,6 +75,7 @@ window.__ModuleLoader__.load({
       chanStable: 'Stable',
       chanBeta: 'Beta',
       chanDev: 'Dev',
+      chanNightly: 'Nightly',
       chanHint: 'Switching triggers an immediate re-check. Beta and dev update more often and may contain less-validated changes.',
       chanSwitching: 'Switching channel…',
       chanDone: 'Switched to',
@@ -81,11 +83,13 @@ window.__ModuleLoader__.load({
       latest: 'Latest',
     };
 
-    // 三条通道：stable 走 latest.json，beta/dev 走 latest-<channel>.json（主进程改写 URL）
+    // 四条通道：stable 走 latest.json，其余走 latest-<channel>.json（主进程改写 URL）。
+    // nightly = 从 harness master 源码编译，跟随上游最新提交（见 scripts/fetch-nightly.mjs）。
     var CHANNELS = [
       { id: 'stable', key: 'chanStable' },
       { id: 'beta', key: 'chanBeta' },
       { id: 'dev', key: 'chanDev' },
+      { id: 'nightly', key: 'chanNightly' },
     ];
 
     exports.name = 'dsh-desktop-updater';

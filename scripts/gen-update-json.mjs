@@ -37,8 +37,8 @@ function die(msg) {
 
 const version = arg('version', pkg.version);
 const channel = String(arg('channel', 'stable')).toLowerCase();
-if (!['stable', 'beta', 'dev', 'w7', 'w7-beta', 'w7-dev'].includes(channel)) {
-  console.error(`[gen-update-json] 未知通道 ${channel}（可选 stable / beta / dev / w7 / w7-beta / w7-dev）`);
+if (!['stable', 'beta', 'dev', 'nightly', 'w7', 'w7-beta', 'w7-dev'].includes(channel)) {
+  console.error(`[gen-update-json] 未知通道 ${channel}（可选 stable / beta / dev / nightly / w7 / w7-beta / w7-dev）`);
   process.exit(1);
 }
 // 通道决定文件名：静态托管只能靠不同文件区分（?channel= 参数对静态源无效）
@@ -217,33 +217,60 @@ for (const runtimeArg of runtimeFiles) {
     const meta = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'));
     const file = meta.file || String(meta.url || '').split('/').pop();
     if (!file) die(`运行时 meta 缺少 file 字段：${runtimeFile}`);
-    const tarPath = path.join(path.dirname(runtimeFile), file);
-    if (!fs.existsSync(tarPath)) die(`运行时 meta 指向的整包不存在：${tarPath}`);
-    const buf = fs.readFileSync(tarPath);
-    const sha = crypto.createHash('sha256').update(buf).digest('hex');
-    if (meta.sha256 && meta.sha256 !== sha) die(`运行时整包 sha256 与 meta 不符：${tarPath}`);
+    const dir = path.dirname(runtimeFile);
+    const tarPath = path.join(dir, file);
+    const hasWhole = fs.existsSync(tarPath);
+    const hasParts = Array.isArray(meta.parts) && meta.parts.length > 0;
+
+    // 整包**可以不存在**：超过托管单文件上限的补丁只发分片，整包本身就不上传
+    // （deploy-pages 也会跳过已切片整包的 25MiB 校验）。
+    // 所以有 parts 时，直接用 meta 里已有的 sha256/size —— 它们就是整包的哈希/大小，
+    // 客户端按分片拼接后再校验，等价。
+    // 以前这里无条件要求整包在盘，导致「重新切片后旧整包被清理」的发版直接 die。
+    let sha = meta.sha256;
+    let size = meta.size;
+    if (hasWhole) {
+      const buf = fs.readFileSync(tarPath);
+      sha = crypto.createHash('sha256').update(buf).digest('hex');
+      size = buf.length;
+      if (meta.sha256 && meta.sha256 !== sha) die(`运行时整包 sha256 与 meta 不符：${tarPath}`);
+    } else if (!hasParts) {
+      die(`运行时 meta 指向的整包不存在，且没有 parts 可用：${tarPath}`);
+    } else if (!sha || !size) {
+      die(`运行时整包缺失，且 meta 未提供 sha256/size：${runtimeFile}`);
+    }
+
+    // 分片齐全性：缺片会导致客户端拼接后校验失败，必须在这里拦住
+    if (hasParts) {
+      const missing = meta.parts.filter((p) => !fs.existsSync(path.join(dir, p)));
+      if (missing.length) die(`运行时补丁缺分片（${missing.length} 个）：${missing.slice(0, 3).join('、')}`);
+      const sum = meta.parts.reduce((n, p) => n + fs.statSync(path.join(dir, p)).size, 0);
+      if (size && sum !== size) {
+        die(`运行时补丁分片大小合计（${sum}）与 meta.size（${size}）不符：${path.basename(runtimeFile)}`);
+      }
+    }
+
     runtimeBlocks.push({
       version: meta.version,
       baseVersion: meta.baseVersion,
       url: `${baseUrl}/${file}`,
       sha256: sha,
-      size: buf.length,
-      ...(meta.parts?.length ? { parts: meta.parts.slice() } : {}),
+      size,
+      ...(hasParts ? { parts: meta.parts.slice() } : {}),
       // meta 里可声明 requiresElectron（如 dsh 0.1.7 只认官方 44.0.0 指纹），
       // 新壳在下载前据此跳过不兼容的补丁
       ...(meta.requiresElectron?.length ? { requiresElectron: meta.requiresElectron.slice() } : {}),
     });
-    // 分片与整包同级，一并 stage 到输出目录，部署时才传得上去
-    stagedRuntime.push(tarPath);
+    // 分片与整包同级，一并 stage 到输出目录，部署时才传得上去。
+    // 整包不存在（已切片的补丁）时不 stage 它 —— 反正也不上传。
+    if (hasWhole) stagedRuntime.push(tarPath);
     for (const p of meta.parts ?? []) {
-      const pp = path.join(path.dirname(runtimeFile), p);
-      if (!fs.existsSync(pp)) die(`找不到分片：${pp}`);
-      stagedRuntime.push(pp);
+      stagedRuntime.push(path.join(dir, p));
     }
     console.log(
       `[gen-update-json] 运行时补丁：dsh ${meta.baseVersion} → ${meta.version}` +
-        `（${(buf.length / 1024 / 1024).toFixed(2)} MB` +
-        `${meta.parts?.length ? `，切成 ${meta.parts.length} 片` : ''}）`,
+        `（${(size / 1024 / 1024).toFixed(2)} MB` +
+        `${hasParts ? `，切成 ${meta.parts.length} 片` : ''}${hasWhole ? '' : '，整包未保留'}）`,
     );
     continue;
   }

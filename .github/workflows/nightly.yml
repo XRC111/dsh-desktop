@@ -1,0 +1,196 @@
+# 每日构建：自动拉取 DeepSeek Harness **master 最新源码**并编译，产出 nightly 安装包。
+#
+# ── 为什么单独一个 workflow ─────────────────────────────────────────────────
+# nightly 与其它通道有本质区别：stable/beta/dev 装的是 npm 上**已发布**的版本，
+# 而 nightly 要跟 master 的最新提交走。官方 npm 上没有 nightly 标签
+# （实测 dist-tags 只有 alpha / latest / next），所以只能自己从源码编。
+#
+# 编译链（scripts/fetch-nightly.mjs 封装，已本机实测跑通）：
+#   clone master（gh-proxy.com 镜像，115MB/0.5min）
+#   → pnpm install --frozen-lockfile（4.3min，需重试抗超时）
+#   → pnpm run build（**要求 git 在 PATH**，构建期要 git rev-parse HEAD）
+#   → 组装成外壳期望的运行时树
+#
+# ── 实测踩到的坑（都已在脚本里处理）────────────────────────────────────────
+#   · pnpm deploy 不可用：只带 508 个包（源码树 1393），vendor/ 下的包会丢
+#   · Windows 上 build:native-system 是 no-op（官方只在 linux/darwin 编原生件）
+#   · 构建目录任一父目录若有 0 字节 package.json，PostCSS 会 JSON.parse('') 崩
+#
+# ── 触发 ────────────────────────────────────────────────────────────────────
+#   1) 定时：每天 UTC 18:00（北京时间次日 02:00）
+#   2) 手动：Actions → nightly → Run workflow（可只构建不发布）
+name: nightly
+
+on:
+  schedule:
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'nightly 外壳版本号（留空 = 自动用 10.4.<运行号>）'
+        required: false
+        default: ''
+      publish:
+        description: '是否发布（部署 feed）。关掉 = 只构建验证'
+        type: boolean
+        default: true
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  nightly:
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: 解析版本号
+        id: v
+        shell: pwsh
+        run: |
+          $input = '${{ inputs.version }}'
+          if ($input) { $ver = $input } else { $ver = '10.4.${{ github.run_number }}' }
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "nightly 外壳版本 = $ver"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # pnpm 版本由仓库的 packageManager 字段决定（11.7.0）
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.7.0
+
+      - name: 安装外壳依赖
+        shell: pwsh
+        run: npm ci --no-audit --no-fund
+
+      # ── 核心：从源码构建 nightly 运行时 ────────────────────────────────────
+      # 这一步会 clone harness master、装依赖、编译、组装运行时树。
+      # 产物落在 resources/dsh-runtime（外壳期望的位置）。
+      - name: 构建 nightly 运行时（源码编译）
+        shell: pwsh
+        env:
+          # 镜像与 registry（脚本内也有默认值，这里显式给便于替换）
+          DSH_GIT_MIRROR: 'https://gh-proxy.com/'
+          DSH_NPM_REGISTRY: 'https://registry.npmmirror.com'
+        run: |
+          # git 由 runner 自带；脚本会自己找（PATH 优先）
+          git --version
+          node scripts/fetch-nightly.mjs --to resources/dsh-runtime
+
+      - name: 记录上游提交
+        id: upstream
+        shell: pwsh
+        run: |
+          $p = 'resources/dsh-runtime/package.json'
+          $j = Get-Content $p -Raw | ConvertFrom-Json
+          $sha = $j.dshNightly.commit
+          $up = $j.dshNightly.upstreamVersion
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "short=$($sha.Substring(0,7))" >> $env:GITHUB_OUTPUT
+          "upstream=$up" >> $env:GITHUB_OUTPUT
+          Write-Host "上游 $up @ $($sha.Substring(0,7))"
+
+      # ── 构建外壳安装包 ──────────────────────────────────────────────────────
+      - name: 生成图标资源
+        shell: pwsh
+        run: npm run gen:assets
+
+      - name: 构建 nightly 安装包
+        shell: pwsh
+        run: |
+          # 只构建 nightly 一条通道，其余全跳过。
+          # nightly 用主线 stable 之外的独立 minor（10.4.x），避免与既有通道撞号。
+          powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
+            -SkipStable -SkipBeta -SkipDev `
+            -SkipW7 -SkipW7Beta -SkipW7Dev `
+            -SkipGen -SkipWrangler `
+            -NightlyVersion '${{ steps.v.outputs.version }}'
+
+      - name: 自检安装包
+        shell: pwsh
+        run: |
+          $f = 'dist/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe'
+          if (-not (Test-Path $f)) { throw "安装包没构建出来：$f" }
+          Write-Host ("  {0}  {1:N1} MB" -f $f, ((Get-Item $f).Length/1MB))
+
+      # ── 发布 ────────────────────────────────────────────────────────────────
+      - name: 上传安装包到 Release
+        if: ${{ inputs.publish != false }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $exists = gh release view packages 2>$null
+          if (-not $exists) {
+            gh release create packages --title '安装包（全版本）' --notes '全部通道的安装包集中分发，feed 外链指向这里。'
+          }
+          gh release upload packages 'dist/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe' --clobber
+
+      - name: 生成 nightly feed
+        if: ${{ inputs.publish != false }}
+        shell: pwsh
+        run: |
+          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/packages'
+          powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
+            -SkipStable -SkipBeta -SkipDev `
+            -SkipW7 -SkipW7Beta -SkipW7Dev `
+            -SkipPack `
+            -NightlyVersion '${{ steps.v.outputs.version }}' `
+            -SetupUrlNightly "$base/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe"
+
+      - name: 部署 nightly feed
+        if: ${{ inputs.publish != false }}
+        shell: pwsh
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if (-not $env:CLOUDFLARE_API_TOKEN) {
+            Write-Host '::warning::未配置 CLOUDFLARE_API_TOKEN，跳过 feed 部署'
+            exit 0
+          }
+          # 六份 feed 一次传（Pages 是整目录替换，缺一份会覆盖掉线上的）
+          $feeds = @('latest.json','latest-beta.json','latest-dev.json',
+                     'latest-nightly.json','latest-w7.json','latest-w7-beta.json','latest-w7-dev.json')
+          $args = @('scripts/deploy-pages.mjs','--project','dsh-desktop-feed','--base-url','https://dl.666-xrc.cc.cd')
+          foreach ($f in $feeds) {
+            $p = "dist/update/$f"
+            if (Test-Path $p) { $args += @('--feed', $p) }
+            else { Write-Host "::warning::缺 $p（跳过）" }
+          }
+          $args += '--stage-only'
+          node @args
+          $stage = (Get-Content 'dist/update/.stage-dir' -Raw).Trim()
+          npx --yes wrangler@4 pages deploy "$stage" --project-name dsh-desktop-feed --branch main --commit-dirty=true
+
+      - name: 归档产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-${{ steps.v.outputs.version }}-${{ steps.upstream.outputs.short }}
+          path: |
+            dist/DSH-Desktop-Setup-*.exe
+            dist/update/latest-nightly.json
+            build/hot-shell-*.tar
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: 汇总
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host '=== nightly 构建汇总 ==='
+          Write-Host "  外壳版本   = ${{ steps.v.outputs.version }}"
+          Write-Host "  上游 dsh   = ${{ steps.upstream.outputs.upstream }}"
+          Write-Host "  上游提交   = ${{ steps.upstream.outputs.short }}"
+          Write-Host "  发布       = ${{ inputs.publish }}"

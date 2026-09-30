@@ -92,6 +92,18 @@
     - id: dsh-desktop-shell
       name: '@dsh-desktop/shell'
 
+    # 计算机操作（computer use）：给模型一组操作本机桌面的工具。
+    #   screen_windows / screen_shot                         只读，默认启用
+    #   screen_activate / screen_resize / mouse_* / key_*    会改系统状态，默认不注册
+    #
+    # 要开启鼠标键盘，给下面这行加 config（注意：补丁是**整体替换** config，不是合并）：
+    #   - id: dsh-desktop-computer-use
+    #     name: '@dsh-desktop/computer-use'
+    #     config:
+    #       allowInput: true
+    - id: dsh-desktop-computer-use
+      name: '@dsh-desktop/computer-use'
+
 # ── 4) Windows：命令执行改用「本地」后端，消除控制台窗口弹出 ────────────────
 #
 # 【现象】在 Windows 上让 Harness 跑命令时，会莫名其妙弹出一个控制台窗口。

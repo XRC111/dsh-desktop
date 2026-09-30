@@ -149,7 +149,13 @@ for (const f of feeds) {
 
 for (const [name, url] of urlNames) {
   const local = resolveLocal(name);
-  if (!local) die(`找不到产物文件 ${name} —— 用 --hot / --runtime / --plugins 指定，或先生成`);
+  if (!local) {
+    // 已切片的整包**本地本来就可能不存在**：超过托管单文件上限的补丁只发分片，
+    // 整包在切片后被清理掉（或从未保留）。这种情况直接跳过，不是错误。
+    // 以前这里先 die 再判 chunked，导致「重新切片后旧整包被清理」的发版卡死。
+    if (chunkedNames.has(name)) continue;
+    die(`找不到产物文件 ${name} —— 用 --hot / --runtime / --plugins 指定，或先生成`);
+  }
   const size = fs.statSync(local).size;
   if (size > PAGES_FILE_LIMIT) {
     if (chunkedNames.has(name)) continue; // 有分片，整包不上

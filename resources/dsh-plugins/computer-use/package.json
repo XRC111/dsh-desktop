@@ -1,0 +1,25 @@
+{
+  "name": "@dsh-desktop/computer-use",
+  "version": "1.0.0",
+  "description": "Computer use for DSH Desktop: screenshot, window control, and synthetic input on Windows",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT",
+  "private": true
+}

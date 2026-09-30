@@ -49,10 +49,11 @@ const api = {
    */
   installUpdate: (mode?: 'hot' | 'runtime' | 'installer') =>
     ipcRenderer.invoke('app:install-update', { mode }),
-  /** 当前更新通道（stable / beta / dev）与它实际请求的 feed 地址 */
+  /** 当前更新通道（stable / beta / dev / nightly）与它实际请求的 feed 地址 */
   getChannel: () => ipcRenderer.invoke('app:get-channel'),
   /** 切换更新通道（写回 update-config.json 并立即按新通道检查一次） */
-  setChannel: (channel: 'stable' | 'beta' | 'dev') => ipcRenderer.invoke('app:set-channel', channel),
+  setChannel: (channel: 'stable' | 'beta' | 'dev' | 'nightly') =>
+    ipcRenderer.invoke('app:set-channel', channel),
   /** 跳过某版本（更新横幅「跳过此版本」）：持久化偏好并收起横幅 */
   skipUpdate: (version: string) => ipcRenderer.invoke('app:skip-update', version),
   /**
