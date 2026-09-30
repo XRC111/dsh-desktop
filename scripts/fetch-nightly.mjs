@@ -74,12 +74,24 @@ function gitExe() {
 
 const git = gitExe();
 
+/**
+ * 跑一条外部命令。
+ *
+ * ⚠️ Windows 上的坑（CI 实测踩到）：`spawnSync('pnpm', ...)` **不会**自动解析
+ * `.cmd` 后缀 —— pnpm/npm 在 Windows 上是 `pnpm.cmd`，Node 只按字面找 `pnpm`，
+ * 结果 ENOENT（status=null → 这里返回 1，看起来像「命令失败」但没有任何输出）。
+ *
+ * 判据不能只看命令名带不带 .cmd（`'pnpm'` 不带），得看**平台**：
+ * Windows 上一律用 shell，让 cmd.exe 去解析 .cmd/.exe。
+ * 代价是参数要自己防注入，但这里全是固定串与内部路径，无外部输入。
+ */
 function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, {
     stdio: 'inherit',
-    shell: process.platform === 'win32' && /\.(cmd|bat)$/i.test(cmd),
+    shell: process.platform === 'win32',
     ...opts,
   });
+  if (r.error) log('  命令启动失败：' + cmd + ' —— ' + String(r.error.message));
   return r.status ?? 1;
 }
 
