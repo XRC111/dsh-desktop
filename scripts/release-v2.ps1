@@ -368,10 +368,17 @@ Info "工作目录：$root"
 foreach ($f in @($PkgPath, $CfgPath, $CfgW7Path)) {
     if (-not (Test-Path -LiteralPath $f)) { throw "缺少文件：$f" }
 }
-$rtNext = Join-Path $root 'build\rt-next'
-$rtNextVer = Get-TreeDshVersion $rtNext
-if ($rtNextVer -ne $NextTreeDshVersion) { throw "build\rt-next 版本异常：期望 $NextTreeDshVersion，实为 '$rtNextVer'" }
-Ok "rt-next 树：dsh $rtNextVer"
+# rt-next / rt-alpha 只有 beta/dev 才需要。nightly 只用主线树，
+# 而且源码编译出来的运行时**没有** rt-next —— 自检必须感知本次要跑哪些通道，
+# 否则 nightly 单独跑时会被「树缺失」卡死（CI 实测）。
+if (-not $SkipBeta) {
+    $rtNext = Join-Path $root 'build\rt-next'
+    $rtNextVer = Get-TreeDshVersion $rtNext
+    if ($rtNextVer -ne $NextTreeDshVersion) { throw "build\rt-next 版本异常：期望 $NextTreeDshVersion，实为 '$rtNextVer'" }
+    Ok "rt-next 树：dsh $rtNextVer"
+} else {
+    Info '跳过 rt-next 检查（-SkipBeta：本次不构建 beta）'
+}
 $rtAlpha = Join-Path $root 'build\rt-alpha'
 $rtAlphaVer = Get-TreeDshVersion $rtAlpha
 if ($rtAlphaVer) { Info "rt-alpha 树已存在：dsh $rtAlphaVer" } else { Info 'rt-alpha 树不存在（dev 构建时会自动重建）' }
@@ -573,7 +580,12 @@ if ($SkipPack -or $SkipNightly) {
         throw ('resources\dsh-runtime 不是 nightly 树（package.json 里没有 dshNightly 段）。' +
                '先跑：node scripts/fetch-nightly.mjs --to resources/dsh-runtime')
     }
-    Info ("nightly 上游 dsh = " + $nightlyInfo.upstreamVersion + ' @ ' + $nightlyInfo.commit.Substring(0,7))
+    $nightlyDsh = $nightlyInfo.upstreamVersion + '+nightly.' + $nightlyInfo.commit.Substring(0,7)
+    Info ("nightly 上游 dsh = " + $nightlyInfo.upstreamVersion + ' @ ' + $nightlyInfo.commit.Substring(0,7) + '  （内嵌 ' + $nightlyDsh + '）')
+
+    # config.dshVersion 必须写成 **nightly 的实际运行时版本**（不是 MainDshVersion）。
+    # 壳的 runtimeVersionOf() 读它来上报「内嵌 dsh 版本」；写错会让热更/降级差分对不上号。
+    Set-DshVersion $nightlyDsh
 
     Invoke-FullBuild -Version $NightlyVersion -Channel 'nightly' -Label 'nightly'
     Run-Node @('scripts\pack-hot.mjs', '--version', $NightlyVersion)
