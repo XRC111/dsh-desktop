@@ -378,7 +378,14 @@ if ($rtAlphaVer) { Info "rt-alpha 树已存在：dsh $rtAlphaVer" } else { Info 
 $w7TarBak = Join-Path $root 'build\dsh-runtime-0.1.7-rc.2-w7.tar.bak'
 if (Test-Path -LiteralPath $w7TarBak) { Ok "w7 运行时 tar 备份在位（$([math]::Round((Get-Item -LiteralPath $w7TarBak).Length / 1MB, 0)) MB）" }
 else { Warn "w7 tar 备份缺失：$w7TarBak（不影响本次发版，但 w7 补丁链后续要用）" }
-if (-not (Test-Path -LiteralPath (Join-Path $WranglerDir 'node_modules\wrangler\bin\wrangler.js'))) { throw "找不到 wrangler：$WranglerDir" }
+# wrangler 只在**真的要上传**时才需要。$WranglerDir 默认指向本机的 openlist-worker
+# （CI 上当然不存在）—— 所以 -SkipWrangler 时不该因为缺它而中止，否则自检先于
+# 构建就 throw，六个包一个都出不来（CI 实测踩到）。
+if ($SkipWrangler) {
+    Info '跳过 wrangler 检查（-SkipWrangler：本次只构建/暂存，不上传）'
+} elseif (-not (Test-Path -LiteralPath (Join-Path $WranglerDir 'node_modules\wrangler\bin\wrangler.js'))) {
+    throw "找不到 wrangler：$WranglerDir（用 -WranglerDir 指定，或加 -SkipWrangler 只构建不上传）"
+}
 if (Test-Junction $RtDir) { Warn "当前 resources\dsh-runtime 是 junction（上次中断残留），构建前会自动处理" }
 $pkgVer = ([regex]::Match((Get-Content -LiteralPath $PkgPath -Raw), '(?m)^\s*"version":\s*"([^"]+)"')).Groups[1].Value
 Info "当前 package.json version = $pkgVer"
