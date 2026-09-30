@@ -181,8 +181,17 @@ fs.mkdirSync(targetDir, { recursive: true });
 log('  复制 node_modules（约 1GB，稍等）');
 copyTree(path.join(srcDir, 'node_modules'), path.join(targetDir, 'node_modules'));
 
-// workspace 包在 pnpm 里是符号链接，脱离源码树会断 → 物化成真目录
+// workspace 包在 pnpm 里是符号链接，脱离源码树会断 → 物化成真目录。
+//
+// ⚠️ CI 实测踩到：copyTree 用 verbatimSymlinks 原样复制链接，pnpm 的 workspace
+// 链接指向 `../../packages/...`（node_modules 之外），复制到目标树后目标不存在
+// → **断链**。在断链路径上 mkdirSync 会直接 ENOENT（连 recursive:true 都救不了，
+//    因为 Node 解析祖先时撞上悬空的 reparse point）。
+// 所以物化前必须先把那个位置的断链/残骸删掉。
 const scopeDir = path.join(targetDir, 'node_modules', '@deepseek-ai');
+try {
+  if (fs.lstatSync(scopeDir).isSymbolicLink()) fs.rmSync(scopeDir, { force: true });
+} catch { /* 不存在就往下走 */ }
 fs.mkdirSync(scopeDir, { recursive: true });
 let materialized = 0;
 for (const base of ['packages', 'apps', 'vendor', 'native']) {
@@ -192,7 +201,8 @@ for (const base of ['packages', 'apps', 'vendor', 'native']) {
     const manifest = JSON.parse(fs.readFileSync(path.join(p, 'package.json'), 'utf8'));
     if (!manifest.name) continue;
     const dest = path.join(targetDir, 'node_modules', ...manifest.name.split('/'));
-    if (fs.existsSync(dest)) continue;
+    // 关键：先清掉可能存在的断链/残骸（existsSync 对断链返回 false，但路径仍占位）
+    try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* 无则跳过 */ }
     fs.mkdirSync(dest, { recursive: true });
     fs.copyFileSync(path.join(p, 'package.json'), path.join(dest, 'package.json'));
     for (const sub of ['lib', 'dist', 'locale', 'assets', 'skills', 'config', 'reference']) {
