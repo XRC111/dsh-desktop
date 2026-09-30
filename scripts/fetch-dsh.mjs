@@ -34,8 +34,14 @@ if (!dshVersion) {
   process.exit(1);
 }
 
-const registry = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com';
-const electronMirror = process.env.DSH_ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/';
+// CI（GitHub runner，在美国）直连上游；本机（国内）走镜像。
+// 走镜像对 runner 是绕远路：美国 → 中国代理 → 美国，还多一个故障点。
+const inCI = process.env.CI === 'true' || process.env.CI === '1';
+const registry =
+  process.env.DSH_NPM_REGISTRY || (inCI ? 'https://registry.npmjs.org' : 'https://registry.npmmirror.com');
+const electronMirror =
+  process.env.DSH_ELECTRON_MIRROR ||
+  (inCI ? 'https://github.com/electron/electron/releases/download/' : 'https://npmmirror.com/mirrors/electron/');
 
 fs.mkdirSync(targetDir, { recursive: true });
 
@@ -98,7 +104,9 @@ const res = spawnSync(npmCmd, args, {
     ELECTRON_MIRROR: electronMirror,
     ELECTRON_BUILDER_BINARIES_MIRROR:
       process.env.ELECTRON_BUILDER_BINARIES_MIRROR ||
-      'https://npmmirror.com/mirrors/electron-builder-binaries/',
+      (inCI
+        ? 'https://github.com/electron-userland/electron-builder-binaries/releases/download/'
+        : 'https://npmmirror.com/mirrors/electron-builder-binaries/'),
   },
 });
 

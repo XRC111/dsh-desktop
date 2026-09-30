@@ -62,9 +62,18 @@ concurrency:
 permissions:
   contents: write   # 上传 Release 资产
 
+# ⚠️ runner 在**美国**：这里把所有上游**显式指回官方**。
+#    仓库里的 .npmrc 指向国内镜像（给本机构建用），而 npm 的优先级是
+#    「命令行 > 环境变量 > 项目 .npmrc > user .npmrc」—— 所以只有环境变量能盖住它。
+#    （实测：`npm config set` 写的是 user 级，**盖不住**项目 .npmrc。）
 env:
-  # 让 Node 生态走国内镜像（与 .npmrc 一致；runner 在国外，但显式指定更稳）
   NODE_OPTIONS: ''
+  NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org'
+  NPM_CONFIG_ELECTRON_MIRROR: 'https://github.com/electron/electron/releases/download/'
+  NPM_CONFIG_ELECTRON_BUILDER_BINARIES_MIRROR: 'https://github.com/electron-userland/electron-builder-binaries/releases/download/'
+  NPM_CONFIG_DISTURL: 'https://nodejs.org/dist'
+  # sharp / node-sqlite3 用预编译 npm 包（@img/*、prebuild-install 回落到源码），
+  # 不走 *_binary_host 下载 → 不设这几项，让它们用各自默认值。
 
 jobs:
   build:

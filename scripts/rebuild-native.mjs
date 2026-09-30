@@ -69,7 +69,12 @@ const res = spawnSync(process.execPath, args, {
   stdio: 'inherit',
   env: {
     ...process.env,
-    ELECTRON_MIRROR: process.env.ELECTRON_MIRROR || 'https://npmmirror.com/mirrors/electron/',
+    // CI（GitHub runner，在美国）直连；本机（国内）走镜像 —— 与 fetch-dsh.mjs 同一策略
+    ELECTRON_MIRROR:
+      process.env.ELECTRON_MIRROR ||
+      (process.env.CI
+        ? 'https://github.com/electron/electron/releases/download/'
+        : 'https://npmmirror.com/mirrors/electron/'),
   },
 });
 

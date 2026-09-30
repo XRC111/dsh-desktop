@@ -6,7 +6,7 @@
 # （实测 dist-tags 只有 alpha / latest / next），所以只能自己从源码编。
 #
 # 编译链（scripts/fetch-nightly.mjs 封装，已本机实测跑通）：
-#   clone master（gh-proxy.com 镜像，115MB/0.5min）
+#   clone master（runner 在美国 → 直连 github.com；本地才走镜像）
 #   → pnpm install --frozen-lockfile（4.3min，需重试抗超时）
 #   → pnpm run build（**要求 git 在 PATH**，构建期要 git rev-parse HEAD）
 #   → 组装成外壳期望的运行时树
@@ -41,6 +41,16 @@ concurrency:
 
 permissions:
   contents: write
+
+# ⚠️ runner 在**美国**：把所有上游显式指回官方。
+#    仓库里的 .npmrc 指向国内镜像（给本机构建用），而 npm 的优先级是
+#    「命令行 > 环境变量 > 项目 .npmrc > user .npmrc」—— 只有环境变量能盖住它。
+#    （实测：`npm config set` 写的是 user 级，**盖不住**项目 .npmrc。）
+env:
+  NPM_CONFIG_REGISTRY: 'https://registry.npmjs.org'
+  NPM_CONFIG_ELECTRON_MIRROR: 'https://github.com/electron/electron/releases/download/'
+  NPM_CONFIG_ELECTRON_BUILDER_BINARIES_MIRROR: 'https://github.com/electron-userland/electron-builder-binaries/releases/download/'
+  NPM_CONFIG_DISTURL: 'https://nodejs.org/dist'
 
 jobs:
   nightly:
@@ -78,11 +88,10 @@ jobs:
       # 产物落在 resources/dsh-runtime（外壳期望的位置）。
       - name: 构建 nightly 运行时（源码编译）
         shell: pwsh
-        env:
-          # 镜像与 registry（脚本内也有默认值，这里显式给便于替换）
-          DSH_GIT_MIRROR: 'https://gh-proxy.com/'
-          DSH_NPM_REGISTRY: 'https://registry.npmmirror.com'
         run: |
+          # ⚠️ runner 在**美国**：所有上游都直连，**不要**用国内镜像 ——
+          #    走 npmmirror/gh-proxy 等于「美国 → 中国代理 → 美国」，绕远路且多一个故障点。
+          #    脚本内部也会按 CI 环境变量自动选直连（见 fetch-nightly.mjs 的 inCI）。
           # git 由 runner 自带；脚本会自己找（PATH 优先）
           git --version
           node scripts/fetch-nightly.mjs --to resources/dsh-runtime

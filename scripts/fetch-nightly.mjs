@@ -7,7 +7,7 @@
 //
 // ── 已实测的事实（2026-09-30，本机 Windows）────────────────────────────────
 //   · 仓库公开：github.com/deepseek-ai/deepseek-harness，默认分支 master
-//   · 镜像克隆可行：gh-proxy.com 前缀，115MB / 0.5 分钟
+//   · 克隆可行：本地走 gh-proxy 镜像（115MB / 0.5 分钟），CI 直连 github.com
 //   · pnpm install --frozen-lockfile：4.3 分钟；常在 1388/1392 处网络超时 → 必须重试
 //   · pnpm run build：可行，但**要求 git 在 PATH**（构建期 git rev-parse HEAD 烧标识）
 //   · Windows 上 build:native-system 是 no-op（官方只在 linux/darwin 编原生件）
@@ -47,8 +47,14 @@ const keepSrc = flag('keep-src');
 const srcDir = path.resolve(arg('src', path.join(root, 'build', 'harness-src')));
 
 const REPO = 'https://github.com/deepseek-ai/deepseek-harness.git';
-const MIRROR = process.env.DSH_GIT_MIRROR || 'https://gh-proxy.com/';
-const registry = process.env.DSH_NPM_REGISTRY || 'https://registry.npmmirror.com';
+
+// ── 镜像策略：CI 直连，本地走镜像 ───────────────────────────────────────────
+// GitHub runner 在**美国**，走 gh-proxy/npmmirror 等于「美国 → 中国代理 → 美国」，
+// 绕远路还多一个故障点；而本机在国内，直连 github.com 常失败。
+// 所以按 CI 环境变量自动切换，两边都可用 DSH_GIT_MIRROR / DSH_NPM_REGISTRY 覆盖。
+const inCI = process.env.CI === 'true' || process.env.CI === '1';
+const MIRROR = process.env.DSH_GIT_MIRROR ?? (inCI ? '' : 'https://gh-proxy.com/');
+const registry = process.env.DSH_NPM_REGISTRY || (inCI ? 'https://registry.npmjs.org' : 'https://registry.npmmirror.com');
 
 function log(m) { console.log('[nightly] ' + m); }
 function die(m) { console.error('[nightly] ' + m); process.exit(1); }
@@ -86,9 +92,11 @@ if (fs.existsSync(path.join(srcDir, '.git'))) {
 } else {
   fs.rmSync(srcDir, { recursive: true, force: true });
   fs.mkdirSync(path.dirname(srcDir), { recursive: true });
-  log('克隆 ' + ref + '（镜像 ' + MIRROR + '）');
-  let code = run(git, ['clone', '--depth', '1', '--branch', ref, MIRROR + REPO, srcDir]);
-  if (code !== 0) {
+  // MIRROR 为空 = CI（直连）；非空 = 本地（走镜像，失败再回落直连）
+  const primary = MIRROR ? MIRROR + REPO : REPO;
+  log('克隆 ' + ref + '（' + (MIRROR ? '镜像 ' + MIRROR : '直连 github.com') + '）');
+  let code = run(git, ['clone', '--depth', '1', '--branch', ref, primary, srcDir]);
+  if (code !== 0 && MIRROR) {
     log('镜像克隆失败 → 回落到直连 github.com');
     fs.rmSync(srcDir, { recursive: true, force: true });
     code = run(git, ['clone', '--depth', '1', '--branch', ref, REPO, srcDir]);
