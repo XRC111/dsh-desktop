@@ -23,6 +23,10 @@ build/plugins-*.meta.json
 build/plugins-*-parts/
 build/rt-next/
 build/rt-alpha/
+# 其它运行时树（如 rt-020 实测树）与临时探测目录，统一按前缀忽略
+build/rt-*/
+build/probe-*/
+build/api-diff*/
 build/runtime-*/
 build/old-w7-asar/
 build/electron-win7/

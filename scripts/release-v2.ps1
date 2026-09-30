@@ -64,9 +64,15 @@ param(
     [string]$W7Version         = '7.1.0',
     [string]$W7BetaVersion     = '7.2.0',
     [string]$W7DevVersion      = '7.3.0',
-    [string]$MainDshVersion    = '0.1.5-rc.3',     # 主线内嵌 dsh（latest 线）
-    [string]$NextTreeDshVersion = '0.1.7-rc.2',    # build\rt-next 期望版本（next 线）
-    [string]$DevDshVersion     = '0.1.7-alpha.2',  # dev 构建 / rt-alpha 树版本（alpha 线）
+    # dsh 版本矩阵（2026-09-27 用户拍板：避开 0.2.0 的破坏性变更，stable 锁在 0.1.7 线）
+    #   stable -> 0.1.7-rc.2   （官方**没有** 0.1.7 正式版，rc.2 是该线最后一版）
+    #   beta   -> 0.2.0-rc.2   （官方 latest / next 都指向它）
+    #   dev    -> 0.2.0-rc.2   （官方**没有** 0.2.0-alpha，dev 暂与 beta 同版本）
+    # ⚠️ 已与官方 dist-tag 脱钩：官方 latest=0.2.0-rc.2，我们 stable 锁 0.1.7-rc.2。
+    #    以后跟版必须**显式指定版本号**，不能再从 latest/next 推导。
+    [string]$MainDshVersion    = '0.1.7-rc.2',     # 主线 stable 内嵌 dsh（resources\dsh-runtime）
+    [string]$NextTreeDshVersion = '0.2.0-rc.2',    # build\rt-next 期望版本（beta）
+    [string]$DevDshVersion     = '0.2.0-rc.2',     # build\rt-alpha 期望版本（dev）
     # 安装包外链（网盘直链）：填了就挂进对应 feed 的 files 块，客户端走外链下载安装包，
     # sha256/size 自动从 dist 同名安装包补齐（下载完照常哈希校验）。留空 = 空骨架
     # （feed 不带安装包，客户端提示手动下载）。直链要求：程序可直接 GET（无验证码/登录校验、

@@ -43,6 +43,7 @@ import {
 import { pickPort } from './port';
 import { installPlugins } from './plugin-installer';
 import { guardPatch } from './patch-guard';
+import { ensurePluginCompatibility } from './plugin-compat';
 import { SHELL_FEATURES, ShellFeatures } from './shell-features';
 import { WindowManager, redactToken } from './window-manager';
 import { TrayManager } from './tray-manager';
@@ -294,6 +295,24 @@ async function startService(): Promise<void> {
     path.join(install.runtimeDir, 'node_modules'),
   ]);
 
+  // 插件兼容层：dsh 0.2.0 起按 manifest 的 peerDependencies 强制校验，声明写死在
+  // 旧区间的插件会被**静默禁用**（如 dshmarket 的 dsh-settings: ^0.1.x 不含 0.2.x）。
+  // 对「声明过时但依赖包仍在运行时」的插件写官方豁免（profiles/web/compatibility.json），
+  // 依赖包真的不在的则拒绝放行。详见 plugin-compat.ts。
+  const compat = ensurePluginCompatibility({
+    profileDir: path.join(dshHomeDir(), 'profiles', 'web'),
+    pluginDirs: pluginDirsInProfile(),
+    runtimeVersion: install.version,
+    searchRoots: [
+      path.join(dshHomeDir(), 'profiles', 'node_modules'),
+      path.join(install.runtimeDir, 'node_modules'),
+    ],
+  });
+  if (compat.allowed.length > 0) {
+    log(`插件兼容层：放行 ${compat.allowed.length} 个声明过时的插件（${compat.allowed.join('、')}）`);
+  }
+  for (const r of compat.refused) log(`插件兼容层：拒绝 ${r.key} —— ${r.reason}`);
+
   const status = await service.start({
     install,
     preferredPort: PREFERRED_PORT,
@@ -473,6 +492,35 @@ function applyFeatureChange(id: string, enabled: boolean): void {
       }
     }
   }
+}
+
+/**
+ * 列出 profile 共享 node_modules 里已落位的插件目录（含 @scope/ 下一层）。
+ * 兼容层要逐个读它们的 package.json 判定 peer 声明。
+ */
+function pluginDirsInProfile(): string[] {
+  const root = path.join(dshHomeDir(), 'profiles', 'node_modules');
+  const dirs: string[] = [];
+  try {
+    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      const full = path.join(root, entry.name);
+      if (entry.name.startsWith('@')) {
+        try {
+          for (const sub of fs.readdirSync(full, { withFileTypes: true })) {
+            if (sub.isDirectory()) dirs.push(path.join(full, sub.name));
+          }
+        } catch {
+          /* 读不到跳过 */
+        }
+      } else {
+        dirs.push(full);
+      }
+    }
+  } catch {
+    /* 首次启动没有该目录 → 空列表 */
+  }
+  return dirs;
 }
 
 function registerIpc(): void {

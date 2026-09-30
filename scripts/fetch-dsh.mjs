@@ -8,13 +8,29 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const targetDir = path.join(root, 'resources', 'dsh-runtime');
+
+// 可选参数（不传 = 老行为：装到 resources/dsh-runtime，版本取根 package.json）
+//   --to <dir>      目标目录（相对项目根或绝对路径）
+//   --version <ver> 要装的 dsh 版本（覆盖 config.dshVersion）
+// 加这两个参数是为了**用同一套逻辑建多棵运行时树**（rt-next / rt-alpha / rt-020 …）：
+// --ignore-scripts 的选择、以及 ensure-spawn-helper 的补跑都在这里，重复实现容易漏。
+function arg(name, fallback = '') {
+  const i = process.argv.indexOf(`--${name}`);
+  const v = i >= 0 ? process.argv[i + 1] : undefined;
+  return v && !v.startsWith('--') ? v : fallback;
+}
+
+const targetDir = (() => {
+  const t = arg('to');
+  if (!t) return path.join(root, 'resources', 'dsh-runtime');
+  return path.isAbsolute(t) ? t : path.resolve(root, t);
+})();
 const force = process.argv.includes('--force');
 
 const rootPkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
-const dshVersion = rootPkg?.config?.dshVersion;
+const dshVersion = arg('version') || rootPkg?.config?.dshVersion;
 if (!dshVersion) {
-  console.error('[fetch-dsh] 根 package.json 缺少 config.dshVersion，请先指定要封装的 dsh 版本');
+  console.error('[fetch-dsh] 缺少 dsh 版本：给 --version，或在根 package.json 里设 config.dshVersion');
   process.exit(1);
 }
 

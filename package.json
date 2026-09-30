@@ -34,7 +34,7 @@
   "private": true,
   "main": "out/main/index.js",
   "config": {
-    "dshVersion": "0.1.5-rc.3",
+    "dshVersion": "0.1.7-rc.2",
     "hotMinBaseVersion": "1.1.1"
   },
   "scripts": {
