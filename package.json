@@ -41,6 +41,7 @@
     "build": "tsc -p tsconfig.json && node scripts/copy-static.mjs",
     "prepare:runtime": "node scripts/fetch-dsh.mjs",
     "prepare:w7": "node scripts/fetch-w7-electron.mjs",
+    "prepare:tools": "node scripts/prepare-tools.mjs",
     "rebuild:native": "node scripts/rebuild-native.mjs",
     "verify:runtime": "node scripts/verify-runtime.mjs",
     "gen:assets": "node scripts/gen-assets.mjs",
@@ -50,8 +51,8 @@
     "deploy:r2": "node scripts/deploy-r2.mjs",
     "gen:manifest": "node scripts/gen-runtime-manifest.mjs",
     "start": "npm run build && electron .",
-    "pack": "npm run build && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs",
-    "dist": "npm run build && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs && electron-builder --win nsis --x64 --prepackaged dist/win-unpacked",
+    "pack": "npm run build && node scripts/prepare-tools.mjs && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs",
+    "dist": "npm run build && node scripts/prepare-tools.mjs && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs && electron-builder --win nsis --x64 --prepackaged dist/win-unpacked",
     "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {
@@ -102,6 +103,11 @@
       {
         "from": "resources/dsh-plugins",
         "to": "dsh-plugins"
+      },
+      {
+        "comment": "内置 git / python：外壳启动 dsh 时把它们的 bin 注入 PATH，模型侧不必自备环境（scripts/prepare-tools.mjs 生成）",
+        "from": "resources/tools",
+        "to": "tools"
       },
       {
         "from": "build/tray.png",

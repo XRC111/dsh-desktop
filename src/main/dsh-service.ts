@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as path from 'path';
 import { DshInstall } from './dsh-locator';
+import { prependToolsToPath } from './builtin-tools';
 import { log, logDshChunk } from './logger';
 import { waitForPort } from './port';
 
@@ -111,6 +112,15 @@ export class DshService extends EventEmitter {
       NO_COLOR: '1',
     };
     delete env.ELECTRON_NO_ATTACH_CONSOLE;
+
+    // 内置 git / python 前置到 PATH：dsh 及其所有子命令都继承，
+    // 这样模型执行 git / python 不必依赖用户机器上的环境配置。
+    // 目录不存在时 prependToolsToPath 原样返回，不制造死路径。
+    const withTools = prependToolsToPath(env);
+    if (withTools !== (env.PATH ?? env.Path ?? '')) {
+      env.PATH = withTools;
+      delete env.Path; // 避免 Windows 上 Path/PATH 双份导致解析歧义
+    }
 
       const child = spawn(process.execPath, args, {
         cwd: opts.install.runtimeDir, // 保证 dsh 能在运行时目录内正确解析模块
