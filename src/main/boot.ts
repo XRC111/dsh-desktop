@@ -291,10 +291,29 @@ async function startService(): Promise<void> {
   // 补丁里 insert 的插件只要有一个解析不到，dsh 会整体起不来
   // （plugin tree failed to load，实测 exit=1）→ 剔除未就绪的行再交给 dsh。
   // 解析根：profile 共享 node_modules（外壳落位插件的地方）+ 运行时自带 node_modules。
-  const patchGuard = guardPatch(desktopPatchFile(), path.join(userDataDir(), 'desktop-patch.effective.yml'), [
-    path.join(dshHomeDir(), 'profiles', 'node_modules'),
-    path.join(install.runtimeDir, 'node_modules'),
-  ]);
+  // computer use 的能力开关存在外壳侧（shell-features.json，用户在设置页改），
+  // 但插件跑在 dsh 进程里、读的是自己的 config —— 两者靠**这里注入补丁**打通：
+  // guardPatch 会把开关值写进 effective 补丁的 config 段，dsh 加载时自然读到。
+  // 好处：改开关只需重启 dsh（不用改 YAML、不用重装插件）。
+  // shellFeatures 在 initShell() 里赋值（L737），而 startService() 在其后（L810）才调用，
+  // 所以到这里必然已就绪；`!` 只是让 TS 知道这个跨函数的时序事实。
+  const sf = shellFeatures!;
+  const cuConfig = {
+    allowScreenshot: sf.isEnabled('computerUseScreenshot'),
+    allowMouse: sf.isEnabled('computerUseMouse'),
+    allowKeyboard: sf.isEnabled('computerUseKeyboard'),
+    allowWindows: sf.isEnabled('computerUseWindows'),
+    allowUnattended: sf.isEnabled('computerUseUnattended'),
+  };
+  const patchGuard = guardPatch(
+    desktopPatchFile(),
+    path.join(userDataDir(), 'desktop-patch.effective.yml'),
+    [
+      path.join(dshHomeDir(), 'profiles', 'node_modules'),
+      path.join(install.runtimeDir, 'node_modules'),
+    ],
+    { 'dsh-desktop-computer-use': cuConfig },
+  );
 
   // 插件兼容层：dsh 0.2.0 起按 manifest 的 peerDependencies 强制校验，声明写死在
   // 旧区间的插件会被**静默禁用**（如 dshmarket 的 dsh-settings: ^0.1.x 不含 0.2.x）。

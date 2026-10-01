@@ -57,14 +57,82 @@ export interface PatchGuardResult {
   dropped: string[];
 }
 
+/** 要给某个 insert 行注入的 config（key = 插件 id，值 = 该行的 config 对象） */
+export type InsertConfig = Record<string, Record<string, unknown>>;
+
+/**
+ * 往 insert 块里的指定行注入 `config:`。
+ *
+ * 为什么要改文本而不是解析 YAML：补丁是我们自己维护的、格式固定，
+ * 为它引一个 YAML 依赖不划算（且要保证**其余内容逐字不变**，避免热壳与安装目录
+ * 两份补丁产生无谓差异）。所以只做行级的定点插入。
+ *
+ * 注入规则：找到 `- id: <key>` 那一行，在它后面的 `name:` 行之后插入 config 块。
+ * 若该行**已有** config（用户手写的），原样保留、不覆盖 —— 用户的显式配置优先。
+ */
+function injectConfigs(lines: string[], configs: InsertConfig): { lines: string[]; injected: string[] } {
+  const injected: string[] = [];
+  const out: string[] = [];
+  let pendingKeys: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    out.push(line);
+
+    // 记录本行声明的 id（可能一行里多个 id 各自成块，但我们的补丁是一行一个）
+    const idm = /^\s*-\s*id\s*:\s*['"]?([^'"\s#]+)['"]?/.exec(line);
+    if (idm) {
+      pendingKeys = [idm[1]];
+      continue;
+    }
+
+    // name 行紧跟 id 行：到这里才知道这一项是哪个插件
+    if (pendingKeys.length && /^\s+name\s*:/.test(line)) {
+      const key = pendingKeys[0];
+      const cfg = configs[key];
+      pendingKeys = [];
+      if (!cfg) continue;
+
+      // config 必须与 name **同级**（不是更深一级），否则 YAML 结构就错了。
+      const indent = /^(\s*)/.exec(line)?.[1] ?? '';
+      const childIndent = indent + '  ';
+
+      // 往后看：该行是否已经有 config → 有就不动，尊重用户手写配置
+      let j = i + 1;
+      let hasConfig = false;
+      while (j < lines.length) {
+        const nxt = lines[j];
+        if (!nxt.trim()) { j++; continue; }
+        if (!nxt.startsWith(indent)) break;
+        if (/^\s+config\s*:/.test(nxt)) { hasConfig = true; break; }
+        j++;
+      }
+      if (hasConfig) continue;
+
+      out.push(indent + 'config:');
+      for (const [k, v] of Object.entries(cfg)) {
+        out.push(childIndent + k + ': ' + JSON.stringify(v));
+      }
+      injected.push(key);
+    }
+  }
+  return { lines: out, injected };
+}
+
 /**
  * 校验并落盘「实际生效的补丁」。
  *
  * @param patchFile 原始补丁（可能来自热壳，也可能来自安装目录）
  * @param outFile   实际生效的补丁输出路径（用户数据目录，保证可写）
  * @param searchRoots 解析插件包名的根目录列表（profile node_modules 优先）
+ * @param configs   要注入到指定 insert 行的 config（如 computer-use 的 allowInput）
  */
-export function guardPatch(patchFile: string, outFile: string, searchRoots: string[]): PatchGuardResult {
+export function guardPatch(
+  patchFile: string,
+  outFile: string,
+  searchRoots: string[],
+  configs: InsertConfig = {},
+): PatchGuardResult {
   let text: string;
   try {
     text = fs.readFileSync(patchFile, 'utf8');
@@ -75,8 +143,12 @@ export function guardPatch(patchFile: string, outFile: string, searchRoots: stri
 
   const wanted = collectInsertedPlugins(text);
   const missing = wanted.filter((n) => !resolvable(n, searchRoots));
-  if (missing.length === 0) {
-    // 全都解析得到：直接用原补丁，不做任何改写（避免引入无谓差异）
+  const hasConfigs = Object.keys(configs).length > 0;
+
+  // 注意：**只要要注入 config 就必须写 effective 文件**，
+  // 不能像以前那样「没有缺失就直接用原补丁」—— 否则注入没地方落。
+  if (missing.length === 0 && !hasConfigs) {
+    // 全都解析得到且无需注入：直接用原补丁，不做任何改写（避免引入无谓差异）
     return { file: patchFile, dropped: [] };
   }
 
@@ -99,12 +171,18 @@ export function guardPatch(patchFile: string, outFile: string, searchRoots: stri
     keep.push(line);
   }
 
+  // 先剔除缺失行，再注入 config（顺序不能反：注入要基于剔除后的文本算缩进）
+  const { lines: finalLines, injected } = hasConfigs
+    ? injectConfigs(keep, configs)
+    : { lines: keep, injected: [] };
+
   try {
     fs.mkdirSync(path.dirname(outFile), { recursive: true });
-    fs.writeFileSync(outFile, keep.join('\n'), 'utf8');
-    log(
-      `桌面适配补丁已剔除 ${missing.length} 个未就绪的插件（${missing.join('、')}）→ 用 ${outFile}`,
-    );
+    fs.writeFileSync(outFile, finalLines.join('\n'), 'utf8');
+    const parts: string[] = [];
+    if (missing.length) parts.push(`剔除 ${missing.length} 个未就绪插件（${missing.join('、')}）`);
+    if (injected.length) parts.push(`注入 config（${injected.join('、')}）`);
+    log(`桌面适配补丁已改写：${parts.join('；') || '无变化'} → 用 ${outFile}`);
     return { file: outFile, dropped: missing };
   } catch (err) {
     log(`写入生效补丁失败，回退原补丁：${String(err)}`);

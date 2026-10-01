@@ -140,7 +140,21 @@ function apply(ctx, config) {
     ctx.logger?.info?.('computer-use：非 Windows 平台，跳过注册');
     return;
   }
-  const allowInput = config?.allowInput === true;
+  // ── 能力开关（由外壳的设置页写入，经 patch-guard 注入到这里）─────────────
+  // 按**能力粒度**分，而不是一个总开关：用户可以只给看屏幕、不给动鼠标。
+  // 全部默认关（除了截图由外壳默认开）；config 缺省时一律按关处理。
+  const on = (k) => config?.[k] === true;
+  const allowScreenshot = config?.allowScreenshot !== false; // 截图默认开（只读）
+  const allowMouse = on('allowMouse');
+  const allowKeyboard = on('allowKeyboard');
+  const allowWindows = on('allowWindows');
+  const allowUnattended = on('allowUnattended');
+
+  // 兼容旧的单一开关：allowInput=true 视为「全开」（老配置不至于失效）
+  const legacyAll = config?.allowInput === true;
+  const canMouse = allowMouse || legacyAll;
+  const canKeyboard = allowKeyboard || legacyAll;
+  const canWindows = allowWindows || legacyAll;
 
   // ── 只读：列窗口 ──────────────────────────────────────────────────────────
   ctx.tools.register(defineTool({
@@ -200,7 +214,8 @@ function apply(ctx, config) {
     }),
   }));
 
-  // ── 只读：截屏 ────────────────────────────────────────────────────────────
+  // ── 只读：截屏（受 allowScreenshot，默认开）────────────────────────────────
+  if (allowScreenshot) {
   ctx.tools.register(defineTool({
     name: 'screen_shot',
     description:
@@ -252,16 +267,15 @@ function apply(ctx, config) {
       rawInput: args,
     }),
   }));
-
-  // ── 以下会改变系统状态，默认不注册 ─────────────────────────────────────────
-  if (!allowInput) {
-    ctx.logger?.info?.(
-      'computer-use：只注册了只读工具（screen_windows / screen_shot）。' +
-        '要启用鼠标键盘操作，在 desktop-patch.yml 里给该行加 config: { allowInput: true }',
-    );
-    return;
+  } else {
+    ctx.logger?.info?.('computer-use：截图已按设置关闭（screen_shot 未注册）');
   }
 
+  // ── 以下会改变系统状态，逐组按开关注册 ─────────────────────────────────────
+  // 设计：按**能力粒度**分开，而不是一个总开关 —— 用户可以只给点鼠标、不给打字。
+
+  // ── 窗口组（allowWindows / 旧 allowInput）──────────────────────────────────
+  if (canWindows) {
   // 切窗口
   ctx.tools.register(defineTool({
     name: 'screen_activate',
@@ -293,7 +307,10 @@ function apply(ctx, config) {
     },
     presentCall: (args) => ({ card: 'generic', title: '调整窗口', kind: 'other', rawInput: args }),
   }));
+  }
 
+  // ── 鼠标组（allowMouse / 旧 allowInput）────────────────────────────────────
+  if (canMouse) {
   // 鼠标移动
   ctx.tools.register(defineTool({
     name: 'mouse_move',
@@ -357,7 +374,10 @@ function apply(ctx, config) {
     },
     presentCall: (args) => ({ card: 'generic', title: `滚动 ${args.delta}`, kind: 'other', rawInput: args }),
   }));
+  }
 
+  // ── 键盘组（allowKeyboard / 旧 allowInput）──────────────────────────────────
+  if (canKeyboard) {
   // 按键 / 组合键
   ctx.tools.register(defineTool({
     name: 'key_press',
@@ -417,6 +437,23 @@ function apply(ctx, config) {
       rawInput: args,
     }),
   }));
+  }
+
+  // 未开启的能力记一条日志，便于用户在「会话日志」里确认当前授权范围
+  const off = [];
+  if (!allowScreenshot) off.push('截图');
+  if (!canMouse) off.push('鼠标');
+  if (!canKeyboard) off.push('键盘');
+  if (!canWindows) off.push('窗口');
+  if (off.length) {
+    ctx.logger?.info?.(
+      'computer-use：本次未启用 ' + off.join('、') +
+        '（改设置：设置 → 桌面 →「AI 操作本机」）',
+    );
+  }
+  if (!allowUnattended) {
+    ctx.logger?.info?.('computer-use：仅在本窗口处于前台时允许操作（无人值守已关闭）');
+  }
 }
 
 export { name, inject, apply };

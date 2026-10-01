@@ -68,6 +68,45 @@ export const SHELL_FEATURES: ShellFeatureDef[] = [
     label: '显示外壳顶条',
     desc: '窗口顶部显示 DSH Desktop 自绘顶条（含当前会话名）。关掉即沉浸模式，内容铺满整窗。',
   },
+  // ── computer use（操作本机桌面）──────────────────────────────────────────
+  // 与上面那些「适配」不同，这组开关让 AI **能操作你的电脑**，风险性质不一样。
+  // 所以按**能力粒度**拆开，而不是一个总开关 —— 你可以只给「看屏幕」，
+  // 或只给「点鼠标」而不给「打字」，按需要逐项放开。
+  //
+  // 截图（看屏幕）默认开：它只是读，且是判断界面状态的必需品。
+  // 其余默认关：都会**真实改变你的系统状态**。
+  {
+    id: 'computerUseScreenshot',
+    def: true,
+    label: '看屏幕（截图）',
+    desc: '允许 AI 截取屏幕或指定窗口的画面。只读，不改动任何东西；关掉则它无法感知界面。',
+  },
+  {
+    id: 'computerUseMouse',
+    def: false,
+    label: '操作鼠标（点击/移动/滚轮）',
+    desc: '允许 AI 移动指针并点击。它能点到任何地方，包括删除按钮 —— 请只在盯着屏幕时开。',
+  },
+  {
+    id: 'computerUseKeyboard',
+    def: false,
+    label: '操作键盘（按键/输入文本）',
+    desc: '允许 AI 按键与打字。它能输入任意内容并触发快捷键（如 Ctrl+S、Alt+F4）。',
+  },
+  {
+    id: 'computerUseWindows',
+    def: false,
+    label: '切换与调整窗口',
+    desc: '允许 AI 把窗口切到前台、移动或缩放。会打断你当前的操作焦点。',
+  },
+  {
+    id: 'computerUseUnattended',
+    def: false,
+    label: '允许后台无人值守操作',
+    desc:
+      '默认 AI 只能在本窗口处于前台时操作（你没在看就别动）。' +
+      '开启后它可以在你切走后继续操作 —— 风险最高，除非在做长流程自动化，否则别开。',
+  },
 ];
 
 const FILE_NAME = 'shell-features.json';
