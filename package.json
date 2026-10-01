@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop",
   "productName": "DSH Desktop",
-  "version": "10.1.6",
+  "version": "10.1.7",
   "description": "DeepSeek Harness desktop shell — 开箱即用的 Windows 桌面封装",
   "author": "DSH Desktop",
   "contributors": [
@@ -105,7 +105,6 @@
         "to": "dsh-plugins"
       },
       {
-        "comment": "内置 git / python：外壳启动 dsh 时把它们的 bin 注入 PATH，模型侧不必自备环境（scripts/prepare-tools.mjs 生成）",
         "from": "resources/tools",
         "to": "tools"
       },
