@@ -504,32 +504,54 @@ function applyFeatureChange(id: string, enabled: boolean): void {
 }
 
 /**
- * 列出 profile 共享 node_modules 里已落位的插件目录（含 @scope/ 下一层）。
- * 兼容层要逐个读它们的 package.json 判定 peer 声明。
+ * 列出已落位的插件目录（含 @scope/ 下一层），供兼容层逐个读 package.json 判定 peer。
+ *
+ * ⚠️ 必须扫**两处**，实测踩过只扫一处的坑：
+ *   · profiles/node_modules/         —— 共享位（外壳 installPlugins 落内置插件的地方）
+ *   · profiles/<name>/node_modules/  —— profile 私有位（用户用 `dsh plugin add` 装的）
+ *
+ * 2026-09-30 实测：dsh-workbuddy-connect 装在**私有位**，而旧代码只扫共享位 →
+ * 它从未进入兼容层视野、没写豁免 → dsh 原生校验把它拒了（报「可能崩溃或数据丢失」）。
+ * 之前只拿 dshmarket / dsh-univer-office（都在共享位）验证，样本恰好绕过了这个盲区。
+ *
+ * 同名包以**私有位优先**（更接近用户实际意图），按 basename 去重。
  */
-function pluginDirsInProfile(): string[] {
-  const root = path.join(dshHomeDir(), 'profiles', 'node_modules');
-  const dirs: string[] = [];
-  try {
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+function pluginDirsInProfile(profileName = 'web'): string[] {
+  const roots = [
+    path.join(dshHomeDir(), 'profiles', 'node_modules'),
+    path.join(dshHomeDir(), 'profiles', profileName, 'node_modules'),
+  ];
+  const byName = new Map<string, string>();
+
+  for (const root of roots) {
+    let entries: import('node:fs').Dirent[];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue; // 目录不存在（首次启动 / 该 profile 没私有插件）→ 换下一个
+    }
+    for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       const full = path.join(root, entry.name);
       if (entry.name.startsWith('@')) {
+        let subs: import('node:fs').Dirent[];
         try {
-          for (const sub of fs.readdirSync(full, { withFileTypes: true })) {
-            if (sub.isDirectory()) dirs.push(path.join(full, sub.name));
-          }
+          subs = fs.readdirSync(full, { withFileTypes: true });
         } catch {
-          /* 读不到跳过 */
+          continue;
+        }
+        for (const sub of subs) {
+          if (!sub.isDirectory()) continue;
+          // 私有位覆盖共享位：后写的赢（roots 里私有位在后面）
+          byName.set(`${entry.name}/${sub.name}`, path.join(full, sub.name));
         }
       } else {
-        dirs.push(full);
+        byName.set(entry.name, full);
       }
     }
-  } catch {
-    /* 首次启动没有该目录 → 空列表 */
   }
-  return dirs;
+
+  return [...byName.values()];
 }
 
 function registerIpc(): void {
