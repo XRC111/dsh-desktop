@@ -1,0 +1,41 @@
+feat: 发版资产按日期 tag 分组；修 w7 误用官方 Electron
+
+## 1) 发版资产按日期 tag 分组（不再全部堆进一个 packages tag）
+
+以前所有版本的安装包都传进同一个 `packages` tag，实测堆到 35 个资产、
+横跨十几版 —— 找某一版、清理旧版都很难，也容易传重/传漏。
+
+改法：**每次发版用自己的 release**，tag 按「日期-当日序号」命名：
+    2026.10.01-1、2026.10.01-2、2026.10.02-1 …（换天自动重置）
+标题与 tag 同名，一眼能看出是哪一批。
+
+- scripts/release-tag.mjs（新）：算下一个可用 tag。
+  gh CLI 为主路径；没装 gh 时回落 GitHub REST API（需 GH_TOKEN）。
+  两者都失败时序号会从 1 重来、可能撞名 —— 所以失败时打警告不静默。
+  6 组命名逻辑单元测试全过（含换天重置、忽略非日期 tag、只看当天）。
+- 已接线：build-release.yml / nightly.yml / release-017-020.ps1。
+  workflow 里加「算本次的 release tag」步骤（id: tag），外链用 steps.tag.outputs.tag。
+
+本次发版已迁入新 release `2026.10.01-1`（六通道六个包），
+线上 feed 外链已指向它并实测 HTTP 200。旧 `packages` 保留作历史兜底。
+
+## 2) 修 w7 误用官方 Electron（「不是有效的 Win32 应用程序」的根因）
+
+现象：Win7 上安装 w7 包报「不是有效的 Win32 应用程序」。
+
+根因（A/B 实测确证）：Add-ElectronDist 把 electronDist 插到了 **package.json 顶层**，
+而 electron-builder 读的是 **"build" 字段**（日志明写 loaded configuration
+file=package.json ("build" field)）→ 字段被忽略 → 静默回落官方 44.0.0。
+
+实测对照：
+    顶层插入   • downloaded electron zip extracted successfully
+               DSH Desktop.exe = 244440576 B（官方 44.0.0）→ Win7 判无效
+    build 段   • using custom unpacked Electron distribution electronDist=build\electron-win7
+               DSH Desktop.exe = 247941120 B（fork）→ Win7 可用
+
+危害：**静默失败** —— 不报错不警告，只是悄悄用了官方 Electron。
+而且 Add-ElectronDist 打印的是 '+electronDist'，看起来像成功了。
+
+改法：插入点改为 "build": { 之后的第一个属性位置，并**加自检**：
+写完必须确认 electronDist 真的落在 build 段内，否则直接 throw。
+以后再插错位置会立刻报错，不再静默失败。

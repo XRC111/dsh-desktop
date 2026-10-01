@@ -156,19 +156,41 @@ function Set-DshVersion  { param([string]$v) Set-JsonField $PkgPath '("dshVersio
 function Set-Channel     { param([string]$c) Set-JsonField $CfgPath '("channel":\s*")([^"]*)(")'             $c 'update-config channel' }
 
 # package.json 临时写入/移除 electronDist（w7 fork 构建专用）。
-# electron-builder 拿到 electronDist 就用本地 fork 44.2.0 发行目录当 Electron 运行时
-# （7.1.0 首打的同款机制），asar 的 version 取自根 package.json —— 壳自报版本天然正确。
+# electron-builder 拿到 electronDist 就用本地 fork 44.2.0 发行目录当 Electron 运行时；
+# asar 的 version 取自根 package.json —— 壳自报版本天然正确。
 # 用完必须 Remove-ElectronDist，否则会污染后续主线构建（官方 44.0.0 会变成 fork）。
+#
+# ⚠️⚠️ 插入位置必须是 **build 段里**，不能放 package.json 顶层（2026-10-01 踩到）
+#   实测证据：放顶层时 electron-builder 的日志是
+#       • downloaded electron zip extracted successfully     ← 它去下载官方版了
+#       DSH Desktop.exe = 244440576 B（官方 44.0.0）
+#   放 build 段里才是
+#       • using custom unpacked Electron distribution  electronDist=build\electron-win7
+#       DSH Desktop.exe = 247941120 B（fork）
+#   为什么：electron-builder 读的是 package.json 的 **"build" 字段**
+#   （日志首行明写 loaded configuration file=package.json ("build" field)）。
+#   顶层那个虽然也在 scheme.json 的顶层 properties 里，但**不会**被用于本次构建配置。
+#
+#   危害：静默失败 —— 不报错、不警告，只是悄悄用了官方 Electron，
+#   于是 w7 安装包在 Win7 上提示「不是有效的 Win32 应用程序」。
 function Add-ElectronDist {
     param([string]$Dir)
     $raw = [System.IO.File]::ReadAllText($PkgPath)
     if ($raw -match '"electronDist"') { Info 'package.json electronDist 已存在（跳过插入）'; return }
-    $m = [regex]::Match($raw, '(?m)^(\s*"name":\s*"[^"]+",\s*\r?\n)')
-    if (-not $m.Success) { throw 'package.json 找不到 name 字段（electronDist 插入点）' }
-    $ins = $m.Groups[1].Value + '  "electronDist": "' + ($Dir -replace '\\', '/') + '",' + "`r`n"
-    $new = $raw.Substring(0, $m.Index) + $ins + $raw.Substring($m.Index + $m.Length)
+    # 插入点："build": { 之后的第一个属性位置（保留其缩进）
+    $m = [regex]::Match($raw, '(?m)^(\s*)"build":\s*\{\s*\r?\n(\s*)"')
+    if (-not $m.Success) { throw 'package.json 找不到 build 段（electronDist 插入点）' }
+    $indent = $m.Groups[2].Value
+    $ins = $indent + '"electronDist": "' + ($Dir -replace '\\', '/') + '",' + "`r`n"
+    $pos = $m.Groups[2].Index
+    $new = $raw.Substring(0, $pos) + $ins + $raw.Substring($pos)
     [System.IO.File]::WriteAllText($PkgPath, $new, (New-Object System.Text.UTF8Encoding($false)))
-    Ok "package.json +electronDist = $Dir"
+    # 自检：确认真的写进 build 段（顶层不算）
+    $chk = [System.IO.File]::ReadAllText($PkgPath)
+    if (-not [regex]::IsMatch($chk, '(?s)"build"\s*:\s*\{[^}]*"electronDist"')) {
+        throw 'electronDist 未落进 build 段（这会让 w7 误用官方 Electron）'
+    }
+    Ok "package.json build.electronDist = $Dir"
 }
 function Remove-ElectronDist {
     $raw = [System.IO.File]::ReadAllText($PkgPath)

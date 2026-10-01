@@ -133,23 +133,36 @@ jobs:
           Write-Host ("  {0}  {1:N1} MB" -f $f, ((Get-Item $f).Length/1MB))
 
       # ── 发布 ────────────────────────────────────────────────────────────────
+      # 每次发版用**自己的** release（tag = 日期-序号，如 2026.10.01-1）。
+      - name: 算本次的 release tag
+        if: ${{ inputs.publish != false }}
+        id: tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = (node scripts/release-tag.mjs).Trim()
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "本次 release tag = $tag"
+
       - name: 上传安装包到 Release
         if: ${{ inputs.publish != false }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $exists = gh release view packages 2>$null
-          if (-not $exists) {
-            gh release create packages --title '安装包（全版本）' --notes '全部通道的安装包集中分发，feed 外链指向这里。'
-          }
-          gh release upload packages 'dist/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe' --clobber
+          $tag = '${{ steps.tag.outputs.tag }}'
+          $f = 'dist/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe'
+          $notes = "nightly ${{ steps.v.outputs.version }}（上游 dsh ${{ steps.upstream.outputs.upstream }} @ ${{ steps.upstream.outputs.short }}）"
+          gh release create $tag --title $tag --notes $notes
+          gh release upload $tag $f
 
       - name: 生成 nightly feed
         if: ${{ inputs.publish != false }}
         shell: pwsh
         run: |
-          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/packages'
+          # 外链指向**本次自己的** release（tag = 日期-序号）
+          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}'
           powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
             -SkipStable -SkipBeta -SkipDev `
             -SkipW7 -SkipW7Beta -SkipW7Dev `

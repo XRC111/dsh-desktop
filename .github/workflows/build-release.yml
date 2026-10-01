@@ -191,31 +191,43 @@ jobs:
           if ($missing.Count) { throw "有 $($missing.Count) 个安装包没构建出来" }
 
       # ── 7) 打热壳 + 运行时差分 + 生成六份 feed（挂外链）──────────────────────
-      #   外链指向本仓库 Release 的 packages tag —— 但包还没上传，所以这里
+      #   外链指向本仓库**本次的** Release（tag = 日期-序号）—— 但包还没上传，所以这里
       #   只生成 feed 骨架；等下面上传完 Release 后**再跑一次** gen 补哈希。
+      # 每次发版用**自己的** release（tag = 日期-序号，如 2026.10.01-1）。
+      # 以前所有版本都堆进同一个 `packages` tag，实测涨到 35 个资产、横跨十几版，
+      # 想找某一版或清理旧版都很难。
+      - name: 算本次的 release tag
+        id: tag
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = (node scripts/release-tag.mjs).Trim()
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "本次 release tag = $tag"
+
       - name: 上传安装包到 Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # packages tag 是「全版本安装包」的集中存放点，feed 外链指向它。
-          # 已存在则复用，不存在则创建。
-          $exists = gh release view packages 2>$null
-          if (-not $exists) {
-            gh release create packages --title '安装包（全版本）' --notes '全部通道的安装包集中分发，feed 外链指向这里。'
-          }
+          $tag = '${{ steps.tag.outputs.tag }}'
           $vs = @('${{ steps.v.outputs.stable }}','${{ steps.v.outputs.beta }}','${{ steps.v.outputs.dev }}',
                   '${{ steps.v.outputs.w7 }}','${{ steps.v.outputs.w7beta }}','${{ steps.v.outputs.w7dev }}')
+          # 标题与 tag 同名（都是日期-序号），一眼能看出是哪一批
+          $notes = "本次发版（六通道）：" + [Environment]::NewLine + (($vs | ForEach-Object { "- DSH-Desktop-Setup-$_.exe" }) -join [Environment]::NewLine)
+          gh release create $tag --title $tag --notes $notes
           foreach ($v in $vs) {
             $f = "dist/DSH-Desktop-Setup-$v.exe"
             Write-Host "上传 $f ..."
-            gh release upload packages $f --clobber
+            gh release upload $tag $f
           }
 
       - name: 生成六份 feed（含安装包哈希）
         shell: pwsh
         run: |
-          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/packages'
+          # 外链指向**本次自己的** release（tag = 日期-序号）
+          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}'
           powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
             -SkipPack -SkipNightly `
             -StableVersion '${{ steps.v.outputs.stable }}' `

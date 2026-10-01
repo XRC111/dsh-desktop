@@ -71,8 +71,12 @@ $Versions = [ordered]@{
     W7Dev  = '7.3.1'    # w7 dev     （dsh 0.2.0-rc.2）
 }
 
-# ── 安装包外链（GitHub Release tag=packages）────────────────────────────────
-$GhPrefix = 'https://gh-proxy.com/https://github.com/XRC111/dsh-desktop/releases/download/packages'
+# ── 安装包外链（GitHub Release；tag = 日期-序号，每次发版一个）──────────────
+# 以前所有版本共用 `packages` tag，堆到 35 个资产、横跨十几版，找某一版很难。
+# 现在按 scripts/release-tag.mjs 的规则算（如 2026.10.01-1）。
+$ReleaseTag = if ($env:DSH_RELEASE_TAG) { $env:DSH_RELEASE_TAG } else { (node scripts/release-tag.mjs).Trim() }
+Info "本次 release tag = $ReleaseTag"
+$GhPrefix = "https://gh-proxy.com/https://github.com/XRC111/dsh-desktop/releases/download/$ReleaseTag"
 $SetupUrls = [ordered]@{}
 foreach ($k in $Versions.Keys) {
     $SetupUrls[$k] = "$GhPrefix/DSH-Desktop-Setup-$($Versions[$k]).exe"
