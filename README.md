@@ -30,16 +30,16 @@
 
 ### 装（最终用户）
 
-从 [Releases](https://github.com/XRC111/dsh-desktop/releases/tag/packages) 下载对应的安装包：
+安装包**一版一个 release**，tag 用日期+序号（如 [`2026.10.01-1`](https://github.com/XRC111/dsh-desktop/releases/tag/2026.10.01-1)），不再堆在一个 `packages` tag 里。
 
 | 安装包 | 通道 | 内嵌 dsh | 适用 |
 | --- | --- | --- | --- |
-| `DSH-Desktop-Setup-10.1.2.exe` | 主线 stable | 0.1.5-rc.3 | **推荐**，Win10/11 |
-| `DSH-Desktop-Setup-10.2.0.exe` | 主线 beta | 0.1.7-rc.2 | 想尝鲜 next 线 |
-| `DSH-Desktop-Setup-10.3.0.exe` | 主线 dev | 0.1.7-alpha.2 | 跟 alpha 线 |
-| `DSH-Desktop-Setup-7.1.3.exe` | w7 stable | 0.1.5-rc.3 | **Windows 7** |
-| `DSH-Desktop-Setup-7.2.0.exe` | w7 beta | 0.1.7-rc.2 | Win7 + next |
-| `DSH-Desktop-Setup-7.3.0.exe` | w7 dev | 0.1.7-alpha.2 | Win7 + alpha |
+| `DSH-Desktop-Setup-10.1.7.exe` | 主线 stable | 0.1.7-rc.2 | **推荐**，Win10/11 |
+| `DSH-Desktop-Setup-10.2.6.exe` | 主线 beta | 0.2.0-rc.2 | 想尝鲜 0.2.0 线 |
+| `DSH-Desktop-Setup-10.3.5.exe` | 主线 dev | 0.2.0-rc.2 | 跟 dev 线 |
+| `DSH-Desktop-Setup-7.1.8.exe` | w7 stable | 0.1.7-rc.2 | **Windows 7** |
+| `DSH-Desktop-Setup-7.2.5.exe` | w7 beta | 0.2.0-rc.2 | Win7 + 0.2.0 |
+| `DSH-Desktop-Setup-7.3.5.exe` | w7 dev | 0.2.0-rc.2 | Win7 + dev |
 
 > **Win7 必须用 7.x**：主线包内嵌官方 Electron 44，在 Win7 上起不来；7.x 用社区 fork 并打了宿主指纹补丁（见 [8.4](#84-win7-支持)）。
 
@@ -54,7 +54,7 @@ npm install
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 ```
 
-产物：`dist/DSH-Desktop-Setup-<version>.exe`（约 160 MB）。
+产物：`dist/DSH-Desktop-Setup-<version>.exe`（约 244 MB —— 含 314 MB 运行时的 tar、内置 git/python 与 Electron）。
 
 ---
 
@@ -344,8 +344,18 @@ $env:DSH_DESKTOP_UPDATE_DRYRUN = '1'  # 只下载校验，不安装
 
 ### 7.7 当前部署
 
+| 通道 | feed | 线上版本 | 内嵌 dsh |
+| --- | --- | --- | --- |
+| 主线 stable | `latest.json` | 10.1.7 | 0.1.7-rc.2 |
+| 主线 beta | `latest-beta.json` | 10.2.6 | 0.2.0-rc.2 |
+| 主线 dev | `latest-dev.json` | 10.3.5 | 0.2.0-rc.2 |
+| w7 stable | `latest-w7.json` | 7.1.8 | 0.1.7-rc.2 |
+| w7 beta | `latest-w7-beta.json` | 7.2.5 | 0.2.0-rc.2 |
+| w7 dev | `latest-w7-dev.json` | 7.3.5 | 0.2.0-rc.2 |
+| nightly | `latest-nightly.json` | 由 CI 每日从 harness `master` 源码编译 | — |
+
 - **feed 托管**：Cloudflare Pages 项目 `dsh-desktop-feed`，域名 **`https://dl.666-xrc.cc.cd`**
-- **安装包分发**：GitHub Release tag **`packages`**（集中放全部版本），feed 挂 `gh-proxy.com` 前缀加速
+- **安装包分发**：GitHub Release，**tag = 日期+序号**（`scripts/release-tag.mjs` 算出，如 `2026.10.01-1`），feed 挂 `gh-proxy.com` 前缀加速
 - **客户端镜像融合**：4 个镜像竞速探测（Range 0-0，8 s 超时，206 且总长吻合）+ 原链兜底；镜像下载失败回 origin 重试
 
 ---
@@ -428,18 +438,36 @@ dsh 0.1.7 起有宿主指纹白名单（见 [5.2](#52-dsh-017-起的宿主指纹
 
 实测：打补丁后 fork 44.2.0 上 **0.1.5-rc.3 与 0.1.7 均完整启动**。
 
+**Win7 没有 `%SystemRoot%\System32\tar.exe`**（微软从 Win10 1803 才随系统内置 bsdtar）。历史上安装器、热更新、运行时补丁三处都直接 spawn 它，Win7 上统一表现为 **「无法调用系统 tar」**（实测 7.1.8）。现在三条链路都不再依赖系统 tar：
+
+| 位置 | 用途 | 现在的做法 |
+| --- | --- | --- |
+| `resources/extract-runtime.cjs` | 安装期 / 首启 / 自动修复展开运行时 | 有系统 tar 走多进程并行；没有则退回内置**纯 JS 单线程**解压 |
+| `src/main/tar-pure.ts` | 热壳（`.tar`）与运行时补丁（`.tar.gz`） | **纯 JS 优先**，系统 tar 仅作兜底 |
+| `src/main/runtime-installer.ts` | 解压器失败后的兜底 | 先探测系统 tar 是否存在，不存在就直报真实失败原因 |
+
+纯 JS 解压实测：26617 个文件 / 474 MB 用时 **12.5 s**（NVMe，单线程）；热壳（33 文件）、运行时差分（441 文件）、插件包三份真实产物与系统 tar 的结果**逐文件 SHA256 完全一致**。
+
 ### 8.5 桌面适配开关
 
-六个开关，**默认全开**，可在 设置 → 桌面 单独关闭：
+十一个开关，可在 设置 → 桌面 单独开关。前六个是**桌面适配**，后五个是 **computer use（让 AI 操作本机）** 的能力闸门：
 
-| 开关 id | 功能 |
-| --- | --- |
-| `externalLinks` | 外链走系统浏览器（不在应用内新开窗口） |
-| `dragDropAttach` | 拖放文件进对话即添加附件 |
-| `trayStatus` | 托盘显示任务运行状态 |
-| `taskNotify` | 任务完成时通知（窗口不在前台才弹） |
-| `framelessFit` | 无边框适配：系统圆角 + 右上角三键安全边距 |
-| `showTitleBar` | 显示外壳顶条（关掉即沉浸模式） |
+| 开关 id | 默认 | 功能 |
+| --- | --- | --- |
+| `externalLinks` | ✅ | 外链走系统浏览器（不在应用内新开窗口） |
+| `dragDropAttach` | ❌ | 拖放文件进对话即添加附件（**外壳垫片**：与官方内置拖放冲突，默认关） |
+| `trayStatus` | ✅ | 托盘显示任务运行状态 |
+| `taskNotify` | ✅ | 任务完成时通知（窗口不在前台才弹） |
+| `framelessFit` | ✅ | 无边框适配：系统圆角 + 右上角三键安全边距 |
+| `showTitleBar` | ✅ | 显示外壳顶条（关掉即沉浸模式） |
+| `computerUseScreenshot` | ✅ | 看屏幕（截图）。只读，关掉 AI 就无法感知界面 |
+| `computerUseMouse` | ❌ | 操作鼠标（移动/点击/滚轮） |
+| `computerUseKeyboard` | ❌ | 操作键盘（按键/输入文本） |
+| `computerUseWindows` | ❌ | 切换与调整窗口（置前/移动/缩放） |
+| `computerUseUnattended` | ❌ | 允许后台无人值守操作（默认只在本窗口前台时能动） |
+
+> computer use 只有「截图」默认开：其余四项都会**真实改变系统状态**，按能力粒度逐项放开，而不是一个总开关。
+> 对应插件 `@dsh-desktop/computer-use`（`resources/dsh-plugins/computer-use`），实现见 [8.7](#87-computer-use-插件)。
 
 - 真源：`src/main/shell-features.ts` 的 `SHELL_FEATURES` 数组；加开关只需加一条，老用户配置缺该键自动取默认
 - 落盘：`%APPDATA%\DSH-Desktop\shell-features.json`
@@ -453,6 +481,29 @@ dsh 0.1.7 起有宿主指纹白名单（见 [5.2](#52-dsh-017-起的宿主指纹
 这个风险由热更新引入：热壳会带补丁（[8.3](#83-热壳必须自带补丁)），而插件走**另一条链路**下载，两者不同步就砖。
 
 `src/main/patch-guard.ts` 在启动前把解析不到的 insert 行剔除，写一份 `desktop-patch.effective.yml` 再交给 dsh —— **宁可少一个插件，也不能起不来**。
+
+---
+
+### 8.7 computer use 插件
+
+`resources/dsh-plugins/computer-use`（`@dsh-desktop/computer-use@1.0.0`）把 Windows 的截屏与合成输入暴露成 dsh 工具，让 AI 能直接看屏幕、点鼠标、敲键盘。
+
+**零依赖**：不装 `sharp`/`robotjs`（都是原生模块，编译一次就要几分钟且要 VS 工具链），直接用 koffi 调 `user32`/`gdi32`/`kernel32`，PNG 也是自己用 `zlib` 拼的（`lib/png.js`）。
+
+| 工具 | 做什么 | 需要开的开关 |
+| --- | --- | --- |
+| `screen_windows` | 列出可见窗口（标题/类名/进程/位置/是否最小化） | `computerUseScreenshot` |
+| `screen_shot` | 截整个屏幕或指定窗口，**直接把图给模型看** | `computerUseScreenshot` |
+| `screen_activate` | 把窗口切到前台 | `computerUseWindows` |
+| `screen_resize` | 移动/缩放窗口 | `computerUseWindows` |
+| `mouse_move` / `mouse_click` / `mouse_scroll` | 移动指针、点击、滚轮 | `computerUseMouse` |
+| `key_press` / `key_type` | 按键（含组合键）、输入文本 | `computerUseKeyboard` |
+
+**安全默认**：默认只开「看屏幕」（只读），其它四项默认关；`computerUseUnattended` 关着时，**只有本窗口在前台**才允许操作，你切走它就停下。
+
+历史开关 `allowInput` 仍然兼容：`true` = 上面所有能力一次全开（老配置不用改）。
+
+> 插件在 dsh 子进程里跑（`ELECTRON_RUN_AS_NODE=1`），那里 `require('electron')` 拿到的是**路径字符串**而不是 Electron API，所以截图不能走 `nativeImage` —— 这也是 `lib/png.js` 存在的原因。
 
 ---
 
@@ -476,6 +527,8 @@ powershell -ExecutionPolicy Bypass -File scripts\release-v2.ps1
 | `-SkipStable` / `-SkipBeta` / `-SkipDev` | 跳过对应主线构建 |
 | `-SkipGen` | 跳过 feed 生成 |
 | `-SkipWrangler` | 只本地暂存，不上传 |
+| `-SkipNightly` | 跳过 nightly（要从 harness `master` 源码编译，很慢） |
+| `-UpgradeDiffSources` | 运行时**升级**差分源（默认 `build\rt-015` → 0.1.5-rc.3），老用户靠它热更 |
 | `-StableVersion` 等 | 指定各通道版本号 |
 | `-SetupUrlStable` 等 | 安装包外链（挂进 feed 的 `files` 块） |
 | `-Plugins` | 插件白名单（默认 `dshmarket, shell, updater`） |
@@ -484,27 +537,34 @@ powershell -ExecutionPolicy Bypass -File scripts\release-v2.ps1
 
 大版本改动建议分两段，中间核对 feed：
 
+推荐用薄封装 `scripts\release-017-020.ps1`（版本号、外链、release tag 一次性写死，免得手敲六个外链出错）：
+
 ```powershell
-# ① 构建 + 生成 feed + 暂存（不部署）
-powershell -ExecutionPolicy Bypass -File scripts\release-v2.ps1 `
-  -SkipBeta -SkipDev -SkipW7Beta -SkipW7Dev -SkipWrangler `
-  -StableVersion 10.1.2 -W7Version 7.1.3 `
-  -SetupUrlStable "https://gh-proxy.com/https://github.com/XRC111/dsh-desktop/releases/download/packages/DSH-Desktop-Setup-10.1.2.exe" `
-  -SetupUrlW7     "https://gh-proxy.com/https://github.com/XRC111/dsh-desktop/releases/download/packages/DSH-Desktop-Setup-7.1.3.exe"
+# ① 构建六个包 + 打热壳/差分 + 生成 feed + 暂存（不部署）
+.\scripts\release-017-020.ps1 -Stage build
 
-# ② 把新安装包传到 GitHub Release（tag=packages）
+# ② 把 6 个安装包传到**本次的日期 release**（tag 由 scripts\release-tag.mjs 算出，如 2026.10.01-1）
 
-# ③ 部署
-powershell -ExecutionPolicy Bypass -File scripts\release-v2.ps1 `
-  -SkipPack -SkipGen -StableVersion 10.1.2 -W7Version 7.1.3
+# ③ 包传完后重新生成 feed（这次能算到本地包的 sha256/size）+ 部署
+.\scripts\release-017-020.ps1 -Stage deploy
 ```
+
+release tag 规则（`scripts/release-tag.mjs`）：`yyyy.MM.dd` + 当日序号，同日第二版就是 `2026.10.01-2`；非日期 tag 一律忽略。
+只想跑部分通道：`-Only stable,w7`（**注意 `powershell -File` 不会按逗号拆参数**，脚本内部自己拆）。
 
 ### 9.3 发版后必须核验
 
 ```powershell
-# 拉线上 feed 比对（别只看脚本输出）
-curl.exe -s "https://dl.666-xrc.cc.cd/latest.json?cb=$(Get-Date -Format yyyyMMddHHmmss)"
+# 一条命令核验七份 feed 里**每一个 URL**（版本号 + 安装包 + 热壳 + 运行时差分切片 + 插件）
+node scripts\verify-feeds.mjs
+
+# 只看某几条通道
+node scripts\verify-feeds.mjs --only latest,latest-w7
 ```
+
+**别只看脚本输出**：版本号对不代表链接能下。真实翻车形态是「版本号对了，但某条链接 404」
+（安装包忘了传、差分切片缺了 part03、热壳没打包）—— 这种错只有点到「更新」的用户才会遇到。
+`verify-feeds.mjs` 把所有链接用 Range 各探 1 字节，任何一条不是 200/206 就退出码 1。
 
 要确认：**版本号、hot 变体（含前向壳）、runtime 差分、plugins 数组**都对得上。
 
@@ -540,6 +600,7 @@ curl.exe -s "https://dl.666-xrc.cc.cd/latest.json?cb=$(Get-Date -Format yyyyMMdd
 | 启动卡在「timed out waiting for the writer lock」 | 上次被强杀留了 `profiles/*.lock`。外壳会自动清理；手动可删 `dsh-home/profiles/*.lock` |
 | 设置页少了某一节 | 插件没落位。检查 `dsh-home/profiles/node_modules/<包名>` 是否存在 |
 | 外壳版本升了但功能没变 | 热壳换了但补丁没跟上。检查热壳目录里有没有 `desktop-patch.yml` |
+| 装到一半报「无法调用系统 tar」 | **Win7 上不该再出现**（7.1.9 起解压器自带纯 JS 兜底）。若仍出现，说明包里的 `resources\extract-runtime.cjs` 是旧版 —— 见 [8.4](#84-win7-支持) |
 | 更新一直提示但版本不变 | feed 里缺**前向热壳**（`base` 高于当前安装版，`pickHot` 挑不到） |
 | 命令执行弹控制台窗口 | 见 `win-console.ts`：外壳启动前分配隐藏控制台，沙箱子进程继承它 |
 
@@ -562,6 +623,7 @@ node_modules\electron\dist\electron.exe --expose-internals `
 - **未做代码签名**，SmartScreen 首次运行可能提示
 - Harness 处于 developer preview：升级 dsh 版本需改根 `package.json` 的 `config.dshVersion` 后重跑 `npm run prepare:runtime -- --force`
 - Win7 线依赖社区 fork 的 Electron，指纹补丁需在 fork 更新后重新验证
+- Win7 没有系统 `tar.exe`，解压走内置**纯 JS 单线程**（实测 26617 文件 / 474 MB 约 12.5 s，比 Win10 的多进程并行慢，但可用）；见 [8.4](#84-win7-支持)
 - 安装包分发依赖 GitHub Release（Pages 单文件上限 25 MiB 放不下）
 
 ---

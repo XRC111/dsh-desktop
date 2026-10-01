@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop",
   "productName": "DSH Desktop",
-  "version": "10.1.7",
+  "version": "10.1.8",
   "description": "DeepSeek Harness desktop shell — 开箱即用的 Windows 桌面封装",
   "author": "DSH Desktop",
   "contributors": [
