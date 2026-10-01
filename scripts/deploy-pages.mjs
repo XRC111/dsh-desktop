@@ -4,6 +4,10 @@
 // Pages 单文件上限 25 MiB —— 145MB 的安装包放不下，所以默认只部署热更新包；
 // 若 JSON 里带 files（安装包），且本地文件超限，会明确报错而不是静默漏掉。
 //
+// ⚠️ Pages 部署是**整目录替换**：这一次没带上的文件，就等于从站点上删掉。
+//    所以部署前会自动把「线上已有、本地没有」的 feed 与二进制补齐（见 pullFromRemote），
+//    这样 CI 只构建 nightly 时也不会把六条主线 feed 抹掉。要关掉加 --no-sync。
+//
 // 用法：
 //   node scripts/deploy-pages.mjs --project dsh-desktop-feed \
 //        [--base-url https://dsh-desktop-feed.pages.dev]   # 默认按项目名推导
@@ -38,6 +42,19 @@ const dryRun = flag('dry-run');
 // 由外部脚本自己跑 wrangler pages deploy <stageDir>。暂存目录会保留，并把路径
 // 写进 dist/update/.stage-dir 供外部脚本读取（比扫 %TEMP% 可靠）。
 const stageOnly = flag('stage-only');
+// 默认开启：本地缺失的文件从线上补齐。关掉用 --no-sync（只在明确知道站点该被清空时用）。
+const syncRemote = !flag('no-sync');
+
+// 通道名即文件名。这七份是站点上的**全集**，部署时少带一份就会把那份抹掉。
+const KNOWN_FEEDS = [
+  'latest.json',
+  'latest-beta.json',
+  'latest-dev.json',
+  'latest-nightly.json',
+  'latest-w7.json',
+  'latest-w7-beta.json',
+  'latest-w7-dev.json',
+];
 // 分通道：`--feed` 可重复，一次部署把所有通道的 JSON 都传上去
 // （Pages 部署是整目录替换，分多次部署会让先传的通道被后一次覆盖）。
 function argAll(name) {
@@ -59,6 +76,33 @@ const wrangler = arg(
   'C:\\Users\\Administrator\\WorkBuddy\\openlist\\openlist-worker\\node_modules\\wrangler\\bin\\wrangler.js',
 );
 const wranglerCwd = path.dirname(path.dirname(path.dirname(wrangler)));
+
+/** 把线上某个文件拉到 dist/update/（本地已有或线上也没有则返回 false）。 */
+async function pullFromRemote(name) {
+  if (!syncRemote) return false;
+  const dir = path.join(root, 'dist', 'update');
+  const dst = path.join(dir, name);
+  if (fs.existsSync(dst)) return true;
+  try {
+    const res = await fetch(`${baseUrl}/${name}`, { redirect: 'follow' });
+    if (!res.ok) return false;
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(dst, Buffer.from(await res.arrayBuffer()));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// 把「本地已有的」与「线上能拉到的」其余 feed 一并纳入本次部署。
+// 少了这一步，任何一次局部部署都会把没带上的通道从站点上抹掉。
+for (const name of KNOWN_FEEDS) {
+  const f = path.join(root, 'dist', 'update', name);
+  if (feedFiles.includes(f)) continue;
+  if (!fs.existsSync(f) && !(await pullFromRemote(name))) continue;
+  feedFiles.push(f);
+  console.log(`[deploy-pages] 补上 ${name}（整目录替换：不带上它就会把它抹掉）`);
+}
 
 for (const f of feedFiles) if (!fs.existsSync(f)) die(`找不到更新 JSON：${f}`);
 if (!fs.existsSync(wrangler)) die(`找不到 wrangler：${wrangler}`);
@@ -148,7 +192,15 @@ for (const f of feeds) {
 }
 
 for (const [name, url] of urlNames) {
-  const local = resolveLocal(name);
+  let local = resolveLocal(name);
+  if (!local && syncRemote && url.startsWith(baseUrl)) {
+    // 本地没有（别的通道的产物、CI 上没构建的通道）→ 从线上下载到 dist/update/，
+    // 下一次 resolveLocal 就能找到，避免重复下载。
+    if (await pullFromRemote(name)) {
+      local = path.join(root, 'dist', 'update', name);
+      console.log(`[deploy-pages] 从线上补齐 ${name}（本地没有）`);
+    }
+  }
   if (!local) {
     // 已切片的整包**本地本来就可能不存在**：超过托管单文件上限的补丁只发分片，
     // 整包在切片后被清理掉（或从未保留）。这种情况直接跳过，不是错误。

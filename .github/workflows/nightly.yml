@@ -163,10 +163,14 @@ jobs:
         run: |
           # 外链指向**本次自己的** release（tag = 日期-序号）
           $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}'
+          # -SkipWrangler：本步只生成 + 暂存（CI 上没有本机的 wrangler 目录，
+          #   不加这个开关自检阶段就会 throw「找不到 wrangler」）。真正上传在下一步。
+          # 其余六个 -SkipXxx：**同时跳过那六份 feed 的生成** —— 否则会用默认版本号
+          #   （10.1.0/7.1.0 之类）把它们覆盖成空骨架，再被整目录替换推到线上。
           powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
             -SkipStable -SkipBeta -SkipDev `
             -SkipW7 -SkipW7Beta -SkipW7Dev `
-            -SkipPack `
+            -SkipPack -SkipWrangler `
             -NightlyVersion '${{ steps.v.outputs.version }}' `
             -SetupUrlNightly "$base/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe"
 

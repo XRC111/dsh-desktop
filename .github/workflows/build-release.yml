@@ -228,8 +228,10 @@ jobs:
         run: |
           # 外链指向**本次自己的** release（tag = 日期-序号）
           $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}'
+          # -SkipWrangler：本步只生成 + 暂存，上传交给下一步（CI 上没有本机的 wrangler 目录）。
+          # 缺的 latest-nightly.json 由 deploy-pages 从线上补齐，不会被整目录替换抹掉。
           powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
-            -SkipPack -SkipNightly `
+            -SkipPack -SkipNightly -SkipWrangler `
             -StableVersion '${{ steps.v.outputs.stable }}' `
             -BetaVersion   '${{ steps.v.outputs.beta }}' `
             -DevVersion    '${{ steps.v.outputs.dev }}' `

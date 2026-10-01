@@ -703,7 +703,9 @@ if ($SkipGen) {
     } else {
         Warn "没有指向 $MainDshVersion 的运行时差分 meta（stable feed 将不含运行时热更）"
     }
-    Invoke-Feed $StableVersion 'stable'  "$StableVersion 稳定版（dsh latest $MainDshVersion，含 beta/dev 回滚链）—— 通道方案 v2 首版" $stableExtra $SetupUrlStable
+    if ($SkipStable) { Info '跳过 stable feed（-SkipStable）' } else {
+        Invoke-Feed $StableVersion 'stable'  "$StableVersion 稳定版（dsh latest $MainDshVersion，含 beta/dev 回滚链）—— 通道方案 v2 首版" $stableExtra $SetupUrlStable
+    }
     # beta/dev 也要挂**前向热壳**：以前这两条只传 @()（无热壳），导致 beta/dev 用户
     # 只能下 230/255MB 安装包升级 —— 热更新在这两条通道形同虚设。
     # 热壳与 stable 的是同一份 out/ 产物，只是版本号不同（壳代码与通道无关）。
@@ -726,9 +728,15 @@ if ($SkipGen) {
     foreach ($h in $nightlyHot) { $nightlyExtra += @('--hot', $h.FullName) }
     if (-not $nightlyHot.Count) { Warn "缺 nightly 热壳包 build\hot-shell-$NightlyVersion-*.tar（nightly 用户只能走安装包）" }
 
-    Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" $betaExtra $SetupUrlBeta
-    Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" $devExtra $SetupUrlDev
-    Invoke-Feed $NightlyVersion 'nightly' "$NightlyVersion 每日构建（dsh master 源码编译）" $nightlyExtra $SetupUrlNightly
+    if ($SkipBeta) { Info '跳过 beta feed（-SkipBeta）' } else {
+        Invoke-Feed $BetaVersion   'beta'    "$BetaVersion 测试版（dsh next $NextTreeDshVersion）" $betaExtra $SetupUrlBeta
+    }
+    if ($SkipDev) { Info '跳过 dev feed（-SkipDev）' } else {
+        Invoke-Feed $DevVersion    'dev'     "$DevVersion 开发版（dsh alpha $DevDshVersion）" $devExtra $SetupUrlDev
+    }
+    if ($SkipNightly) { Info '跳过 nightly feed（-SkipNightly）' } else {
+        Invoke-Feed $NightlyVersion 'nightly' "$NightlyVersion 每日构建（dsh master 源码编译）" $nightlyExtra $SetupUrlNightly
+    }
     # w7 stable feed 与主线同构地挂降级资源：7.2.0(0.1.7-rc.2)/7.3.0(0.1.7-alpha.2) 切回
     # stable 后轮询 latest-w7.json（壳版本 7.2.0 > feed 版本 7.1.2，不触发 shellOutdated），
     # 全靠 runtime 差分精确命中才置 available → 热壳(7.1.2) + 运行时(0.1.5-rc.3) 一起落位，
@@ -747,7 +755,9 @@ if ($SkipGen) {
         if ($meta.Count) { $w7Extra += @('--runtime', $meta[0].FullName) }
         else { Warn "缺降级差分 meta：$tag -> $MainDshVersion（w7 stable feed 将不含该回滚链）" }
     }
-    Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh latest $MainDshVersion）" $w7Extra $SetupUrlW7
+    if ($SkipW7) { Info '跳过 w7 feed（-SkipW7）' } else {
+        Invoke-Feed $W7Version     'w7'      "$W7Version 稳定版（w7 专用，dsh latest $MainDshVersion）" $w7Extra $SetupUrlW7
+    }
     # w7 beta/dev 同样挂前向热壳
     $w7BetaHot = @(Get-ChildItem "build\hot-shell-$W7BetaVersion-*.tar" -ErrorAction SilentlyContinue)
     $w7BetaExtra = @()
@@ -759,8 +769,12 @@ if ($SkipGen) {
     foreach ($h in $w7DevHot) { $w7DevExtra += @('--hot', $h.FullName) }
     if (-not $w7DevHot.Count) { Warn "缺 w7 dev 热壳包 build\hot-shell-$W7DevVersion-*.tar" }
 
-    Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" $w7BetaExtra $SetupUrlW7Beta
-    Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" $w7DevExtra $SetupUrlW7Dev
+    if ($SkipW7Beta) { Info '跳过 w7-beta feed（-SkipW7Beta）' } else {
+        Invoke-Feed $W7BetaVersion 'w7-beta' "$W7BetaVersion 测试版（w7，dsh next $NextTreeDshVersion）" $w7BetaExtra $SetupUrlW7Beta
+    }
+    if ($SkipW7Dev) { Info '跳过 w7-dev feed（-SkipW7Dev）' } else {
+        Invoke-Feed $W7DevVersion  'w7-dev'  "$W7DevVersion 开发版（w7，dsh alpha $DevDshVersion）" $w7DevExtra $SetupUrlW7Dev
+    }
     foreach ($v in @($StableVersion, $BetaVersion, $DevVersion, $W7Version, $W7BetaVersion, $W7DevVersion)) {
         if (Test-Path -LiteralPath "dist\DSH-Desktop-Setup-$v.exe") {
             $u = switch ($v) {
@@ -784,16 +798,19 @@ Step '6/7 暂存 + 部署到 Cloudflare Pages（六份 feed 一次传齐）'
 # ---------------------------------------------------------------------------
 # feed 列表必须与本次实际生成的对齐：跳过 nightly 时并不产出 latest-nightly.json，
 # 若仍列进来 step 6 会 throw 缺文件（本地全通道发版实测踩到）。所以按 SkipNightly 过滤。
+# 七份全列：本地缺的那份由 deploy-pages 从**线上**补齐。
+# Pages 部署是整目录替换 —— 少传一份就等于把它从站点上抹掉，所以宁可补齐也不能漏。
+# （以前这里对缺文件直接 throw，结果是「只发 nightly 的 CI」根本走不到部署那一步。）
 $allFeeds = @('latest.json', 'latest-beta.json', 'latest-dev.json',
-              'latest-w7.json', 'latest-w7-beta.json', 'latest-w7-dev.json')
-if (-not $SkipNightly) { $allFeeds += 'latest-nightly.json' }
+              'latest-w7.json', 'latest-w7-beta.json', 'latest-w7-dev.json',
+              'latest-nightly.json')
 $dpArgs = New-Object System.Collections.ArrayList
 [void]$dpArgs.Add('scripts\deploy-pages.mjs')
 [void]$dpArgs.Add('--project');  [void]$dpArgs.Add('dsh-desktop-feed')
 [void]$dpArgs.Add('--base-url'); [void]$dpArgs.Add($BaseUrl)
 foreach ($f in $allFeeds) {
     $p = "dist\update\$f"
-    if (-not (Test-Path -LiteralPath $p)) { throw "缺少 feed：$p" }
+    if (-not (Test-Path -LiteralPath $p)) { Warn "本地没有 $p（交给 deploy-pages 从线上补齐）"; continue }
     [void]$dpArgs.Add('--feed'); [void]$dpArgs.Add($p)
 }
 [void]$dpArgs.Add('--stage-only')
