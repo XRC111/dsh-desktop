@@ -28,32 +28,60 @@ export function datePart(d = new Date()) {
 }
 
 /**
+ * 用 GitHub REST API 列 release tag。
+ *
+ * 公开仓库**不需要 token**（匿名 60 次/小时/IP，发版足够）。有 token 就用，顺带抬高限额。
+ * 用 Node 自带的 fetch 而不是 curl：本机 curl 有 schannel 吊销检查的坑
+ * （CRYPT_E_NO_REVOCATION_CHECK，整个 HTTPS 直接 HTTP=000），fetch 走 Node 自己的 TLS 栈没这问题。
+ */
+async function listTagsViaApi() {
+  const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
+  const headers = { Accept: 'application/vnd.github+json', 'User-Agent': 'dsh-desktop-release-tag' };
+  if (token) headers.Authorization = 'Bearer ' + token;
+  const res = await fetch('https://api.github.com/repos/' + REPO + '/releases?per_page=100', { headers });
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const json = await res.json();
+  if (!Array.isArray(json)) throw new Error('返回不是数组');
+  return json.map((x) => x.tag_name).filter(Boolean);
+}
+
+/**
  * 列出仓库里已有的 release tag。
  *
- * 两条路（都失败才返回空数组）：
- *   1) `gh release list`（CI 里有 GH_TOKEN，主路径）
- *   2) GitHub REST API（本地没装 gh CLI 时用，需 GH_TOKEN / GITHUB_TOKEN）
+ * 三条路，任一成功就返回：
+ *   1) `gh release list`（装了 gh CLI 最快；CI 里本来就有 GH_TOKEN）
+ *   2) GitHub REST API（**公开仓库无需 token**，Node fetch）
+ *   3) curl + token（前两条都不通时的老路）
  *
- * ⚠️ 返回空数组会让序号从 1 重来 → 可能与已有 tag 撞名。所以失败时打警告，
- *    让人至少知道「这次没查到已有 tag」。
+ * ⚠️ 只有**三条全失败**才返回空数组 —— 那会让序号从 1 重来、可能与已有 tag 撞名，
+ *    所以一定打警告，让人至少知道「这次没查到已有 tag」。
  */
-export function listTags() {
+export async function listTags() {
+  // 1) gh CLI（不带 shell，避免 Node 22 的 DEP0190 警告）
   const gh = spawnSync('gh', ['release', 'list', '--repo', REPO, '--limit', '200', '--json', 'tagName'], {
     encoding: 'utf8',
-    shell: process.platform === 'win32',
   });
   if (gh.status === 0) {
     try {
-      return JSON.parse(gh.stdout).map((x) => x.tagName);
+      const tags = JSON.parse(gh.stdout).map((x) => x.tagName);
+      if (Array.isArray(tags)) return tags;
     } catch {
       /* 落到 API */
     }
   }
 
+  // 2) REST API（无需 token）
+  try {
+    return await listTagsViaApi();
+  } catch (err) {
+    console.error('[release-tag] REST API 查询失败：' + String(err && err.message ? err.message : err));
+  }
+
+  // 3) curl + token（老路）
   const token = process.env.GH_TOKEN || process.env.GITHUB_TOKEN;
   if (!token) {
-    console.error('[release-tag] 警告：既无 gh CLI 也无 GH_TOKEN，无法列出已有 release');
-    console.error('[release-tag]       序号将从 1 重算，可能与已有 tag 撞名');
+    console.error('[release-tag] 警告：gh CLI 与 REST API 都不可用，且没有 GH_TOKEN —— 无法列出已有 release');
+    console.error('[release-tag]       序号将从 1 重算，可能与已有 tag 撞名（可设 DSH_RELEASE_TAG 直接指定）');
     return [];
   }
   const api = spawnSync(
@@ -73,7 +101,6 @@ export function listTags() {
     return [];
   }
 }
-
 /**
  * 算「下一个可用 tag」。
  *
@@ -94,13 +121,13 @@ export function nextTag(existing, today = new Date()) {
 // ── CLI ────────────────────────────────────────────────────────────────────
 const isMain = process.argv[1] && process.argv[1].endsWith('release-tag.mjs');
 if (isMain) {
-  const tags = listTags();
+  const tags = await listTags();
   if (process.argv.includes('--list')) {
     for (const t of tags) {
       if (/^\d{4}\.\d{2}\.\d{2}-\d+$/.test(t)) console.log(t);
     }
-    process.exit(0);
+  } else {
+    // 只输出 tag 本身，方便 shell 里 `$tag = node scripts/release-tag.mjs`
+    console.log(nextTag(tags));
   }
-  // 只输出 tag 本身，方便 shell 里 `$tag = node scripts/release-tag.mjs`
-  console.log(nextTag(tags));
 }

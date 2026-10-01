@@ -17,7 +17,7 @@
 
     三段式（推荐按顺序跑）：
       ① .\scripts\release-017-020.ps1 -Stage build    # 构建 6 个包 + 打热壳/差分 + 生成 feed
-      ② 手动把 6 个安装包传到 GitHub Release tag=packages
+      ② 手动把 6 个安装包传到 GitHub Release（tag = 日期-序号，脚本会打印）
       ③ .\scripts\release-017-020.ps1 -Stage deploy   # 重新生成 feed（挂上外链哈希）+ 部署
 
     也可以一次跑完（-Stage all），但那样 feed 里的安装包哈希会是空的
@@ -52,23 +52,34 @@ param(
     [switch]$SkipUpload,
 
     # 干跑：只打印将要执行的命令，不真正执行
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    # 跳过「安装包是否已上传到 release」的检查（默认**不跳**）。
+    # 拦的是最常见的翻车：包还没传就发 feed → 客户端更新链接全是 404，上线后才发现。
+    [switch]$SkipAssetCheck
 )
 
 $ErrorActionPreference = 'Stop'
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+
+# ── 输出函数（必须定义在**第一次使用之前**：PowerShell 是顺序执行，
+#    定义写在使用之后就报「术语 'Info' 不会被识别为 cmdlet」）────────────
+function Info($m) { Write-Host "  . $m" -ForegroundColor DarkGray }
+function Ok($m)   { Write-Host "  [ok] $m" -ForegroundColor Green }
+function Warn($m) { Write-Host "  [!!] $m" -ForegroundColor Yellow }
+function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # ── 本次发版的版本号（改这里就能发下一版）────────────────────────────────────
 $Versions = [ordered]@{
-    Stable = '10.1.3'   # 主线 stable（dsh 0.1.7-rc.2）
-    Beta   = '10.2.2'   # 主线 beta  （dsh 0.2.0-rc.2）
-    Dev    = '10.3.1'   # 主线 dev   （dsh 0.2.0-rc.2）
-    W7     = '7.1.4'    # w7 stable  （dsh 0.1.7-rc.2）
-    W7Beta = '7.2.1'    # w7 beta    （dsh 0.2.0-rc.2）
-    W7Dev  = '7.3.1'    # w7 dev     （dsh 0.2.0-rc.2）
+    Stable = '10.1.8'   # 主线 stable（dsh 0.1.7-rc.2）
+    Beta   = '10.2.7'   # 主线 beta  （dsh 0.2.0-rc.2）
+    Dev    = '10.3.6'   # 主线 dev   （dsh 0.2.0-rc.2）
+    W7     = '7.1.9'    # w7 stable  （dsh 0.1.7-rc.2）—— 含 Win7 无系统 tar 的修复
+    W7Beta = '7.2.6'    # w7 beta    （dsh 0.2.0-rc.2）
+    W7Dev  = '7.3.6'    # w7 dev     （dsh 0.2.0-rc.2）
 }
 
 # ── 安装包外链（GitHub Release；tag = 日期-序号，每次发版一个）──────────────
@@ -81,11 +92,6 @@ $SetupUrls = [ordered]@{}
 foreach ($k in $Versions.Keys) {
     $SetupUrls[$k] = "$GhPrefix/DSH-Desktop-Setup-$($Versions[$k]).exe"
 }
-
-function Info($m) { Write-Host "  . $m" -ForegroundColor DarkGray }
-function Ok($m)   { Write-Host "  [ok] $m" -ForegroundColor Green }
-function Warn($m) { Write-Host "  [!!] $m" -ForegroundColor Yellow }
-function Step($m) { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 
 # ── 组装 release-v2.ps1 的参数 ────────────────────────────────────────────────
 $skip = @{
@@ -215,6 +221,24 @@ if ($Stage -ne 'build' -and -not $SkipUpload) {
     } else { Warn 'wrangler 未登录 → 部署会失败，先跑 npx wrangler login' }
 }
 
+# 6) 安装包必须真的已经在 release 上 —— 否则 feed 挂的全是 404 链接，
+#    而且要等客户端点「更新」才会发现。gh-proxy 对 HEAD 不友好，用 Range 取 1 字节探测。
+if ($Stage -ne 'build' -and -not $SkipAssetCheck) {
+    $missing = @()
+    foreach ($k in $wanted) {
+        $u = $SetupUrls[$k]
+        $code = (& curl.exe -sS -o NUL -w '%{http_code}' --noproxy '*' --ssl-no-revoke -L -r 0-0 --max-time 30 $u 2>$null)
+        if ("$code" -notmatch '^(200|206)$') { $missing += "$k $($Versions[$k]) → HTTP $code" }
+    }
+    if ($missing.Count) {
+        foreach ($m in $missing) { Warn "安装包还下不到：$m" }
+        throw ("有 $($missing.Count) 个安装包不在 release $ReleaseTag 上。" + [Environment]::NewLine +
+               "  先把 dist\DSH-Desktop-Setup-<版本>.exe 传到这里：" + [Environment]::NewLine +
+               "    https://github.com/XRC111/dsh-desktop/releases/tag/$ReleaseTag" + [Environment]::NewLine +
+               "  再跑 -Stage deploy。（确认要跳过检查就加 -SkipAssetCheck）")
+    }
+    Ok "$($wanted.Count) 个安装包都已在 release $ReleaseTag 上可下载"
+}
 # ── 执行 ──────────────────────────────────────────────────────────────────────
 Step "执行 release-v2.ps1（$Stage）"
 
@@ -242,7 +266,7 @@ Ok "完成（耗时 $([math]::Round($sw.Elapsed.TotalMinutes,1)) 分钟）"
 # ── 收尾提示 ──────────────────────────────────────────────────────────────────
 if ($Stage -eq 'build') {
     Step '下一步'
-    Info '1) 把下面这些安装包传到 GitHub Release（tag=packages）：'
+    Info "1) 把下面这些安装包传到 GitHub Release（tag=$ReleaseTag）："
     foreach ($k in $wanted) {
         $v = $Versions[$k]
         $exe = "dist\DSH-Desktop-Setup-$v.exe"
