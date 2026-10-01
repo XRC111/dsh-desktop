@@ -760,8 +760,11 @@ if ($SkipGen) {
 # ---------------------------------------------------------------------------
 Step '6/7 暂存 + 部署到 Cloudflare Pages（六份 feed 一次传齐）'
 # ---------------------------------------------------------------------------
-$allFeeds = @('latest.json', 'latest-beta.json', 'latest-dev.json', 'latest-nightly.json',
+# feed 列表必须与本次实际生成的对齐：跳过 nightly 时并不产出 latest-nightly.json，
+# 若仍列进来 step 6 会 throw 缺文件（本地全通道发版实测踩到）。所以按 SkipNightly 过滤。
+$allFeeds = @('latest.json', 'latest-beta.json', 'latest-dev.json',
               'latest-w7.json', 'latest-w7-beta.json', 'latest-w7-dev.json')
+if (-not $SkipNightly) { $allFeeds += 'latest-nightly.json' }
 $dpArgs = New-Object System.Collections.ArrayList
 [void]$dpArgs.Add('scripts\deploy-pages.mjs')
 [void]$dpArgs.Add('--project');  [void]$dpArgs.Add('dsh-desktop-feed')
