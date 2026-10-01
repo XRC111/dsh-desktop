@@ -1,4 +1,4 @@
-# 依赖与构建产物
+﻿# 依赖与构建产物
 node_modules/
 out/
 dist/
@@ -37,6 +37,8 @@ build/old-w7-asar/
 build/electron-win7/
 build/pages-deploy/
 build/*.bak
+build/.msg*.txt
+build/e2e-*.txt
 # 插件依赖与打包产物（artifacts 由插件自身构建脚本重建，本地构建前若缺失需先生成）
 resources/dsh-plugins/*/node_modules/
 resources/dsh-plugins/*/artifacts/
