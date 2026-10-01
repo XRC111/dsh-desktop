@@ -20,13 +20,14 @@
   }
 
   const bridge = window.dshDesktop;
-  // 没有桥也照样能工作（真 File 不需要读盘），但开关关掉时不必装监听：
-  // 外壳通过 preload 同步暴露开关状态，拿不到就按「开」处理。
-  if (bridge && typeof bridge.isFeatureEnabled === 'function') {
-    let on = true;
-    try { on = !!bridge.isFeatureEnabled('dragDropAttach'); } catch (e) { on = true; }
-    if (!on) return;
-  }
+  // ⚠️ 拿不到开关时按「关」处理（不是按「开」）。
+  // 本垫片与官方内置拖放（dsh-client-ui-attachment）**冲突**：它用捕获阶段 +
+  // stopPropagation，会掐断事件让官方收不到。所以「不确定」时必须选不装监听，
+  // 否则一旦桥不可用，就会把官方拖放压掉。
+  if (!bridge || typeof bridge.isFeatureEnabled !== 'function') return;
+  let on = false;
+  try { on = !!bridge.isFeatureEnabled('dragDropAttach'); } catch (e) { on = false; }
+  if (!on) return;
 
   // 过了所有前置检查才认领（语义：监听确实装上了）
   window.__dshDesktopDragDrop = true;

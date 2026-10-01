@@ -606,7 +606,7 @@ function registerIpc(): void {
   // 同步查询：注入脚本在启动时用它决定要不要装监听（异步会有竞态）
   ipcMain.on('app:feature-enabled', (event, id: unknown) => {
     event.returnValue =
-      typeof id === 'string' ? (shellFeatures?.isEnabled(id) ?? true) : false;
+      typeof id === 'string' ? (shellFeatures?.isEnabled(id) ?? false) : false;
   });
   // 页面上报任务运行状态（托盘 + 任务完成通知）
   ipcMain.on('app:task-state', (_e, payload: unknown) => {

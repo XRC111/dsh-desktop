@@ -38,11 +38,20 @@ export const SHELL_FEATURES: ShellFeatureDef[] = [
     label: '外链走系统浏览器',
     desc: '页面里的 http/https 链接交给系统默认浏览器打开，不在应用内新开窗口。',
   },
+  // ⚠️ 默认**关**：官方 dsh 已内置拖放（dsh-client-ui-attachment 的 onDragEnter/onDrop，
+  // 0.1.7 与 0.2.0 都有），而本垫片用**捕获阶段 + stopPropagation**，会**掐断**事件，
+  // 让官方的拖放完全收不到 → 冲突。实测：官方监听是冒泡阶段，捕获先于冒泡，必被拦死。
+  //
+  // 历史：本垫片是 0.1.5 时代写的，当时官方没有拖放，属于补缺；现在官方不仅有了，
+  // 还更全（目录递归、dropEffect、拖入高亮、canAcceptDrop 判断）—— 垫片从「补缺」变成「打架」。
+  // 保留代码（万一将来官方回退，可手动打开），但默认关闭。
   {
     id: 'dragDropAttach',
-    def: true,
-    label: '拖放文件添加附件',
-    desc: '把文件从资源管理器拖进窗口即加入当前对话的附件，等效于点「添加附件」。',
+    def: false,
+    label: '拖放文件添加附件（外壳垫片）',
+    desc:
+      '⚠️ 与官方内置拖放冲突，默认关闭。官方本身已支持拖放，无需打开。' +
+      '仅当官方拖放失效时才考虑启用（会覆盖官方行为）。',
   },
   {
     id: 'trayStatus',
