@@ -1,8 +1,8 @@
-import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from './logger';
 import { updatesDir, packagedRuntimeDir, dshRuntimeDir, devRuntimeDir, runtimeRoot } from './paths';
+import { extractTarPure, extractWithSystemTar } from './tar-pure';
 
 /**
  * 运行时差分补丁：让 dsh 本体也能走热更新。
@@ -77,139 +77,31 @@ export function clearPendingPatch(): void {
 
 /**
  * 解压 .tar.gz 到指定目录（通用）。
- * 用系统 bsdtar（`-xzf` 直接吃 gzip）；不可用时回退到 tar npm 包 + zlib 手写解包。
+ *
+ * 主路径是纯 JS 解包 —— 零外部依赖、零外部进程。
+ * Win7 上必须如此：系统根本没有 tar.exe（Win10 1803 才内置），
+ * 直接 spawn 只会得到「无法调用系统 tar」。
  */
 export function extractTarGz(tarFile: string, destDir: string): Promise<void> {
-  fs.mkdirSync(destDir, { recursive: true });
-
-  // 主路径：纯 JS 解包 —— 零外部依赖、零外部进程，不可能出现"卡死不返回"。
-  return extractTarGzPure(tarFile, destDir).catch(async (pureErr) => {
-    // 兜底：系统 tar.exe（限时 60s，防挂起）。仅当纯 JS 失败时才会走到这里。
-    const tarExe =
-      process.platform === 'win32'
-        ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
-        : 'tar';
-    log(`纯 JS 解包失败（${String((pureErr as Error)?.message ?? pureErr).slice(0, 120)}），回退系统 tar…`);
-
-    return new Promise<void>((resolve, reject) => {
-      const child = spawn(tarExe, ['-xzf', tarFile, '-C', destDir], {
-        windowsHide: true,
-        stdio: ['ignore', 'ignore', 'pipe'],
-      });
-      let stderr = '';
-      child.stderr?.on('data', (c: Buffer) => {
-        stderr += c.toString('utf8');
-      });
-      const timer = setTimeout(() => {
-        try {
-          child.kill();
-        } catch {}
-        reject(new Error('系统 tar 解包超时（60s）'));
-      }, 60_000);
-      child.once('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-      child.once('exit', (code) => {
-        clearTimeout(timer);
-        if (code === 0) resolve();
-        else reject(new Error(`tar 退出码 ${code}：${stderr.slice(-300)}`));
-      });
-    });
+  return extractTarPure(tarFile, destDir).catch((pureErr) => {
+    log(
+      `纯 JS 解包失败（${String((pureErr as Error)?.message ?? pureErr).slice(0, 120)}），回退系统 tar…`,
+    );
+    // 兜底：系统 tar.exe（限时 60s，防挂起）。仅当纯 JS 失败时才会走到这里，
+    // 且只有 Win10 1803+ 才可能成功 —— Win7 走不到这里（纯 JS 从不会失败）。
+    return extractWithSystemTar(tarFile, destDir, true, 60_000);
   });
 }
 
-/**
- * 纯 JS 解包 .tar.gz：不 spawn 任何外部进程。
- *
- * 为什么不用系统 tar.exe：它可能被安全软件/环境拦截后**既不退出也不报错**
- * （实测会把下载进度卡死在 99%）。tar 格式本身很简单，512 字节头 + 数据块，
- * 我们只需要支持自家打包器（bsdtar）产出的：普通文件、目录、GNU 长名（L）、PAX 扩展头（x）。
- */
-export function extractTarGzPure(tarFile: string, destDir: string): Promise<void> {
-  return Promise.resolve().then(() => {
-    const zlib = require('zlib') as typeof import('zlib');
-    const tarBuf = zlib.gunzipSync(fs.readFileSync(tarFile));
-    let offset = 0;
-    let pendingName: string | null = null;
-
-    const readStr = (buf: Buffer, off: number, len: number): string => {
-      const raw = buf.subarray(off, off + len);
-      const end = raw.indexOf(0);
-      return (end === -1 ? raw : raw.subarray(0, end)).toString('utf8');
-    };
-
-    while (offset + 512 <= tarBuf.length) {
-      const header = tarBuf.subarray(offset, offset + 512);
-      if (header.every((b) => b === 0)) break; // 结束块
-
-      const nameField = readStr(header, 0, 100);
-      const prefix = readStr(header, 345, 155).trim();
-      const sizeStr = readStr(header, 124, 12).replace(/[^0-7]/g, '');
-      const size = parseInt(sizeStr || '0', 8) || 0;
-      const type = String.fromCharCode(header[156] || 48);
-      offset += 512;
-
-      const data = tarBuf.subarray(offset, offset + size);
-      offset += Math.ceil(size / 512) * 512;
-
-      if (type === 'L') {
-        pendingName = readStr(data, 0, size).replace(/\0[\s\S]*$/, '');
-        continue;
-      }
-      if (type === 'x') {
-        // PAX 扩展头：形如 "52 path=updater/lib/x.js\n"，作用于下一个条目
-        const text = data.toString('utf8');
-        const m = text.match(/(?:^|\n)\d+ path=([^\n]+)/);
-        pendingName = m ? m[1] : pendingName;
-        continue;
-      }
-      if (type === 'g') continue; // 全局扩展头，忽略
-
-      let name = pendingName ?? (prefix ? `${prefix}/${nameField}` : nameField);
-      pendingName = null;
-      name = name.replace(/^\.\//, '');
-      if (!name || name.includes('..') || path.isAbsolute(name)) continue;
-
-      const dest = path.join(destDir, ...name.split('/'));
-      if (type === '5') {
-        fs.mkdirSync(dest, { recursive: true });
-        continue;
-      }
-      if (type === '0' || type === '\0') {
-        fs.mkdirSync(path.dirname(dest), { recursive: true });
-        fs.writeFileSync(dest, data.subarray(0, size));
-      }
-      // 其它类型（链接等）我们的包里没有，忽略
-    }
-  });
-}
+/** @deprecated 旧名字，等价于 extractTarPure；保留仅为兼容既有引用。 */
+export const extractTarGzPure = extractTarPure;
 
 /**
- * 解压 .tar.gz 到指定目录（通用入口）。
- * 先用纯 JS 解包（零外部依赖，不可能卡死）；万一失败再退回系统 tar.exe。
+ * 解压运行时补丁（.tar.gz）到指定目录 —— 与 extractTarGz 同一条路径。
+ * 曾经这里直接 spawn 系统 tar，Win7 上会让运行时补丁整条链路失效。
  */
 export function extractRuntimePatch(tarFile: string, destDir: string): Promise<void> {
-  const tarExe =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
-      : 'tar';
-
-  return new Promise((resolve, reject) => {
-    const child = spawn(tarExe, ['-xzf', tarFile, '-C', destDir], {
-      windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr?.on('data', (c: Buffer) => {
-      stderr += c.toString('utf8');
-    });
-    child.once('error', (err) => reject(err));
-    child.once('exit', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`解压运行时补丁失败（tar 退出码 ${code}）：${stderr.slice(-300)}`));
-    });
-  });
+  return extractTarGz(tarFile, destDir);
 }
 
 export function readManifest(patchDir: string): RuntimePatchManifest {

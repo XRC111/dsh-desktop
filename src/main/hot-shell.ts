@@ -1,9 +1,9 @@
 import { app } from 'electron';
-import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from './logger';
 import { hotRoot } from './paths';
+import { extractTarPure, extractWithSystemTar, hasSystemTar } from './tar-pure';
 
 /**
  * 热更新壳（hot shell）：不跑安装包，下载一份新壳代码 → 重启应用即生效。
@@ -465,27 +465,22 @@ export function hotStagingDir(version: string): string {
   return dir;
 }
 
-/** 用系统自带 bsdtar 解压热更新包（不额外分发解压器） */
+/**
+ * 解压热更新包（.tar）。
+ *
+ * 主路径是纯 JS 解包：热壳只有 out/ 那几百 KB，纯 JS 毫秒级完成，
+ * 而且 Win7 根本没有系统 tar.exe（Win10 1803 才内置），
+ * 老的「用系统自带 bsdtar 解压（不额外分发解压器）」在 Win7 上会让热更新整个失效。
+ */
 export function extractHotPackage(tarFile: string, destDir: string): Promise<void> {
-  const tarExe =
-    process.platform === 'win32'
-      ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
-      : 'tar';
-
-  return new Promise((resolve, reject) => {
-    const child = spawn(tarExe, ['-xf', tarFile, '-C', destDir], {
-      windowsHide: true,
-      stdio: ['ignore', 'ignore', 'pipe'],
-    });
-    let stderr = '';
-    child.stderr?.on('data', (c: Buffer) => {
-      stderr += c.toString('utf8');
-    });
-    child.once('error', (err) => reject(err));
-    child.once('exit', (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`解压热更新包失败（tar 退出码 ${code}）：${stderr.slice(-300)}`));
-    });
+  return extractTarPure(tarFile, destDir).catch(async (pureErr) => {
+    if (!hasSystemTar()) {
+      throw new Error(
+        `解压热更新包失败（内置解压器）：${String((pureErr as Error)?.message ?? pureErr)}`,
+      );
+    }
+    log(`热更新包纯 JS 解包失败（${String((pureErr as Error)?.message ?? pureErr).slice(0, 120)}），回退系统 tar…`);
+    return extractWithSystemTar(tarFile, destDir);
   });
 }
 

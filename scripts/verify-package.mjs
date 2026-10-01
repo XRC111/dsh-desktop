@@ -171,6 +171,34 @@ if (fs.existsSync(tarPath) && fs.existsSync(manifestPath) && fs.existsSync(extra
   }
 }
 
+// ── 3b) 解压器必须带 Win7 纯 JS 兜底 ────────────────────────────────────────
+// Win7 没有 %SystemRoot%\System32\tar.exe（Win10 1803 才内置），解压器若只会
+// spawn 系统 tar，安装到一半就会报「无法调用系统 tar」（实测 7.1.8）。
+if (fs.existsSync(extractorPath)) {
+  const src = fs.readFileSync(extractorPath, 'utf8');
+  if (src.includes('extractTarPure') && src.includes('hasTar')) {
+    ok('解压器含 Win7 纯 JS 兜底');
+  } else {
+    bad(
+      '解压器含 Win7 纯 JS 兜底',
+      'extract-runtime.cjs 里找不到 extractTarPure —— 这是只会 spawn 系统 tar 的旧版，Win7 装不了',
+    );
+  }
+}
+
+// 热壳 / 运行时差分解包也必须纯 JS 优先（同样为了 Win7），实现集中在 out/main/tar-pure.js
+const tarPureBundle = path.join(projectRoot, 'out', 'main', 'tar-pure.js');
+if (fs.existsSync(tarPureBundle)) {
+  const src = fs.readFileSync(tarPureBundle, 'utf8');
+  if (src.includes('extractTarPure') && src.includes('extractWithSystemTar')) {
+    ok('热壳/差分解包含纯 JS 路径');
+  } else {
+    bad('热壳/差分解包含纯 JS 路径', 'out/main/tar-pure.js 内容不完整');
+  }
+} else {
+  bad('热壳/差分解包含纯 JS 路径', tarPureBundle + ' 不存在（未编译？）');
+}
+
 // ── 4) 桌面适配补丁 + 插件 ───────────────────────────────────────────────────
 const patchFile = path.join(resources, 'desktop-patch.yml');
 if (!fs.existsSync(patchFile)) {

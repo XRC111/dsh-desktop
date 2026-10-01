@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { extractRuntimeScript } from './paths';
 import { log } from './logger';
+import { hasSystemTar } from './tar-pure';
 
 /**
  * Harness 运行时的落位、完整性自检与自动修复。
@@ -266,7 +267,13 @@ async function extractParallel(
     await runExtractor(args, onProgress);
     return;
   } catch (err) {
-    log(`多线程解压不可用（${String((err as Error)?.message ?? err)}），回退单线程 tar`);
+    const detail = String((err as Error)?.message ?? err);
+    // Win7 没有 %SystemRoot%\\System32\\tar.exe，兜底 tar 必然也失败。
+    // 与其抛一个误导性的「无法调用系统 tar」，不如把真正的失败原因报出来。
+    if (!hasSystemTar()) {
+      throw new Error(`内置解压器失败：${detail}（本机没有系统 tar 可作兜底，Windows 7 属正常情况）`);
+    }
+    log(`多线程解压不可用（${detail}），回退单线程 tar`);
     onProgress?.('多线程解压不可用，改用单线程方式（会慢一些）…');
   }
 
@@ -300,7 +307,7 @@ function runTar(args: string[]): Promise<void> {
     child.once('error', (err) => {
       reject(
         new Error(
-          `无法调用系统 tar：${err.message}。请确认系统为 Windows 10 1803 或更高版本。`,
+          `无法调用系统 tar：${err.message}。Windows 7 不自带 tar.exe，请改用内置解压器或升级到 Windows 10 1803 以上。`,
         ),
       );
     });

@@ -17,8 +17,9 @@
  *
  *   退出码：0 = 全部文件校验通过；1 = 失败（含校验后仍缺失）。
  *
- * 依赖：Node（安装期由 Electron 内置 Node 以 ELECTRON_RUN_AS_NODE=1 充当）+
- *       Windows 自带 bsdtar（%SystemRoot%\System32\tar.exe，Win10 1803+）。
+ * 依赖：只有 Node（安装期由 Electron 内置 Node 以 ELECTRON_RUN_AS_NODE=1 充当）。
+ *       有 Windows 自带 bsdtar（%SystemRoot%\System32\tar.exe，Win10 1803+）时用它多进程并行；
+ *       Win7 没有 tar.exe，自动退回内置纯 JS 单线程解压（慢一些，但不需要任何外部程序）。
  *
  * 注：本文件必须以 CommonJS 纯 Node 运行，不得引用 electron / asar。
  */
@@ -204,6 +205,74 @@ function writeProgress(force = false) {
 // 分批：按字节数做 LPT 装箱，保证各批次体量均衡（避免某个大文件拖尾）
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pure-JS tar extraction: for platforms WITHOUT System32\tar.exe (Windows 7).
+// Slower than tar.exe (single thread) but zero external dependency.
+// ---------------------------------------------------------------------------
+function extractTarPure(tarFile, destDir, wanted, onProgress) {
+  const fd = fs.openSync(tarFile, 'r');
+  const fsize = fs.fstatSync(fd).size;
+  const BLOCK = 512;
+  const block = Buffer.alloc(BLOCK);
+  let pos = 0;
+  let pendingName = '';
+  let doneBytes = 0, doneFiles = 0, lastSay = 0;
+  const dirsMade = new Set();
+  function ensureDir(d) { if (!dirsMade.has(d)) { fs.mkdirSync(d, { recursive: true }); dirsMade.add(d); } }
+  try {
+    while (pos + BLOCK <= fsize) {
+      if (fs.readSync(fd, block, 0, BLOCK, pos) < BLOCK) break;
+      if (isZeroBlock(block)) break;
+      const rawName = readString(block, 0, 100);
+      const prefix = readString(block, 345, 155);
+      const sizeField = readString(block, 124, 12).replace(/[^0-7]/g, '');
+      const dataSize = parseInt(sizeField || '0', 8) || 0;
+      const typeFlag = String.fromCharCode(block[156]);
+      const dataBlocks = Math.ceil(dataSize / BLOCK);
+      const dataStart = pos + BLOCK;
+      if (typeFlag === 'L') {
+        const nb = Buffer.alloc(dataSize);
+        fs.readSync(fd, nb, 0, dataSize, dataStart);
+        pendingName = nb.toString('utf8').replace(/\0+$/, '');
+        pos = dataStart + dataBlocks * BLOCK; continue;
+      }
+      if (typeFlag === 'x' || typeFlag === 'g') {
+        // PAX 扩展头：真正的长名/非 ASCII 名在 path= 记录里，必须解析出来
+        const pb = Buffer.alloc(dataSize);
+        fs.readSync(fd, pb, 0, dataSize, dataStart);
+        const p = parsePaxPath(pb);
+        if (p && typeFlag === 'x') pendingName = p;
+        pos = dataStart + dataBlocks * BLOCK; continue;
+      }
+      if (typeFlag !== '0' && typeFlag !== '\0' && typeFlag !== '' && typeFlag !== '5') {
+        pendingName = ''; pos = dataStart + dataBlocks * BLOCK; continue;
+      }
+      const name = pendingName || (prefix ? prefix + '/' + rawName : rawName);
+      pendingName = '';
+      if (wanted && !wanted.has(name)) { pos = dataStart + dataBlocks * BLOCK; continue; }
+      if (typeFlag === '5') { ensureDir(path.join(destDir, name)); pos = dataStart + dataBlocks * BLOCK; continue; }
+      const abs = path.join(destDir, name);
+      ensureDir(path.dirname(abs));
+      const out = fs.openSync(abs, 'w');
+      try {
+        let left = dataSize, at2 = dataStart;
+        const buf2 = Buffer.alloc(1024 * 1024);
+        while (left > 0) {
+          const take = Math.min(buf2.length, left);
+          if (fs.readSync(fd, buf2, 0, take, at2) !== take) throw new Error('short read: ' + name);
+          fs.writeSync(out, buf2, 0, take);
+          at2 += take; left -= take;
+        }
+      } finally { fs.closeSync(out); }
+      doneBytes += dataSize; doneFiles++;
+      pos = dataStart + dataBlocks * BLOCK;
+      const now = Date.now();
+      if (onProgress && now - lastSay > 500) { lastSay = now; onProgress(doneBytes, doneFiles); }
+    }
+  } finally { fs.closeSync(fd); }
+  return { doneBytes: doneBytes, doneFiles: doneFiles };
+}
+
 function planBatches(entries, targetBatches) {
   const bins = Array.from({ length: Math.max(1, targetBatches) }, () => ({ bytes: 0, items: [] }));
   for (const e of [...entries].sort((a, b) => b.size - a.size)) {
@@ -281,7 +350,13 @@ function verify(entries) {
 
 async function main() {
   if (!fs.existsSync(opts.tar)) fail(`未找到 tar：${opts.tar}`);
-  if (!fs.existsSync(TAR_EXE)) fail(`未找到系统 tar：${TAR_EXE}（需要 Windows 10 1803+）`);
+
+  // Windows 7 没有 %SystemRoot%\System32\tar.exe（微软从 Win10 1803 才内置 bsdtar）。
+  // 有系统 tar 就用多进程并行（快）；没有就退回内置纯 JS 解压（慢，但零依赖、不报错）。
+  const hasTar = fs.existsSync(TAR_EXE);
+  if (!hasTar) {
+    say(`未找到系统 tar（${TAR_EXE}），改用内置纯 JS 解压（单线程，会慢一些）`);
+  }
 
   const started = Date.now();
 
@@ -343,7 +418,7 @@ async function main() {
 
   say(
     `开始解压：${state.totalFiles} 个文件 / ${(state.totalBytes / 1048576).toFixed(1)} MB，` +
-      `并发 ${opts.threads}（CPU ${os.cpus().length} 核）`,
+      (hasTar ? `并发 ${opts.threads}（CPU ${os.cpus().length} 核）` : '纯 JS 单线程模式'),
   );
 
   fs.mkdirSync(opts.dest, { recursive: true });
@@ -355,9 +430,22 @@ async function main() {
     // 3 轮：首轮全量并行；后续轮只重试缺失项（杀软偶发拦截 / 瞬时锁）
     while (round < 3) {
       round++;
-      const batches = planBatches(targets, Math.min(64, Math.max(opts.threads, opts.threads * 3)));
-      const errors = await runBatches(batches, tmpDir);
-      if (errors.length > 0) say(`第 ${round} 轮有 ${errors.length} 个批次报错：${errors[0]}`);
+      if (hasTar) {
+        const batches = planBatches(targets, Math.min(64, Math.max(opts.threads, opts.threads * 3)));
+        const errors = await runBatches(batches, tmpDir);
+        if (errors.length > 0) say(`第 ${round} 轮有 ${errors.length} 个批次报错：${errors[0]}`);
+      } else {
+        // Windows 7 路径：单线程纯 JS 解压（只解 targets 里点名的成员）
+        const wanted = new Set(targets.map((e) => e.name));
+        const res = extractTarPure(opts.tar, opts.dest, wanted, (bytes, files) => {
+          state.doneBytes = bytes;
+          state.doneFiles = files;
+          writeProgress();
+        });
+        state.doneBytes = res.doneBytes;
+        state.doneFiles = res.doneFiles;
+        say(`第 ${round} 轮纯 JS 解压完成：${res.doneFiles} 个文件`);
+      }
 
       state.phase = 'verify';
       writeProgress(true);
