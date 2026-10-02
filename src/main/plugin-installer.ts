@@ -27,6 +27,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { createHash } from 'crypto';
 import { dshPluginsSourceDir, profileModulesDir, userPluginsDir } from './paths';
 import { log } from './logger';
 
@@ -48,6 +49,37 @@ export interface PluginInstallResult {
 interface PkgInfo {
   name: string;
   version: string;
+  /** 内容指纹（见 fingerprintOf） */
+  fingerprint: string;
+}
+
+/**
+ * 目录内容指纹：按「相对路径 + 大小 + mtime」排序后哈希。
+ *
+ * 为什么不能只看 package.json 的 version：插件改动时**经常忘记改版本号** ——
+ * 实测 computer-use 从「只有 allowInput 总开关」重写成「5 个粒度开关」时版本号仍是 1.0.0，
+ * 于是落位逻辑判定「版本没变」直接跳过复制，用户跑的一直是旧代码，
+ * 表现为「改了插件但工具没出现」。指纹与版本号解耦，内容一变就一定重装。
+ */
+function fingerprintOf(dir: string): string {
+  const parts: string[] = [];
+  const walk = (d: string, rel: string) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) { walk(p, r); continue; }
+      if (!e.isFile()) continue; // 跳过符号链接等
+      try {
+        const st = fs.statSync(p);
+        parts.push(r + ':' + st.size + ':' + Math.round(st.mtimeMs));
+      } catch { /* 读不到就忽略 */ }
+    }
+  };
+  walk(dir, '');
+  parts.sort();
+  return createHash('sha256').update(parts.join('\n')).digest('hex').slice(0, 16);
 }
 
 function readPkgInfo(dir: string, fallbackName: string): PkgInfo | null {
@@ -62,6 +94,7 @@ function readPkgInfo(dir: string, fallbackName: string): PkgInfo | null {
     return {
       name: typeof pkg.name === 'string' && pkg.name ? pkg.name : `${PLUGIN_SCOPE}/${fallbackName}`,
       version: typeof pkg.version === 'string' ? pkg.version : '0',
+      fingerprint: fingerprintOf(dir),
     };
   } catch {
     return null;
@@ -161,8 +194,12 @@ export function installPlugins(): PluginInstallResult {
     try {
       // 版本没变且入口仍在 → 跳过复制（启动更快）
       if (fs.existsSync(markerPath) && fs.existsSync(path.join(item.dest, 'package.json'))) {
-        const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as { version?: string };
-        if (marker.version === item.pkg.version) {
+        const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8')) as {
+          version?: string;
+          fingerprint?: string;
+        };
+        // 指纹优先：老戳没有 fingerprint 字段 → 视为需要重装（一次性升级代价，之后就走指纹）
+        if (marker.fingerprint && marker.fingerprint === item.pkg.fingerprint) {
           result.installed.push(item.pkg.name);
           continue;
         }
@@ -170,7 +207,11 @@ export function installPlugins(): PluginInstallResult {
       copyDir(item.srcDir, item.dest);
       fs.writeFileSync(
         markerPath,
-        JSON.stringify({ version: item.pkg.version, managedBy: 'dsh-desktop' }),
+        JSON.stringify({
+          version: item.pkg.version,
+          fingerprint: item.pkg.fingerprint,
+          managedBy: 'dsh-desktop',
+        }),
       );
       result.installed.push(item.pkg.name);
     } catch (err) {
