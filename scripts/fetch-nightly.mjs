@@ -232,12 +232,32 @@ fs.mkdirSync(dshDir, { recursive: true });
 fs.copyFileSync(path.join(srcDir, 'apps', 'cli', 'package.json'), path.join(dshDir, 'package.json'));
 copyTree(path.join(srcDir, 'apps', 'cli', 'lib'), path.join(dshDir, 'lib'));
 
-// 组装自检：整棵树里不允许有符号链接 —— 打包/解压链会丢掉它们（见上面 hoisted 的说明）。
+// 残留的符号链接一律**物化成真副本**。
+// 为什么不能只靠 hoisted：`link:` 协议的依赖（pnpm-workspace 的 overrides 里就有
+// cosmokit / schemastery）以及少数传递依赖仍会是链接，链接在这条分发链上会被丢掉。
+// 物化后整棵树只剩普通文件与目录，打包/解压/校验三步都不会再有歧义。
+const nmDir = path.join(targetDir, 'node_modules');
+const leftover = findSymlinks(nmDir, 0);
+if (leftover.length) {
+  let done = 0;
+  for (const link of leftover) {
+    let real;
+    try { real = fs.realpathSync(link); } catch { die('符号链接指向不存在的目标：' + link); }
+    let st;
+    try { st = fs.statSync(real); } catch { die('符号链接目标读不到：' + link + ' -> ' + real); }
+    fs.rmSync(link, { recursive: true, force: true });
+    if (st.isDirectory()) fs.cpSync(real, link, { recursive: true, force: true, dereference: true });
+    else fs.copyFileSync(real, link);
+    done++;
+  }
+  log('  物化残留符号链接 ' + done + ' 个');
+}
+
+// 组装自检：整棵树里不允许再有符号链接 —— 打包/解压链会丢掉它们（见上面说明）。
 // 这里提前失败，别等用户在安装器里撞上 ERR_MODULE_NOT_FOUND。
-const links = findSymlinks(path.join(targetDir, 'node_modules'), 5);
+const links = findSymlinks(nmDir, 5);
 if (links.length) {
-  die('组装后的 node_modules 里仍有符号链接（打包会被静默丢弃）：' + links.join(' | ') +
-      '\n  → pnpm install 必须带 --config.node-linker=hoisted，且 workspace 包要被物化。');
+  die('组装后的 node_modules 里仍有符号链接（打包会被静默丢弃）：' + links.join(' | '));
 }
 log('  自检通过：node_modules 无符号链接');
 
@@ -271,10 +291,12 @@ if (!keepSrc) {
 }
 
 /** 找符号链接（最多返回 limit 个，够报错用就行） */
+/** 找符号链接；limit <= 0 表示不限数量 */
 function findSymlinks(dir, limit = 5) {
+  const cap = limit > 0 ? limit : Infinity;
   const out = [];
   const stack = [dir];
-  while (stack.length && out.length < limit) {
+  while (stack.length && out.length < cap) {
     const d = stack.pop();
     let entries;
     try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
@@ -282,7 +304,7 @@ function findSymlinks(dir, limit = 5) {
       const p = path.join(d, e.name);
       let st;
       try { st = fs.lstatSync(p); } catch { continue; }
-      if (st.isSymbolicLink()) { out.push(p); if (out.length >= limit) break; continue; }
+      if (st.isSymbolicLink()) { out.push(p); if (out.length >= cap) break; continue; }
       if (e.isDirectory()) stack.push(p);
     }
   }
