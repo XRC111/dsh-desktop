@@ -407,28 +407,28 @@ function apply(ctx, config) {
   ctx.tools.register(defineTool({
     name: 'key_type',
     description:
-      '逐字输入一段文本（仅支持可映射到虚拟键的 ASCII 字符：字母、数字、常见标点）。' +
-      '中文等需要 IME 的字符请改用剪贴板 + Ctrl+V。',
+      '输入一段文本。**支持中文与任意 Unicode**（走 KEYEVENTF_UNICODE 注入，' +
+      '不经过键盘布局与 IME）。',
     parameters: { text: { type: 'string', required: true } },
-    output: textOut({ typed: { type: 'integer' } }),
+    output: textOut({ typed: { type: 'integer' }, skipped: { type: 'array', items: { type: 'string' } } }),
     execute(args) {
       const text = String(args?.text ?? '');
-      let typed = 0;
-      for (const ch of text) {
-        const upper = ch.toUpperCase();
-        const needShift = ch !== upper && /[A-Z]/.test(upper);
-        let vk;
-        try {
-          vk = vkOf(ch);
-        } catch {
-          continue; // 无法映射的字符跳过（不中断整段输入）
-        }
-        if (needShift) w32.keyDown(VK.shift, false);
-        w32.keyPress(vk, false);
-        if (needShift) w32.keyUp(VK.shift, false);
-        typed++;
+      if (!text) return Promise.resolve({ typed: 0 });
+
+      // 策略：**全部走 Unicode 注入**。
+      //
+      // 为什么不按「ASCII 用 VkKeyScanW、非 ASCII 用 Unicode」拆：
+      // 两条路径混用会让 IME/输入法状态在中间插入不可预期的行为（实测过：
+      // 中文之后紧跟的 ASCII 会被输入法当候选字吃掉）。整段走同一条路径最稳，
+      // 而 Unicode 注入对 ASCII 同样有效（它绕过键盘布局，直接注入字符）。
+      //
+      // 代价：不触发键盘快捷键语义（不会产生 Ctrl+C 这种组合键效果）——
+      // 需要快捷键请用 key_press。这里只负责「打字」。
+      const r = w32.typeUnicode(text);
+      if (r.failed) {
+        throw new Error(`输入中断：已发送 ${r.sent} 个字符后 SendInput 失败。`);
       }
-      return Promise.resolve({ typed });
+      return Promise.resolve({ typed: r.sent });
     },
     presentCall: (args) => ({
       card: 'generic',

@@ -114,6 +114,10 @@ function funcs() {
     // 键盘
     keybd_event: user32.func('void keybd_event(uint8 bVk, uint8 bScan, uint32 dwFlags, uintptr_t dwExtraInfo)'),
     MapVirtualKeyW: user32.func('uint32 MapVirtualKeyW(uint32 uCode, uint32 uMapType)'),
+    // 字符 → (虚拟键, 需要的修饰键)：比手搓映射表可靠得多（见 keyTypeChar 的说明）
+    VkKeyScanW: user32.func('short VkKeyScanW(uint16 ch)'),
+    // 任意 Unicode 字符输入（中文/emoji 等），走 KEYEVENTF_UNICODE —— 这是唯一的路
+    SendInput: user32.func('uint32 SendInput(uint32 nInputs, void* pInputs, int cbSize)'),
     GetKeyState: user32.func('short GetKeyState(int nVirtKey)'),
     // GDI 截屏
     GetDC: user32.func('intptr_t GetDC(intptr_t hWnd)'),
@@ -348,13 +352,78 @@ export function mouseClick(x, y, button = 'left', double = false) {
     f.mouse_event(down, 0, 0, 0, 0);
     f.mouse_event(up, 0, 0, 0, 0);
   }
-  return { at: cursorPos(), button, double };
+  // ⚠️ 返回字段必须与 index.js 的 output schema **完全一致** ——
+  //    schema 是 additionalProperties:false，多一个字段整次调用就被判为
+  //    「returned invalid output」（点击其实已经执行了，调用方却看到报错，极易误重试）。
+  return { at: cursorPos() };
 }
 
 export function mouseWheel(delta) {
   const f = funcs();
   f.mouse_event(MOUSEEVENTF.WHEEL, 0, 0, delta | 0, 0);
   return { delta };
+}
+
+/**
+ * 字符 → { vk, shift, ctrl, alt }，用 VkKeyScanW 取**当前键盘布局**下的正确映射。
+ *
+ * 为什么不能手搓映射表（实测踩过两个 bug）：
+ *   1) 小写字母被当成需要 Shift：`ch !== upper && /[A-Z]/.test(upper)` 对 'b' 也成立，
+ *      而 vkOf('b') 返回的已是大写 VK 码 0x42（本来就不带 Shift），再按 Shift 就成了 'B'
+ *      —— 输入 "bilibili" 打出 "BILIBILI"；
+ *   2) 需要 Shift 的符号（_ : ? " < > { } | + ~ ! @ # $ % ^ & * ( )）根本没进映射表，
+ *      被 catch 静默 continue —— 打不出且不报错。
+ * VkKeyScanW 一次性给出 vk 与修饰键状态，两种问题同时消失。
+ * 返回 null 表示该字符在当前布局下打不出来（调用方跳过并计数）。
+ */
+export function keyScan(ch) {
+  const f = funcs();
+  const r = f.VkKeyScanW(String(ch).charCodeAt(0));
+  if (r === -1 || r === 0xffff) return null;
+  const vk = r & 0xff;
+  const state = (r >> 8) & 0xff;
+  return { vk, shift: (state & 1) !== 0, ctrl: (state & 2) !== 0, alt: (state & 4) !== 0 };
+}
+
+/**
+ * 输入任意 Unicode 文本（中文、emoji、任意符号）。
+ *
+ * 为什么不能用 keybd_event：它只能发**虚拟键码**，而中文根本不对应任何虚拟键
+ * （要靠 IME 组字）。实测 keybd_event 打中文是**静默丢失**。
+ * SendInput + KEYEVENTF_UNICODE 是把 UTF-16 码元直接塞进 wScan，由系统注入 ——
+ * 不经过键盘布局与 IME，任何字符都能原样到达。
+ *
+ * 结构体布局（x64，实测正确，别改）：
+ *   INPUT      = type(4) + pad(4) + union(32)            = 40 字节
+ *   KEYBDINPUT = wVk(2) wScan(2) dwFlags(4) time(4) pad(4) dwExtraInfo(8)
+ *   union 的 32 字节由 MOUSEINPUT 撑出来（不是 KEYBDINPUT 的 24）——
+ *   写小了 SendInput 会返回 0（参数错误）。
+ */
+export function typeUnicode(text) {
+  const f = funcs();
+  const INPUT_SIZE = 40;
+  const KEYEVENTF_UNICODE = 0x0004;
+  const KEYEVENTF_KEYUP = 0x0002;
+  const unit = (cu, up) => {
+    const b = Buffer.alloc(INPUT_SIZE);
+    b.writeUInt32LE(1, 0); // INPUT_KEYBOARD
+    b.writeUInt16LE(0, 8); // wVk 必须为 0
+    b.writeUInt16LE(cu, 10); // wScan = UTF-16 码元
+    b.writeUInt32LE(KEYEVENTF_UNICODE | (up ? KEYEVENTF_KEYUP : 0), 12);
+    return b;
+  };
+  let sent = 0;
+  for (const ch of String(text)) {
+    // 代理对（emoji 等）拆成两个 UTF-16 码元逐个发
+    const units = [];
+    for (let i = 0; i < ch.length; i++) units.push(ch.charCodeAt(i));
+    for (const u of units) {
+      const pair = Buffer.concat([unit(u, false), unit(u, true)]);
+      if (f.SendInput(2, pair, INPUT_SIZE) !== 2) return { sent, failed: true };
+      sent++;
+    }
+  }
+  return { sent };
 }
 
 export function keyPress(vk, extended = false) {
@@ -405,6 +474,15 @@ export function capture(opts = {}) {
 
   if (opts.hwnd) {
     const hwnd = BigInt(opts.hwnd);
+    // 最小化的窗口：Windows 把它的矩形挪到 (-32000, -32000) 这个哨兵位置，
+    // 截出来是 146x28 的垃圾（实测只有 168 字节）。以前会**静默返回这张垃圾图**，
+    // 调用方以为截成功了。这里直接报错并给出可执行的建议。
+    if (f.IsIconic(hwnd)) {
+      throw new Error(
+        `窗口处于最小化状态，截不到画面（hwnd=${opts.hwnd}）。` +
+          '先用 screen_activate 把它还原到前台，再截图。',
+      );
+    }
     // 优先用 DWM 的真实可见边界（不含投影），拿不到再退回 GetWindowRect
     const r = extendedFrame(f, hwnd) ?? (() => {
       const rbuf = Buffer.alloc(16);
@@ -415,6 +493,13 @@ export function capture(opts = {}) {
     y = r.top;
     w = r.right - r.left;
     h = r.bottom - r.top;
+    // 兜底：极小区域一定是错的（哨兵值、或窗口刚被隐藏）
+    if (w < 16 || h < 16) {
+      throw new Error(
+        `窗口可见区域过小（${w}x${h}，hwnd=${opts.hwnd}），可能已最小化或被隐藏。` +
+          '先 screen_activate 再试。',
+      );
+    }
   } else {
     const s = screenSize();
     x = 0;
