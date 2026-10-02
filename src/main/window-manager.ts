@@ -355,9 +355,25 @@ export class WindowManager {
     if (this.dshUrl) this.loadDshUi(this.dshUrl);
   }
 
+  /**
+   * 自动化进行中且主窗口已隐藏时，是否禁止把主窗口拉回前台。
+   *
+   * 实测：DSH 的 Electron 窗口会在约 10 秒后**自己把前台抢回去**（无需用户操作）。
+   * 而 computer use 的注入只能靠「激活那一刻」的快照判断目标 —— 于是输入会落到
+   * DSH 自己的窗口上，且工具仍报成功。破局点是：窗口**隐藏**时不会抢焦点，
+   * 所以自动化进行中就别把它叫回来。用户点悬浮球/托盘时再显式打开。
+   */
+  suppressAutoFocus = false;
+
   show(): void {
     if (!this.win || this.win.isDestroyed()) return;
     if (!this.win.isVisible()) {
+      // 自动化进行中：只恢复窗口可见性，**不抢焦点**（showInactive）
+      if (this.suppressAutoFocus) {
+        this.win.showInactive();
+        this.contentView?.webContents.setBackgroundThrottling(false);
+        return;
+      }
       this.contentView?.webContents.setBackgroundThrottling(false);
       this.win.show();
     }

@@ -54,6 +54,7 @@ import { appliedPatch, applyPendingRuntimePatch, findRuntimeDir, runtimeVersionO
 import { injectAttachmentPicker, registerAttachmentPickerHandlers } from './attachment-picker';
 import { ensureHiddenConsole, ensureWin32ProcessNoWindowPatch } from './win-console';
 import { ensureAclDefaultDaclPatch } from './acl-patch';
+import { ComputerUseBall } from './computer-use-ball';
 
 /** dsh web 的首选端口，被占用时自动回退到系统分配端口 */
 const PREFERRED_PORT = 3080;
@@ -101,6 +102,7 @@ app.commandLine.appendSwitch('disable-component-update');
 const service = new DshService();
 let windowManager: WindowManager | null = null;
 let trayManager: TrayManager | null = null;
+let computerUseBall: ComputerUseBall | null = null;
 /** 外壳功能开关（用户数据目录持久化；见 shell-features.ts） */
 let shellFeatures: ShellFeatures | null = null;
 let updater: Updater | null = null;
@@ -387,6 +389,7 @@ async function restartApp(reason: string): Promise<void> {
     log(`重启前停止服务出错：${String(err)}`);
   }
   service.killTreeSync();
+  computerUseBall?.destroy();
   trayManager?.destroy();
   app.relaunch();
   app.exit(0);
@@ -624,7 +627,8 @@ function registerIpc(): void {
       trayManager?.setTaskRunning(false);
       return;
     }
-    if (shellFeatures && !shellFeatures.isEnabled('trayStatus')) {
+    computerUseBall?.setMainVisible(windowManager?.isVisible() ?? false);
+  if (shellFeatures && !shellFeatures.isEnabled('trayStatus')) {
       trayManager?.setTaskRunning(false);
       return;
     }
@@ -786,6 +790,17 @@ app.whenReady().then(async () => {
   });
   trayManager.create();
   trayManager.setHotShell(hotShell?.version ?? null);
+
+  // computer use 悬浮球：主窗口隐藏且自动化进行时显示，同时抑制主窗口把焦点抢回去
+  computerUseBall = new ComputerUseBall({
+    onOpenMainWindow: () => {
+      // 用户主动点悬浮球 → 解除抑制，正常打开并聚焦
+      if (windowManager) windowManager.suppressAutoFocus = false;
+      windowManager?.show();
+    },
+    isMainWindowHidden: () => !windowManager?.isVisible(),
+  });
+  computerUseBall.create();
 
   // ── 更新 ──────────────────────────────────────────────────────────────────
   // 优先热更新（下载新壳 → 重启即生效），必要时降级到完整安装包。

@@ -79,6 +79,12 @@ const api = {
    */
   reportTaskState: (state: { running: boolean; unloading?: boolean }) =>
     ipcRenderer.send('app:task-state', state),
+  /**
+   * computer use 把「正在操作本机」报给外壳（悬浮球 + 抑制主窗口抢焦点）。
+   * 单向通知；外壳没实现对应监听时这条消息会被忽略，不影响页面。
+   */
+  reportComputerUseState: (state: { active: boolean; action?: string }) =>
+    ipcRenderer.send('app:computer-use-state', state),
 };
 
 contextBridge.exposeInMainWorld('dshDesktop', api);
