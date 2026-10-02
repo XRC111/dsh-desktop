@@ -87,6 +87,15 @@ function Invoke-Step {
     param([string]$Name, [string]$LogFile, [scriptblock]$Body)
     $sw = [Diagnostics.Stopwatch]::StartNew()
     Write-Host "    运行: $Name"
+    # 子进程把 stderr 合并进来时（2>&1），PowerShell 会把每一行 stderr 包成
+    # ErrorRecord；而脚本顶部是 $ErrorActionPreference='Stop'，于是 npm 的
+    # **warning 也会抛异常**——哪怕退出码是 0。实测 npm run build 在 stderr 打
+    # 一条 `npm warn Unknown project config ...` 就足以让本步变成「抛异常」，
+    # 真正的编译输出反而被这个异常顶掉了。
+    # 这里只在调用子进程的局部作用域内放宽成 Continue：让 stderr 正常落进
+    # $out（完整写进日志），成败只由 $LASTEXITCODE 决定。
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
     try {
         $out = & $Body 2>&1
         $code = $LASTEXITCODE
@@ -103,13 +112,17 @@ function Invoke-Step {
     } catch {
         $sw.Stop()
         Fail "$Name 抛异常: $($_.Exception.Message)"
+        Show-Tail $LogFile 25
         return $false
+    } finally {
+        $ErrorActionPreference = $prevEap
     }
 }
 
 # ── 版本号 ────────────────────────────────────────────────────────────────
 $pkgPath = Join-Path $root 'package.json'
-$origVersion = ((Get-Content $pkgPath -Raw) | ConvertFrom-Json).version
+# 同样要显式 UTF-8（见 Set-PkgVersion 里的说明），否则读到乱码 JSON 直接解析失败。
+$origVersion = ([System.IO.File]::ReadAllText($pkgPath, (New-Object System.Text.UTF8Encoding($false))) | ConvertFrom-Json).version
 if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = $origVersion
     Info "未指定 -Version，用 package.json 的 $Version"
@@ -117,9 +130,17 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
 
 function Set-PkgVersion {
     param([string]$V)
-    $t = Get-Content $pkgPath -Raw
-    $t = [regex]::Replace($t, '("version":\s*")[^"]+(")', "`$1$V`$2")
-    [System.IO.File]::WriteAllText($pkgPath, $t, (New-Object System.Text.UTF8Encoding($false)))
+    # ⚠️ 必须显式指定 UTF-8。package.json 是**无 BOM** 的 UTF-8，而
+    # `Get-Content -Raw` 在 Windows PowerShell 5.1 下按系统 ANSI 代码页解码
+    # （本机 gb2312）→ 中文变乱码，且破折号「—」(U+2014, e2 80 94) 被 GBK
+    # 解读后产生的孤立字节会在写回时吃掉字符串结尾的引号，JSON 直接非法。
+    # 症状：build 报 EJSONPARSE "Bad control character in string literal"。
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $t = [System.IO.File]::ReadAllText($pkgPath, $utf8)
+    # 用 MatchEvaluator 而不是替换串：版本号以数字开头时（如 10.1.9），
+    # 替换串里的 $1 会被 .NET 解析成命名组 $110，导致 "version": " 整段被吃掉。
+    $t = [regex]::Replace($t, '("version":\s*")[^"]+(")', { param($m) $m.Groups[1].Value + $V + $m.Groups[2].Value })
+    [System.IO.File]::WriteAllText($pkgPath, $t, $utf8)
 }
 
 # ── stub 体检 ─────────────────────────────────────────────────────────────
