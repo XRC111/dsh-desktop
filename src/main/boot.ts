@@ -53,6 +53,7 @@ import { activeHotShell, rollbackHotShell, shellVersion } from './hot-shell';
 import { appliedPatch, applyPendingRuntimePatch, findRuntimeDir, runtimeVersionOf } from './runtime-patch';
 import { injectAttachmentPicker, registerAttachmentPickerHandlers } from './attachment-picker';
 import { ensureHiddenConsole, ensureWin32ProcessNoWindowPatch } from './win-console';
+import { ensureAclDefaultDaclPatch } from './acl-patch';
 
 /** dsh web 的首选端口，被占用时自动回退到系统分配端口 */
 const PREFERRED_PORT = 3080;
@@ -260,6 +261,11 @@ async function startService(): Promise<void> {
   // Windows 弹窗修复：确保 dsh-win32-process 的普通令牌路径带 CREATE_NO_WINDOW
   // （运行时热更新/自愈可能覆盖补丁，这里幂等重打；详见 win-console.ts）
   ensureWin32ProcessNoWindowPatch(runtimeDir);
+
+  // Windows 沙箱修复：workspace-write 下受限子进程会在 DLL 初始化阶段
+  // 0xC0000142 秒死（令牌默认 DACL 只挂了 restricting 列表里的能力 SID，
+  // 缺正常 SID 列表的主体）。启动时幂等重打；详见 acl-patch.ts
+  ensureAclDefaultDaclPatch(runtimeDir);
 
   const verify = verifyRuntime(runtimeDir);
   if (!verify.ok || !verify.install) {
