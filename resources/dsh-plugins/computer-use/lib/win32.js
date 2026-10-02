@@ -141,6 +141,11 @@ function funcs() {
     SetActiveWindow: user32.func('intptr_t SetActiveWindow(intptr_t hWnd)'),
     SetFocus: user32.func('intptr_t SetFocus(intptr_t hWnd)'),
     SwitchToThisWindow: user32.func('void SwitchToThisWindow(intptr_t hWnd, bool fUnknown)'),
+    // 前台校验失败时，用来报出「实际是哪个进程抢了前台」（如 msedge.exe / WPS.exe），
+    // 让调用方一次看懂，而不是靠截图考古。
+    OpenProcess: kernel32.func('intptr_t OpenProcess(uint32 dwDesiredAccess, bool bInheritHandle, uint32 dwProcessId)'),
+    QueryFullProcessImageNameW: kernel32.func('bool QueryFullProcessImageNameW(intptr_t hProcess, uint32 dwFlags, _Out_ uint16_t* lpExeName, _Inout_ uint32* lpdwSize)'),
+    CloseHandle: kernel32.func('bool CloseHandle(intptr_t hObject)'),
     // DWM：窗口是否被隐藏（cloked）、窗口的真实可见边界（去掉阴影边框）
     DwmGetWindowAttribute: dwmapi
       ? dwmapi.func('int DwmGetWindowAttribute(intptr_t hwnd, uint32 attr, _Out_ void* pv, uint32 cb)')
@@ -305,6 +310,71 @@ export function foregroundWindow() {
   const tbuf = Buffer.alloc(1024);
   const tn = f.GetWindowTextW(h, tbuf, 512);
   return { hwnd: String(h), title: wstr(tbuf, tn) };
+}
+
+/**
+ * 前台窗口所属进程的映像名（如 `msedge.exe`）—— 报错时给出来，调用方才能一眼看出
+ * 「本该是 WPS，实际是 msedge」。
+ */
+export function processOfWindow(hwnd) {
+  const f = funcs();
+  const h = BigInt(hwnd);
+  const pidBuf = Buffer.alloc(4);
+  f.GetWindowThreadProcessId2(h, pidBuf);
+  const pid = pidBuf.readUInt32LE(0);
+  if (!pid) return { pid: 0, name: '' };
+  // PROCESS_QUERY_LIMITED_INFORMATION (0x1000)
+  const proc = f.OpenProcess(0x1000, false, pid);
+  if (!proc) return { pid, name: '' };
+  try {
+    // 签名：BOOL QueryFullProcessImageNameW(HANDLE, DWORD, LPWSTR, PDWORD lpdwSize)
+    // 第四个参数是 in/out 的字符数（不含结尾 \0），所以用一个 uint32 槽位传进去，
+    // 不能拿缓冲区本身当 size 用。
+    const buf = Buffer.alloc(1024);
+    const sizeSlot = Buffer.alloc(4);
+    sizeSlot.writeUInt32LE(512, 0);
+    const ok = f.QueryFullProcessImageNameW(proc, 0, buf, sizeSlot);
+    if (!ok) return { pid, name: '' };
+    const chars = sizeSlot.readUInt32LE(0);
+    if (!chars) return { pid, name: '' };
+    const full = wstr(buf, chars);
+    return { pid, name: full.split(/[\\/]/).pop() ?? full };
+  } finally {
+    f.CloseHandle(proc);
+  }
+}
+
+/**
+ * 注入前的前台所有权强校验。
+ *
+ * 为什么需要它：激活调用返回的 foreground 是**调用当时**的快照，
+ * 而输入注入发生在若干毫秒之后。DSH 自己的 Electron GUI（或 IM 宿主）
+ * 常在这段时间里把前台抢回去 —— 于是 `key_type` 返回成功、文本却进了别的窗口。
+ * 这是静默失败里最危险的一类：调用方看到成功，可能误伤用户当前窗口。
+ *
+ * @param targetHwnd 期望的前台窗口；undefined 表示不校验。
+ * @throws 前台不是目标时抛出结构化信息（含实际前台的进程名）。
+ */
+export function assertForeground(targetHwnd) {
+  if (targetHwnd === undefined || targetHwnd === null || targetHwnd === '') return { ok: true };
+  const f = funcs();
+  // 同样统一成字符串比较，避免 Number / BigInt 不等导致的误判
+  const target = String(BigInt(targetHwnd));
+  const actual = String(f.GetForegroundWindow());
+  if (actual === target) return { ok: true, hwnd: target };
+  const info = processOfWindow(String(actual));
+  const tbuf = Buffer.alloc(1024);
+  const tn = f.GetWindowTextW(actual, tbuf, 512);
+  const err = new Error(
+    `注入中止：前台窗口不是目标窗口。期望 hwnd=${targetHwnd}，实际 hwnd=${String(actual)}` +
+      (info.name ? `（${info.name}）` : '') +
+      (wstr(tbuf, tn) ? `“${wstr(tbuf, tn)}”` : ''),
+  );
+  err.expectedHwnd = String(targetHwnd);
+  err.actualHwnd = String(actual);
+  err.actualProcess = info.name ?? '';
+  err.actualTitle = wstr(tbuf, tn);
+  throw err;
 }
 
 export function showWindow(hwnd, cmd) {
@@ -490,17 +560,20 @@ export function listElements(opts = {}) {
  */
 export function activateAndWait(hwnd, timeoutMs = 500) {
   const f = funcs();
-  const target = BigInt(hwnd);
+  // ⚠️ GetForegroundWindow() 返回 Number，而 BigInt(hwnd) 是 BigInt。
+  // 直接 `cur !== target` 永远为真（类型不同），settled 会恒为 false ——
+  // 这会让「目标本来就在前台」的合法调用被误判成失败。统一成字符串比较。
+  const target = String(BigInt(hwnd));
   activateWindow(hwnd);
   const deadline = Date.now() + timeoutMs;
-  let cur = f.GetForegroundWindow();
+  let cur = String(f.GetForegroundWindow());
   while (cur !== target && Date.now() < deadline) {
     // 忙等一小段：这里在 dsh 子进程里跑，阻塞几十毫秒可接受
     const until = Date.now() + 10;
     while (Date.now() < until) { /* spin */ }
-    cur = f.GetForegroundWindow();
+    cur = String(f.GetForegroundWindow());
   }
-  return { hwnd: String(hwnd), foreground: String(cur), settled: cur === target };
+  return { hwnd: String(hwnd), foreground: cur, settled: cur === target };
 }
 
 export function sendKeySteps(steps) {

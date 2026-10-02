@@ -403,12 +403,19 @@ function apply(ctx, config) {
     name: 'mouse_click',
     description:
       '在屏幕坐标处点击鼠标。省略 x/y 则在当前位置点。' +
-      'button 可选 left（默认）/ right / middle；double=true 双击。',
+      'button 可选 left（默认）/ right / middle；double=true 双击。' +
+      '强烈建议带 hwnd：点击落在**当前前台窗口**上，若目标不在前台，' +
+      '这一下会点到挡在上面的窗口（实测点击坐标正确但落到了别的窗口）。' +
+      '带 hwnd 会先切前台并等切换生效。',
     parameters: {
       x: { type: 'integer', description: '可选：先移动到该 x' },
       y: { type: 'integer', description: '可选：先移动到该 y' },
       button: { type: 'string', enum: ['left', 'right', 'middle'], description: '默认 left' },
       double: { type: 'boolean', description: '是否双击' },
+      hwnd: {
+        type: 'string',
+        description: '可选：先切该窗口到前台再点击（强烈建议传，避免点到别的窗口）',
+      },
     },
     output: textOut({
       at: {
@@ -418,6 +425,22 @@ function apply(ctx, config) {
       },
     }),
     execute(args) {
+      // 与 key_press / key_type 同样的前台守卫。点击比输入更直观，也更容易误伤：
+      // 坐标算对了但前台不是目标时，这一下会落到挡在上面的窗口上。
+      if (args?.hwnd) {
+        const a = w32.activateAndWait(String(args.hwnd));
+        if (!a.settled) {
+          const info = w32.processOfWindow(a.foreground);
+          const err = new Error(
+            `点击中止：无法把目标窗口切到前台。期望 hwnd=${String(args.hwnd)}，` +
+              `实际 hwnd=${a.foreground}` + (info.name ? `（${info.name}）` : ''),
+          );
+          err.expectedHwnd = String(args.hwnd);
+          err.actualHwnd = a.foreground;
+          err.actualProcess = info.name ?? '';
+          throw err;
+        }
+      }
       return Promise.resolve(
         w32.mouseClick(
           typeof args?.x === 'number' ? args.x : undefined,
@@ -483,7 +506,25 @@ function apply(ctx, config) {
       // 不先切的话，任何抢焦点的弹窗（实测：NSIS Error 对话框）都会把按键吃掉。
       // activateAndWait 会等前台**真的**切过去再返回；直接 activateWindow 后立刻发按键
       // 会因为切换是异步的而落到旧窗口上（实测：0,0）。
-      if (args?.hwnd) w32.activateAndWait(String(args.hwnd));
+      //
+      // ⚠️ 但 activateAndWait 的返回值只是**那一刻**的快照。DSH 自己的 Electron GUI
+      // （或 IM 宿主）可能在注入前又把前台抢回去。所以注入前再校验一次，
+      // 不一致就报错，绝不带着「以为成功」继续 —— 否则输入会落到用户当前窗口上。
+      if (args?.hwnd) {
+        const r = w32.activateAndWait(String(args.hwnd));
+        if (!r.settled) {
+          const info = w32.processOfWindow(r.foreground);
+          const err = new Error(
+            `注入中止：无法把目标窗口切到前台。期望 hwnd=${String(args.hwnd)}，` +
+              `实际 hwnd=${r.foreground}` + (info.name ? `（${info.name}）` : ''),
+          );
+          err.expectedHwnd = String(args.hwnd);
+          err.actualHwnd = r.foreground;
+          err.actualProcess = info.name ?? '';
+          throw err;
+        }
+      }
+      w32.assertForeground(args?.hwnd);
 
       const steps = [];
       for (let i = 0; i < codes.length - 1; i++) steps.push({ vk: codes[i].vk, up: false, extended: codes[i].ext });
@@ -492,7 +533,7 @@ function apply(ctx, config) {
       steps.push({ vk: last.vk, up: true, extended: last.ext });
       for (let i = codes.length - 2; i >= 0; i--) steps.push({ vk: codes[i].vk, up: true, extended: codes[i].ext });
       w32.sendKeySteps(steps);
-      // 回报按键实际落到了哪个窗口：调用方据此判断有没有被抢焦点
+      // 回报**注入时刻**的真实前台（不是激活时的旧快照），调用方据此判断有没有被抢焦点
       return Promise.resolve({ keys, foreground: w32.foregroundWindow().hwnd });
     },
     presentCall: (args) => ({ card: 'generic', title: `按键 ${(args?.keys ?? []).join('+')}`, kind: 'other', rawInput: args }),
@@ -503,9 +544,22 @@ function apply(ctx, config) {
     name: 'key_type',
     description:
       '输入一段文本。**支持中文与任意 Unicode**（走 KEYEVENTF_UNICODE 注入，' +
-      '不经过键盘布局与 IME）。',
-    parameters: { text: { type: 'string', required: true } },
-    output: textOut({ typed: { type: 'integer' }, skipped: { type: 'array', items: { type: 'string' } } }),
+      '不经过键盘布局与 IME）。' +
+      '强烈建议带 hwnd：按键是发给**当前前台窗口**的，若中途有弹窗或 GUI 抢走焦点，' +
+      '文本就会落到别的窗口上（实测过整段中文进错窗口、字数统计为 0）。' +
+      '带 hwnd 会先切前台、等切换生效，并在注入前再校验一次。',
+    parameters: {
+      text: { type: 'string', required: true },
+      hwnd: {
+        type: 'string',
+        description: '可选：先把该窗口切到前台再输入（强烈建议传，避免文本落到别的窗口）',
+      },
+    },
+    output: textOut({
+      typed: { type: 'integer' },
+      skipped: { type: 'array', items: { type: 'string' } },
+      foreground: { type: 'string' },
+    }),
     execute(args) {
       const text = String(args?.text ?? '');
       if (!text) return Promise.resolve({ typed: 0 });
@@ -519,11 +573,30 @@ function apply(ctx, config) {
       //
       // 代价：不触发键盘快捷键语义（不会产生 Ctrl+C 这种组合键效果）——
       // 需要快捷键请用 key_press。这里只负责「打字」。
+      // 与 key_press 同样的前台守卫：先切、等生效、注入前再校验。
+      // 文本注入比按键更危险 —— 几百字进错窗口几乎无法察觉，只能靠事后截图发现。
+      if (args?.hwnd) {
+        const a = w32.activateAndWait(String(args.hwnd));
+        if (!a.settled) {
+          const info = w32.processOfWindow(a.foreground);
+          const err = new Error(
+            `输入中止：无法把目标窗口切到前台。期望 hwnd=${String(args.hwnd)}，` +
+              `实际 hwnd=${a.foreground}` + (info.name ? `（${info.name}）` : ''),
+          );
+          err.expectedHwnd = String(args.hwnd);
+          err.actualHwnd = a.foreground;
+          err.actualProcess = info.name ?? '';
+          throw err;
+        }
+      }
+      w32.assertForeground(args?.hwnd);
+
       const r = w32.typeUnicode(text);
       if (r.failed) {
         throw new Error(`输入中断：已发送 ${r.sent} 个字符后 SendInput 失败。`);
       }
-      return Promise.resolve({ typed: r.sent });
+      // 回报注入时刻的真实前台，让调用方能核对文本到底进了哪个窗口
+      return Promise.resolve({ typed: r.sent, foreground: w32.foregroundWindow().hwnd });
     },
     presentCall: (args) => ({
       card: 'generic',
