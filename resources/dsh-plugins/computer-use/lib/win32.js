@@ -56,6 +56,7 @@ let koffi = null;
 let user32 = null;
 let gdi32 = null;
 let kernel32 = null;
+let dwmapi = null;
 
 /** 延迟加载：插件被加载但没人调用工具时，不付这份开销 */
 export function ensureWin32() {
@@ -71,6 +72,9 @@ export function ensureWin32() {
   user32 = koffi.load('user32.dll');
   gdi32 = koffi.load('gdi32.dll');
   kernel32 = koffi.load('kernel32.dll');
+  // dwmapi 用来问「这个窗口是不是被 DWM 隐藏了」（UWP 的幽灵窗口）以及拿真实边界。
+  // 拿不到也不致命（老系统/精简系统可能没有），所以单独 try。
+  try { dwmapi = koffi.load('dwmapi.dll'); } catch { dwmapi = null; }
 }
 
 export function isSupported() {
@@ -130,6 +134,10 @@ function funcs() {
     SetActiveWindow: user32.func('intptr_t SetActiveWindow(intptr_t hWnd)'),
     SetFocus: user32.func('intptr_t SetFocus(intptr_t hWnd)'),
     SwitchToThisWindow: user32.func('void SwitchToThisWindow(intptr_t hWnd, bool fUnknown)'),
+    // DWM：窗口是否被隐藏（cloked）、窗口的真实可见边界（去掉阴影边框）
+    DwmGetWindowAttribute: dwmapi
+      ? dwmapi.func('int DwmGetWindowAttribute(intptr_t hwnd, uint32 attr, _Out_ void* pv, uint32 cb)')
+      : null,
   };
   return F;
 }
@@ -149,6 +157,32 @@ function readRect(buf) {
 
 function readPoint(buf) {
   return { x: buf.readInt32LE(0), y: buf.readInt32LE(4) };
+}
+
+/** DWMWA_CLOAKED：0 = 正常显示；1/2/4 = 被 DWM 隐藏（UWP 后台页、最小化的商店应用等） */
+function isCloaked(f, hwnd) {
+  if (!f.DwmGetWindowAttribute) return false; // 没有 dwmapi 时按「未隐藏」处理
+  try {
+    const buf = Buffer.alloc(4);
+    const hr = f.DwmGetWindowAttribute(hwnd, 14, buf, 4);
+    if (hr !== 0) return false;
+    return buf.readUInt32LE(0) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+/** DWMWA_EXTENDED_FRAME_BOUNDS：窗口的**可见**边界（去掉投影与不可见边框），失败返回 null */
+function extendedFrame(f, hwnd) {
+  if (!f.DwmGetWindowAttribute) return null;
+  try {
+    const buf = Buffer.alloc(16);
+    const hr = f.DwmGetWindowAttribute(hwnd, 9, buf, 16);
+    if (hr !== 0) return null;
+    return readRect(buf);
+  } catch {
+    return null;
+  }
 }
 
 function wstr(buf, n) {
@@ -180,6 +214,10 @@ export function listWindows() {
   const cb = koffi.register((hwnd) => {
     try {
       if (!f.IsWindowVisible(hwnd)) return true;
+      // 被 DWM 隐藏的窗口 IsWindowVisible 仍返回 true（UWP 后台页、已关闭的商店应用），
+      // 它们会以「Windows 输入体验」「新通知」之类标题混进列表 —— 实测一次能混进 13 个，
+      // 把真正的窗口淹没。cloked 判定是唯一可靠的过滤手段。
+      if (isCloaked(f, hwnd)) return true;
       const tbuf = Buffer.alloc(1024);
       const tn = f.GetWindowTextW(hwnd, tbuf, 512);
       if (tn <= 0) return true; // 无标题的（工具窗/隐藏窗）跳过
@@ -191,12 +229,17 @@ export function listWindows() {
       f.GetWindowThreadProcessId(hwnd, pbuf);
       const rbuf = Buffer.alloc(16);
       f.GetWindowRect(hwnd, rbuf);
+      const rect = readRect(rbuf);
+      // 零尺寸/1x1 的是消息窗与辅助窗，点不到也没内容，一并滤掉
+      if (rect.right - rect.left <= 0 || rect.bottom - rect.top <= 0) return true;
       out.push({
         hwnd: String(hwnd),
         title,
         className: wstr(cbuf, cn),
         pid: pbuf.readUInt32LE(0),
-        rect: readRect(rbuf),
+        rect,
+        // 真实可见边界（截窗口时用它才不含投影/不可见边框），拿不到就退回 rect
+        frame: extendedFrame(f, hwnd) ?? rect,
         minimized: f.IsIconic(hwnd),
         maximized: f.IsZoomed(hwnd),
       });
@@ -362,22 +405,32 @@ export function capture(opts = {}) {
 
   if (opts.hwnd) {
     const hwnd = BigInt(opts.hwnd);
-    const rbuf = Buffer.alloc(16);
-    if (!f.GetWindowRect(hwnd, rbuf)) throw new Error(`读不到窗口矩形：${opts.hwnd}`);
-    const r = readRect(rbuf);
+    // 优先用 DWM 的真实可见边界（不含投影），拿不到再退回 GetWindowRect
+    const r = extendedFrame(f, hwnd) ?? (() => {
+      const rbuf = Buffer.alloc(16);
+      if (!f.GetWindowRect(hwnd, rbuf)) throw new Error(`读不到窗口矩形：${opts.hwnd}`);
+      return readRect(rbuf);
+    })();
     x = r.left;
     y = r.top;
     w = r.right - r.left;
     h = r.bottom - r.top;
-    srcDC = f.GetWindowDC(hwnd);
-    releaseSrc = () => f.ReleaseDC(hwnd, srcDC);
   } else {
     const s = screenSize();
+    x = 0;
+    y = 0;
     w = s.width;
     h = s.height;
-    srcDC = f.GetDC(0);
-    releaseSrc = () => f.ReleaseDC(0, srcDC);
   }
+
+  // ⚠️ **一律从屏幕 DC 抓**，绝不用 GetWindowDC ——
+  //    现代窗口（Chromium/Electron/WPF/UWP）都是 GPU 合成直接上屏的，窗口自身的 DC 里
+  //    什么都没有：实测对同一个窗口 GetWindowDC 抓到的是 **100% 纯黑**（0/2028928 个非黑像素），
+  //    而屏幕 DC 同一区域 99.2% 有内容。这就是「截指定窗口返回全黑图」的根因。
+  //    代价：窗口被别的窗口遮住时会连遮挡物一起截进来。这是 GDI 的固有限制
+  //    （要避开得用 Windows.Graphics.Capture 或 PrintWindow(PW_RENDERFULLCONTENT)）。
+  srcDC = f.GetDC(0);
+  releaseSrc = () => f.ReleaseDC(0, srcDC);
 
   if (w <= 0 || h <= 0) {
     releaseSrc();
@@ -389,7 +442,8 @@ export function capture(opts = {}) {
   const old = f.SelectObject(memDC, bmp);
   try {
     // SRCCOPY | CAPTUREBLT（CAPTUREBLT 让分层窗口也进画面，否则截图缺内容）
-    const ok = f.BitBlt(memDC, 0, 0, w, h, srcDC, 0, 0, 0x00cc0020 | 0x40000000);
+    // 源坐标用 (x, y)：屏幕 DC 的原点是屏幕左上角，而我们要的是窗口那一块。
+    const ok = f.BitBlt(memDC, 0, 0, w, h, srcDC, x, y, 0x00cc0020 | 0x40000000);
     if (!ok) throw new Error('BitBlt 失败');
 
     // BITMAPINFOHEADER（40 字节）+ 颜色表，负高度 = 自上而下
