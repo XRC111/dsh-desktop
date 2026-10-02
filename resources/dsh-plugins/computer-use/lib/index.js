@@ -84,7 +84,10 @@ const textOut = (props) => ({
 // ---------------------------------------------------------------------------
 
 async function screenshotToContent(ctx, opts) {
-  const cap = w32.capture(opts.hwnd ? { hwnd: opts.hwnd } : {});
+  const cap = w32.capture({
+    ...(opts.hwnd ? { hwnd: opts.hwnd } : {}),
+    ...(opts.grid ? { grid: true } : {}),
+  });
   const label = `screenshot-${new Date().toISOString().replace(/[:.]/g, '-')}.png`;
 
   // 首选：交给 attachment 服务 → image content block（模型原生看图）
@@ -214,6 +217,68 @@ function apply(ctx, config) {
     }),
   }));
 
+  // ── 只读：枚举 UI 元素（精确坐标，治「点偏」）──────────────────────────────
+  ctx.tools.register(defineTool({
+    name: 'screen_elements',
+    description:
+      '列出屏幕上所有**可交互** UI 元素及其**精确屏幕坐标**（来自 UI Automation，误差 0）。' +
+      '**点按钮前先用它拿坐标**，比从截图目测准得多 —— 按钮通常只有 24-32px 高，' +
+      '目测误差 10-40px 必然点偏。返回里 cx/cy 就是可直接传给 mouse_click 的中心点。' +
+      'clickable=true 表示该元素支持 Invoke（能点）。',
+    parameters: {
+      filter: { type: 'string', description: '可选：按名称子串过滤（不区分大小写），如「保存」' },
+      hwnd: { type: 'string', description: '可选：只枚举该窗口内（来自 screen_windows）' },
+      types: { type: 'string', description: '可选：只要这些控件类型，如 Button,Edit,MenuItem' },
+      max: { type: 'integer', description: '最多返回条数，默认 200' },
+    },
+    output: textOut({
+      elements: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            name: { type: 'string' },
+            type: { type: 'string' },
+            x: { type: 'integer' },
+            y: { type: 'integer' },
+            w: { type: 'integer' },
+            h: { type: 'integer' },
+            cx: { type: 'integer' },
+            cy: { type: 'integer' },
+            enabled: { type: 'boolean' },
+            clickable: { type: 'boolean' },
+          },
+        },
+      },
+    }),
+    execute(args) {
+      const list = w32.listElements({
+        filter: args?.filter,
+        hwnd: args?.hwnd,
+        types: args?.types,
+        max: args?.max,
+      });
+      return Promise.resolve({
+        elements: list.map((e) => ({
+          name: String(e.name ?? ''),
+          type: String(e.type ?? ''),
+          x: Number(e.x) | 0, y: Number(e.y) | 0,
+          w: Number(e.w) | 0, h: Number(e.h) | 0,
+          cx: Number(e.cx) | 0, cy: Number(e.cy) | 0,
+          enabled: e.enabled === true,
+          clickable: e.clickable === true,
+        })),
+      });
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: args?.filter ? `列出 UI 元素（匹配「${args.filter}」）` : '列出 UI 元素',
+      kind: 'read',
+      rawInput: args,
+    }),
+  }));
+
   // ── 只读：截屏（受 allowScreenshot，默认开）────────────────────────────────
   if (allowScreenshot) {
   ctx.tools.register(defineTool({
@@ -223,6 +288,13 @@ function apply(ctx, config) {
       '用于观察当前界面状态、确认操作结果。',
     parameters: {
       hwnd: { type: 'string', description: '可选：窗口句柄（来自 screen_windows）' },
+      grid: {
+        type: 'boolean',
+        description:
+          '可选：叠加坐标网格（每 100px 一条线，边缘带刻度数字）。' +
+          '要从截图估坐标时建议打开 —— 可以读数而不是估数。' +
+          '更准的做法是先用 screen_elements 拿精确坐标。',
+      },
     },
     output: {
       schema: {
@@ -249,7 +321,7 @@ function apply(ctx, config) {
       },
     },
     async execute(args) {
-      const r = await screenshotToContent(ctx, { hwnd: args?.hwnd });
+      const r = await screenshotToContent(ctx, { hwnd: args?.hwnd, grid: args?.grid === true });
       const shotId = `shot-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       shots.set(shotId, r);
       return {

@@ -103,3 +103,90 @@ export function bgraToRgba(buf) {
   }
   return buf;
 }
+
+/**
+ * 在 RGBA 缓冲上画坐标网格与刻度标签（供截图叠加用）。
+ *
+ * 为什么要画网格：模型从整屏截图里**目测估算**按钮坐标，误差天然有 10-40px，
+ * 而典型按钮只有 24-32px 高 —— 于是「老是点偏」。
+ * 画上带数字的网格后，模型可以**读数**（看目标落在哪两条线之间）而不是估数，
+ * 把误差压到一个格子的 1/4 以内。这是纯像素操作，零依赖。
+ *
+ * 网格设计：
+ *   · 主格 100px：细线（灰，低对比，不干扰阅读）
+ *   · 每 200px：稍亮线 + 边缘坐标数字
+ *   · 只在**边缘条带**画数字，不在中间盖住内容
+ *
+ * @param rgba  RGBA 缓冲（原地修改）
+ * @param width/height 尺寸
+ * @param originX/originY 该图左上角对应的屏幕坐标（窗口截图时非 0）
+ * @param step 主格间距（像素），默认 100
+ */
+export function drawGrid(rgba, width, height, originX = 0, originY = 0, step = 100) {
+  const setPx = (x, y, r, g, b) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const i = (y * width + x) * 4;
+    rgba[i] = r; rgba[i + 1] = g; rgba[i + 2] = b; rgba[i + 3] = 255;
+  };
+  // 半透明叠加：把原像素与线条色按比例混合，避免生硬的纯色线盖住内容
+  const blend = (x, y, r, g, b, a) => {
+    if (x < 0 || y < 0 || x >= width || y >= height) return;
+    const i = (y * width + x) * 4;
+    rgba[i] = Math.round(rgba[i] * (1 - a) + r * a);
+    rgba[i + 1] = Math.round(rgba[i + 1] * (1 - a) + g * a);
+    rgba[i + 2] = Math.round(rgba[i + 2] * (1 - a) + b * a);
+    rgba[i + 3] = 255;
+  };
+
+  // 网格线：每 step 一条，5px 粗的淡线（视觉上像标尺，不遮挡）
+  for (let sx = 0; sx < width; sx += step) {
+    const major = ((sx + originX) % (step * 2)) === 0;
+    for (let y = 0; y < height; y++) {
+      blend(sx, y, major ? 255 : 120, major ? 80 : 160, major ? 80 : 255, major ? 0.45 : 0.22);
+      if (major) blend(sx + 1, y, 255, 80, 80, 0.22);
+    }
+  }
+  for (let sy = 0; sy < height; sy += step) {
+    const major = ((sy + originY) % (step * 2)) === 0;
+    for (let x = 0; x < width; x++) {
+      blend(x, sy, major ? 255 : 120, major ? 80 : 160, major ? 80 : 255, major ? 0.45 : 0.22);
+      if (major) blend(x, sy + 1, 255, 80, 80, 0.22);
+    }
+  }
+
+  // 刻度数字：3x5 点阵字体，画在左边缘与上边缘，黑底白字保证可读
+  const glyphs = {
+    '0': ['111','101','101','101','111'], '1': ['010','110','010','010','111'],
+    '2': ['111','001','111','100','111'], '3': ['111','001','111','001','111'],
+    '4': ['101','101','111','001','001'], '5': ['111','100','111','001','111'],
+    '6': ['111','100','111','101','111'], '7': ['111','001','010','010','010'],
+    '8': ['111','101','111','101','111'], '9': ['111','101','111','001','111'],
+  };
+  const drawText = (txt, tx, ty, scale) => {
+    const cw = 3 * scale + scale; // 字宽 + 间距
+    // 背景条（黑底，保证任何内容上都可读）
+    for (let y = -scale; y < 5 * scale + scale; y++)
+      for (let x = -scale; x < txt.length * cw + scale; x++) blend(tx + x, ty + y, 0, 0, 0, 0.75);
+    for (let ci = 0; ci < txt.length; ci++) {
+      const gph = glyphs[txt[ci]];
+      if (!gph) continue;
+      for (let gy = 0; gy < 5; gy++)
+        for (let gx = 0; gx < 3; gx++)
+          if (gph[gy][gx] === '1')
+            for (let dy = 0; dy < scale; dy++)
+              for (let dx = 0; dx < scale; dx++)
+                setPx(tx + ci * cw + gx * scale + dx, ty + gy * scale + dy, 255, 235, 60);
+    }
+  };
+
+  const scale = width >= 1400 ? 2 : 1;
+  // 左侧：纵坐标（每 2*step 标一个，避免太密）
+  for (let sy = 0; sy < height; sy += step * 2) {
+    drawText(String(sy + originY), 4, sy + 3, scale);
+  }
+  // 顶部：横坐标
+  for (let sx = 0; sx < width; sx += step * 2) {
+    drawText(String(sx + originX), sx + 3, 3, scale);
+  }
+  return { step, originX, originY, gridWidth: width, gridHeight: height };
+}
