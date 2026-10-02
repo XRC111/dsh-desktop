@@ -51,8 +51,8 @@
     "deploy:r2": "node scripts/deploy-r2.mjs",
     "gen:manifest": "node scripts/gen-runtime-manifest.mjs",
     "start": "npm run build && electron .",
-    "pack": "npm run build && node scripts/prepare-tools.mjs && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs",
-    "dist": "npm run build && node scripts/prepare-tools.mjs && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 && node scripts/prepare-payload.mjs && electron-builder --win nsis --x64 --prepackaged dist/win-unpacked",
+    "pack": "npm run build && node scripts/prepare-tools.mjs && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 --publish never && node scripts/prepare-payload.mjs",
+    "dist": "npm run build && node scripts/prepare-tools.mjs && node scripts/pack-runtime.mjs && node scripts/gen-runtime-manifest.mjs && electron-builder --win dir --x64 --publish never && node scripts/prepare-payload.mjs && electron-builder --win nsis --x64 --publish never --prepackaged dist/win-unpacked",
     "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {

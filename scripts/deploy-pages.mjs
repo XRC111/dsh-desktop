@@ -105,7 +105,9 @@ for (const name of KNOWN_FEEDS) {
 }
 
 for (const f of feedFiles) if (!fs.existsSync(f)) die(`找不到更新 JSON：${f}`);
-if (!fs.existsSync(wrangler)) die(`找不到 wrangler：${wrangler}`);
+// --stage-only / --dry-run 根本不会调用 wrangler（CI 上没有本机那份，上传交给外部脚本
+// 用 npx wrangler 做），所以这两种模式下不该因为它不存在而中止。
+if (!stageOnly && !dryRun && !fs.existsSync(wrangler)) die(`找不到 wrangler：${wrangler}`);
 
 // 每个通道一份：文件名即通道（latest.json / latest-beta.json / latest-dev.json）
 const feeds = feedFiles.map((file) => ({
