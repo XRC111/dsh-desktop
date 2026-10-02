@@ -5,7 +5,17 @@
 # 而 nightly 要跟 master 的最新提交走。官方 npm 上没有 nightly 标签
 # （实测 dist-tags 只有 alpha / latest / next），所以只能自己从源码编。
 #
-# 编译链（scripts/fetch-nightly.mjs 封装，已本机实测跑通）：
+# ── nightly 只构建，什么都不发 ──────────────────────────────────────────────
+# 产物进 Actions artifact（保留 14 天），由人按需下载试跑。**刻意不做**：
+#   · 不发 GitHub Release —— nightly 每天一个包，堆 Release 没意义；
+#   · 不打热壳 —— nightly 用户本来就该整包换；
+#   · 不生成、不部署 feed —— 没有 feed 就没有「把线上 feed 弄坏」的可能。
+# （历史教训：早期版本复用六通道发版脚本 release-v2.ps1，结果它会用默认版本号
+#   （10.1.0/7.1.0…）把另外六份 feed 重新生成成空骨架；又要求本机 wrangler 目录
+#   而在 CI 上直接 throw；还因为 electron-builder 的 CI 隐式 publish 没有 GH_TOKEN
+#   而 exit=1。所以现在 nightly 走独立的 scripts/release-nightly.ps1。）
+#
+# ── 编译链（scripts/fetch-nightly.mjs 封装，已本机实测跑通）──────────────────
 #   clone master（runner 在美国 → 直连 github.com；本地才走镜像）
 #   → pnpm install --frozen-lockfile（4.3min，需重试抗超时）
 #   → pnpm run build（**要求 git 在 PATH**，构建期要 git rev-parse HEAD）
@@ -18,7 +28,7 @@
 #
 # ── 触发 ────────────────────────────────────────────────────────────────────
 #   1) 定时：每天 UTC 18:00（北京时间次日 02:00）
-#   2) 手动：Actions → nightly → Run workflow（可只构建不发布）
+#   2) 手动：Actions → nightly → Run workflow
 name: nightly
 
 on:
@@ -30,17 +40,13 @@ on:
         description: 'nightly 外壳版本号（留空 = 自动用 10.4.<运行号>）'
         required: false
         default: ''
-      publish:
-        description: '是否发布（部署 feed）。关掉 = 只构建验证'
-        type: boolean
-        default: true
 
 concurrency:
   group: nightly
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 # ⚠️ runner 在**美国**：把所有上游显式指回官方。
 #    仓库里的 .npmrc 指向国内镜像（给本机构建用），而 npm 的优先级是
@@ -100,105 +106,27 @@ jobs:
         id: upstream
         shell: pwsh
         run: |
-          $p = 'resources/dsh-runtime/package.json'
-          $j = Get-Content $p -Raw | ConvertFrom-Json
+          $j = Get-Content 'resources/dsh-runtime/package.json' -Raw | ConvertFrom-Json
           $sha = $j.dshNightly.commit
-          $up = $j.dshNightly.upstreamVersion
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "short=$($sha.Substring(0,7))" >> $env:GITHUB_OUTPUT
-          "upstream=$up" >> $env:GITHUB_OUTPUT
-          Write-Host "上游 $up @ $($sha.Substring(0,7))"
+          "upstream=$($j.dshNightly.upstreamVersion)" >> $env:GITHUB_OUTPUT
+          Write-Host "上游 $($j.dshNightly.upstreamVersion) @ $($sha.Substring(0,7))"
 
-      # ── 构建外壳安装包 ──────────────────────────────────────────────────────
       - name: 生成图标资源
         shell: pwsh
         run: npm run gen:assets
 
+      # ── 构建安装包（唯一的重活）──────────────────────────────────────────────
       - name: 构建 nightly 安装包
         shell: pwsh
         run: |
-          # 只构建 nightly 一条通道，其余全跳过。
-          # nightly 用主线 stable 之外的独立 minor（10.4.x），避免与既有通道撞号。
-          powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
-            -SkipStable -SkipBeta -SkipDev `
-            -SkipW7 -SkipW7Beta -SkipW7Dev `
-            -SkipGen -SkipWrangler `
-            -NightlyVersion '${{ steps.v.outputs.version }}'
+          # 独立脚本：只构建，不发 Release、不打热壳、不碰 feed。
+          # 它会自检运行时树确实是 nightly（package.json 里有 dshNightly 段）。
+          pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-nightly.ps1 `
+            -Version '${{ steps.v.outputs.version }}'
 
-      - name: 自检安装包
-        shell: pwsh
-        run: |
-          $f = 'dist/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe'
-          if (-not (Test-Path $f)) { throw "安装包没构建出来：$f" }
-          Write-Host ("  {0}  {1:N1} MB" -f $f, ((Get-Item $f).Length/1MB))
-
-      # ── 发布 ────────────────────────────────────────────────────────────────
-      # 每次发版用**自己的** release（tag = 日期-序号，如 2026.10.01-1）。
-      - name: 算本次的 release tag
-        if: ${{ inputs.publish != false }}
-        id: tag
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = (node scripts/release-tag.mjs).Trim()
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          Write-Host "本次 release tag = $tag"
-
-      - name: 上传安装包到 Release
-        if: ${{ inputs.publish != false }}
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          $tag = '${{ steps.tag.outputs.tag }}'
-          $f = 'dist/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe'
-          $notes = "nightly ${{ steps.v.outputs.version }}（上游 dsh ${{ steps.upstream.outputs.upstream }} @ ${{ steps.upstream.outputs.short }}）"
-          gh release create $tag --title $tag --notes $notes
-          gh release upload $tag $f
-
-      - name: 生成 nightly feed
-        if: ${{ inputs.publish != false }}
-        shell: pwsh
-        run: |
-          # 外链指向**本次自己的** release（tag = 日期-序号）
-          $base = 'https://gh-proxy.com/https://github.com/${{ github.repository }}/releases/download/${{ steps.tag.outputs.tag }}'
-          # -SkipWrangler：本步只生成 + 暂存（CI 上没有本机的 wrangler 目录，
-          #   不加这个开关自检阶段就会 throw「找不到 wrangler」）。真正上传在下一步。
-          # 其余六个 -SkipXxx：**同时跳过那六份 feed 的生成** —— 否则会用默认版本号
-          #   （10.1.0/7.1.0 之类）把它们覆盖成空骨架，再被整目录替换推到线上。
-          powershell -ExecutionPolicy Bypass -File scripts/release-v2.ps1 `
-            -SkipStable -SkipBeta -SkipDev `
-            -SkipW7 -SkipW7Beta -SkipW7Dev `
-            -SkipPack -SkipWrangler `
-            -NightlyVersion '${{ steps.v.outputs.version }}' `
-            -SetupUrlNightly "$base/DSH-Desktop-Setup-${{ steps.v.outputs.version }}.exe"
-
-      - name: 部署 nightly feed
-        if: ${{ inputs.publish != false }}
-        shell: pwsh
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: |
-          if (-not $env:CLOUDFLARE_API_TOKEN) {
-            Write-Host '::warning::未配置 CLOUDFLARE_API_TOKEN，跳过 feed 部署'
-            exit 0
-          }
-          # 六份 feed 一次传（Pages 是整目录替换，缺一份会覆盖掉线上的）
-          $feeds = @('latest.json','latest-beta.json','latest-dev.json',
-                     'latest-nightly.json','latest-w7.json','latest-w7-beta.json','latest-w7-dev.json')
-          $args = @('scripts/deploy-pages.mjs','--project','dsh-desktop-feed','--base-url','https://dl.666-xrc.cc.cd')
-          foreach ($f in $feeds) {
-            $p = "dist/update/$f"
-            if (Test-Path $p) { $args += @('--feed', $p) }
-            else { Write-Host "::warning::缺 $p（跳过）" }
-          }
-          $args += '--stage-only'
-          node @args
-          $stage = (Get-Content 'dist/update/.stage-dir' -Raw).Trim()
-          npx --yes wrangler@4 pages deploy "$stage" --project-name dsh-desktop-feed --branch main --commit-dirty=true
-
+      # ── 归档 ────────────────────────────────────────────────────────────────
       - name: 归档产物
         if: always()
         uses: actions/upload-artifact@v4
@@ -206,8 +134,7 @@ jobs:
           name: nightly-${{ steps.v.outputs.version }}-${{ steps.upstream.outputs.short }}
           path: |
             dist/DSH-Desktop-Setup-*.exe
-            dist/update/latest-nightly.json
-            build/hot-shell-*.tar
+            dist/DSH-Desktop-Setup-*.exe.blockmap
           retention-days: 14
           if-no-files-found: warn
 
@@ -219,4 +146,5 @@ jobs:
           Write-Host "  外壳版本   = ${{ steps.v.outputs.version }}"
           Write-Host "  上游 dsh   = ${{ steps.upstream.outputs.upstream }}"
           Write-Host "  上游提交   = ${{ steps.upstream.outputs.short }}"
-          Write-Host "  发布       = ${{ inputs.publish }}"
+          Write-Host '  产物       = Actions 页面本次 run 的 Artifacts（保留 14 天）'
+          Write-Host '  说明       = nightly 只构建验证，不发布 Release、不生成 feed'
