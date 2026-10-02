@@ -15,6 +15,11 @@
     由人按需下载试跑。所以这里刻意什么都不发 —— 没有 feed 就没有「把线上 feed
     弄坏」的可能，这是 nightly 最该保证的事。
 
+    两条线都构建（与主线发版一致）：
+      主线 10.4.x  → 官方 Electron 44（Win10/11）
+      w7   7.4.x   → 社区 fork + 宿主指纹补丁（Windows 7）
+    Win7 用户不该因为「没有 nightly」被落下；两条线同一天构建，版本号一一对应。
+
     通道说明：本脚本**不动** resources/update-config.json 的 channel（保持 stable）。
     因为 nightly 没有自己的 feed，写 nightly 只会让壳去轮询一个不存在的地址；
     保持 stable 则 nightly 包仍能正常收到插件热更，只是壳版本 10.4.x > 10.1.x，
@@ -37,6 +42,12 @@ param(
     # 运行时树（必须是 fetch-nightly.mjs 编出来的：package.json 里有 dshNightly 段）
     [string]$RuntimeDir = 'resources\dsh-runtime',
 
+    # 跳过 w7 线（只构建主线）。fork 下载失败时可临时用。
+    [switch]$SkipW7,
+
+    # w7 外壳版本号。留空则由主线推导：10.4.9 -> 7.4.9
+    [string]$W7Version = '',
+
     # 构建完不回滚 package.json 的版本（CI 上无所谓；本机建议别加）
     [switch]$KeepVersion
 )
@@ -54,6 +65,7 @@ Set-Location $root
 Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 
 $PkgPath = Join-Path $root 'package.json'
+$CfgPath = Join-Path $root 'resources\update-config.json'
 $RtDir   = Join-Path $root $RuntimeDir
 
 # JSON 字段改写（正则定位、保留 BOM 与原格式，幂等：值相同则跳过）
@@ -85,11 +97,20 @@ if (-not $Version) {
 
 $origPkgVer = Get-JsonField $PkgPath '(?m)^(\s*"version":\s*")([^"]*)(")'
 $origDshVer = Get-JsonField $PkgPath '("dshVersion":\s*")([^"]*)(")'
+$origChannel = Get-JsonField $CfgPath '("channel":\s*")([^"]*)(")'
+$CfgW7Path = Join-Path $root 'resources\update-config.w7.json'
+$CfgBak    = Join-Path $root 'build\.update-config.mainline.bak'
+
+if (-not $W7Version) {
+    # 10.4.9 -> 7.4.9：patch 位对齐，minor 换成 w7 线的 7
+    $parts = $Version.Split('.')
+    if ($parts.Count -ge 3) { $W7Version = '7.4.' + $parts[2] } else { $W7Version = '7.4.0' }
+}
 
 try {
 
 # ---------------------------------------------------------------------------
-Step "0/3 自检（nightly 外壳 $Version）"
+Step "0/5 自检（nightly 外壳 $Version / w7 $W7Version）"
 # ---------------------------------------------------------------------------
 $rtPkg = Join-Path $RtDir 'package.json'
 if (-not (Test-Path -LiteralPath $rtPkg)) {
@@ -105,7 +126,7 @@ $dshNightly = $info.upstreamVersion + '+nightly.' + $info.commit.Substring(0,7)
 Ok "上游 dsh $($info.upstreamVersion) @ $($info.commit.Substring(0,7))（内嵌 $dshNightly）"
 
 # ---------------------------------------------------------------------------
-Step "1/3 构建安装包 $Version"
+Step "1/5 构建主线安装包 $Version"
 # ---------------------------------------------------------------------------
 # config.dshVersion 写**运行时实际版本**（带 +nightly.<sha>）：壳靠它上报内嵌 dsh 版本。
 Set-JsonField $PkgPath '(?m)^(\s*"version":\s*")([^"]*)(")' $Version 'package.json version'
@@ -115,7 +136,77 @@ Info 'npm run dist 开始（数分钟）…'
 if ($LASTEXITCODE -ne 0) { throw "npm run dist 失败（exit=$LASTEXITCODE）" }
 
 # ---------------------------------------------------------------------------
-Step '2/3 自检产物'
+Step "2/5 构建 w7 安装包 $W7Version（fork Electron，Win7 用）"
+# ---------------------------------------------------------------------------
+if ($SkipW7) {
+    Warn '跳过 w7 线（-SkipW7）'
+} else {
+    # fork Electron 必须就位且已打宿主指纹补丁（dsh 0.1.7 起有指纹白名单，不打补丁会拒绝启动）
+    $w7Exe = Join-Path $root 'build\electron-win7\electron.exe'
+    if (-not (Test-Path -LiteralPath $w7Exe)) {
+        Info 'fork Electron 缺失 → 下载 build/electron-win7'
+        & node scripts\fetch-w7-electron.mjs
+        if ($LASTEXITCODE -ne 0) { throw "fetch-w7-electron.mjs 失败（exit=$LASTEXITCODE）" }
+    }
+    $patchPy = Join-Path $root 'scripts\patch-w7-electron.py'
+    if ((Test-Path -LiteralPath $w7Exe) -and (Test-Path -LiteralPath $patchPy)) {
+        # 幂等判定：已打补丁的 exe 里 .19 应为 0 处、.13 应为 4 处
+        $txt = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($w7Exe))
+        $n13 = ([regex]::Matches($txt, '15\.2\.124\.13-electron\.0')).Count
+        $n19 = ([regex]::Matches($txt, '15\.2\.124\.19-electron\.0')).Count
+        if ($n19 -gt 0 -or $n13 -lt 4) {
+            Info "fork 指纹未打补丁（.13 命中 $n13 / .19 残留 $n19）→ 跑 patch-w7-electron.py"
+            $py = Get-Command python -ErrorAction SilentlyContinue
+            if (-not $py) { throw '找不到 python（打 fork 指纹补丁需要它；见 scripts/patch-w7-electron.py）' }
+            & python $patchPy $w7Exe
+            if ($LASTEXITCODE -ne 0) { throw "patch-w7-electron.py 失败（exit=$LASTEXITCODE）" }
+            $txt2 = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($w7Exe))
+            $c13 = ([regex]::Matches($txt2, '15\.2\.124\.13-electron\.0')).Count
+            $c19 = ([regex]::Matches($txt2, '15\.2\.124\.19-electron\.0')).Count
+            if ($c19 -ne 0 -or $c13 -lt 4) { throw "补丁后指纹仍不对：.13=$c13 .19=$c19" }
+            Ok 'fork 指纹补丁完成'
+        } else {
+            Info 'fork 指纹已就绪（.13 ×4 / .19 ×0），跳过补丁'
+        }
+    }
+
+    # electronDist 必须写进 package.json 的 **build 段**，放顶层会被静默忽略
+    # （那样 w7 包会误用官方 Electron，Win7 上提示「不是有效的 Win32 应用程序」）
+    $rawPkg = [System.IO.File]::ReadAllText($PkgPath)
+    if ($rawPkg -notmatch '"electronDist"') {
+        $m = [regex]::Match($rawPkg, '(?m)^(\s*)"build":\s*\{\s*\r?\n(\s*)"')
+        if (-not $m.Success) { throw 'package.json 找不到 build 段（electronDist 插入点）' }
+        $indent = $m.Groups[2].Value
+        $ins = $indent + '"electronDist": "build/electron-win7",' + "`r`n"
+        $pos = $m.Groups[2].Index
+        [System.IO.File]::WriteAllText($PkgPath, $rawPkg.Substring(0, $pos) + $ins + $rawPkg.Substring($pos), (New-Object System.Text.UTF8Encoding($false)))
+        $chk = [System.IO.File]::ReadAllText($PkgPath)
+        if (-not [regex]::IsMatch($chk, '(?s)"build"\s*:\s*\{[^}]*"electronDist"')) {
+            throw 'electronDist 未落进 build 段（这会让 w7 误用官方 Electron）'
+        }
+        Ok 'package.json build.electronDist = build/electron-win7'
+    }
+
+    Copy-Item -LiteralPath $CfgPath -Destination $CfgBak -Force      # 备份主线更新源
+    Copy-Item -LiteralPath $CfgW7Path -Destination $CfgPath -Force   # 换 w7 模板（指向 latest-w7*.json）
+    try {
+        Set-JsonField $PkgPath '(?m)^(\s*"version":\s*")([^"]*)(")' $W7Version 'package.json version（w7）'
+        # w7 线内嵌的仍是同一天编出来的 nightly 运行时（latest 线，不换血）
+        Info "w7 $W7Version：electronDist=fork，npm run dist 开始（数分钟）…"
+        & npm run dist
+        if ($LASTEXITCODE -ne 0) { throw "w7 npm run dist 失败（exit=$LASTEXITCODE）" }
+    } finally {
+        Copy-Item -LiteralPath $CfgBak -Destination $CfgPath -Force
+        $raw2 = [System.IO.File]::ReadAllText($PkgPath)
+        $new2 = [regex]::Replace($raw2, '(?m)^\s*"electronDist":\s*"[^"]*",\s*\r?\n', '')
+        if ($new2 -ne $raw2) { [System.IO.File]::WriteAllText($PkgPath, $new2, (New-Object System.Text.UTF8Encoding($false))) }
+    }
+    $w7Out = Join-Path $root "dist\DSH-Desktop-Setup-$W7Version.exe"
+    if (-not (Test-Path -LiteralPath $w7Out)) { throw "w7 构建产物缺失：$w7Out" }
+    Ok "DSH-Desktop-Setup-$W7Version.exe  $([math]::Round((Get-Item -LiteralPath $w7Out).Length / 1MB, 1)) MB"
+}
+# ---------------------------------------------------------------------------
+Step '3/5 自检产物'
 # ---------------------------------------------------------------------------
 $exe = Join-Path $root "dist\DSH-Desktop-Setup-$Version.exe"
 if (-not (Test-Path -LiteralPath $exe)) { throw "构建产物缺失：$exe" }
@@ -132,15 +223,17 @@ if (Test-Path -LiteralPath $unpacked) {
 }
 
 # ---------------------------------------------------------------------------
-Step '3/3 完成（nightly 只构建，不发 Release / 不打热壳 / 不部署 feed）'
+Step '4/5 汇总（nightly 只构建，不发 Release / 不打热壳 / 不部署 feed）'
 # ---------------------------------------------------------------------------
-Info "产物：$exe"
+Info "主线产物：$exe"
+if (-not $SkipW7) { Info "w7  产物：dist\DSH-Desktop-Setup-$W7Version.exe" }
 Info '下载：Actions 页面的本次 run → Artifacts'
 } finally {
     if (-not $KeepVersion) {
         try {
             if ($origPkgVer) { Set-JsonField $PkgPath '(?m)^(\s*"version":\s*")([^"]*)(")' $origPkgVer 'package.json version（回滚）' }
             if ($origDshVer) { Set-JsonField $PkgPath '("dshVersion":\s*")([^"]*)(")' $origDshVer 'config.dshVersion（回滚）' }
+            if ($origChannel -and (Test-Path -LiteralPath $CfgPath)) { Set-JsonField $CfgPath '("channel":\s*")([^"]*)(")' $origChannel 'update-config channel（回滚）' }
         } catch { Warn "回滚失败：$($_.Exception.Message)" }
     }
 }

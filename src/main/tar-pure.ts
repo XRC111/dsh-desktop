@@ -87,6 +87,42 @@ export function extractTarPure(tarFile: string, destDir: string): Promise<void> 
       name = name.replace(/^\.\//, '');
       if (!name || name.includes('..') || path.isAbsolute(name)) continue;
 
+      // 链接条目（'1' 硬链接 / '2' 符号链接）：pnpm 布局的 node_modules 里大量包是
+      // 符号链接，漏掉会让解出来的树**静默缺包**（实测 nightly 装完 dsh 起不来，
+      // 报 Cannot find package 'semver'）。所以必须建出来，不能跳过。
+      if (type === '1' || type === '2') {
+        const linkName = readStr(header, 157, 100);
+        if (!linkName) continue;
+        const dest = path.join(destDir, ...name.split('/'));
+        fs.mkdirSync(path.dirname(dest), { recursive: true });
+        try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* 无则跳过 */ }
+        if (type === '1') {
+          const srcAbs = path.join(destDir, ...linkName.replace(/^\.\//, '').split('/'));
+          try { fs.copyFileSync(srcAbs, dest); } catch { /* 目标未解出：留到下一轮 */ }
+        } else {
+          // 目标可能是打包机的**绝对路径**（Windows bsdtar 写成 //?/D:/…）——
+          // 照建就是断链，要归一到「树内相对路径」。
+          let rel = linkName.replace(/^\/\/\?\//, '').replace(/\\/g, '/');
+          if (/^[A-Za-z]:\//.test(rel)) {
+            const segs = rel.replace(/^[A-Za-z]:\//, '').split('/').filter(Boolean);
+            const at = segs.indexOf(name.split('/')[0]);
+            const rootRel = at >= 0 ? segs.slice(at).join('/') : segs[segs.length - 1];
+            rel = path.relative(path.dirname(dest), path.join(destDir, rootRel)).replace(/\\/g, '/');
+          }
+          try {
+            fs.symlinkSync(rel, dest, 'file');
+          } catch {
+            // 无符号链接权限时退化成复制目标内容
+            const tgt = path.resolve(path.dirname(dest), rel);
+            try {
+              if (fs.statSync(tgt).isDirectory()) fs.cpSync(tgt, dest, { recursive: true, force: true });
+              else fs.copyFileSync(tgt, dest);
+            } catch { /* 留到下一轮 */ }
+          }
+        }
+        continue;
+      }
+
       const dest = path.join(destDir, ...name.split('/'));
       if (type === '5') {
         fs.mkdirSync(dest, { recursive: true });

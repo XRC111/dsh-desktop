@@ -144,11 +144,15 @@ function readTarIndex(file) {
         fs.readSync(fd, buf, 0, dataSize, dataStart);
         const p = parsePaxPath(buf);
         if (p) pendingName = p;
-      } else if (typeFlag === '0' || typeFlag === '\0' || typeFlag === '' || typeFlag === '5') {
+      } else if (typeFlag === '0' || typeFlag === '\0' || typeFlag === '' || typeFlag === '5' ||
+                 typeFlag === '1' || typeFlag === '2') {
         const name = pendingName || (prefix ? `${prefix}/${rawName}` : rawName);
         // 目录条目（typeflag '5'）也一并收进来：文件清单只记文件，但 tar 全量解压
         // 会重建空目录，少了它们就与旧流程有细微差异。目录不参与校验（见 verify）。
-        if (name) entries.push({ name, size: dataSize, dir: typeFlag === '5' });
+        // 链接条目（'1' 硬链接 / '2' 符号链接）也要收：pnpm 布局的 node_modules 里
+        // 大量包是符号链接，漏掉它们会让装出来的运行时**静默缺包**（实测 nightly
+        // 10.4.8 起不来，报 Cannot find package 'semver'）。
+        if (name) entries.push({ name, size: dataSize, dir: typeFlag === '5', link: typeFlag });
         pendingName = '';
       } else {
         pendingName = '';
@@ -244,13 +248,54 @@ function extractTarPure(tarFile, destDir, wanted, onProgress) {
         if (p && typeFlag === 'x') pendingName = p;
         pos = dataStart + dataBlocks * BLOCK; continue;
       }
-      if (typeFlag !== '0' && typeFlag !== '\0' && typeFlag !== '' && typeFlag !== '5') {
+      if (typeFlag !== '0' && typeFlag !== '\0' && typeFlag !== '' && typeFlag !== '5' &&
+          typeFlag !== '1' && typeFlag !== '2') {
         pendingName = ''; pos = dataStart + dataBlocks * BLOCK; continue;
       }
       const name = pendingName || (prefix ? prefix + '/' + rawName : rawName);
       pendingName = '';
       if (wanted && !wanted.has(name)) { pos = dataStart + dataBlocks * BLOCK; continue; }
       if (typeFlag === '5') { ensureDir(path.join(destDir, name)); pos = dataStart + dataBlocks * BLOCK; continue; }
+      // 链接条目：'2' 符号链接 / '1' 硬链接。pnpm 布局里 node_modules 大量用符号链接，
+      // 漏掉就会**静默缺包**（实测 nightly 装完 dsh 起不来）。
+      if (typeFlag === '1' || typeFlag === '2') {
+        const linkName = readString(block, 157, 100);
+        if (!linkName) { pendingName = ''; pos = dataStart + dataBlocks * BLOCK; continue; }
+        const abs2 = path.join(destDir, name);
+        ensureDir(path.dirname(abs2));
+        try { fs.rmSync(abs2, { recursive: true, force: true }); } catch { /* 无则跳过 */ }
+        if (typeFlag === '1') {
+          // 硬链接：tar 里存的是「相对归档根」的名字，直接复制已解出的目标
+          const srcAbs = path.join(destDir, linkName.replace(/^\.\//, ''));
+          try { fs.copyFileSync(srcAbs, abs2); } catch { /* 目标还没解出来：留到下一轮 */ }
+        } else {
+          // 符号链接：tar 里存的目标可能是相对路径，也可能是**打包机的绝对路径**
+          // （Windows 的 bsdtar 会写成 //?/D:/code/symtest/src/rt/real）—— 后者在目标机上
+          // 根本不存在，直接照建就是断链。所以要把它归一到「树内相对路径」：
+          //   去掉 //?/ 前缀与盘符，再从右往左找与**条目路径首段**重合的位置，
+          //   那一段就是打包根在树内的对应物。
+          let rel = linkName.replace(/^\/\/\?\//, '').replace(/\\/g, '/');
+          if (/^[A-Za-z]:\//.test(rel)) {
+            const segs = rel.replace(/^[A-Za-z]:\//, '').split('/').filter(Boolean);
+            const firstSeg = name.split('/')[0];
+            const at = segs.indexOf(firstSeg);
+            const rootRel = at >= 0 ? segs.slice(at).join('/') : segs[segs.length - 1];
+            rel = path.relative(path.dirname(abs2), path.join(destDir, rootRel)).replace(/\\/g, '/');
+          }
+          try {
+            fs.symlinkSync(rel, abs2, 'file');
+          } catch (e) {
+            // Windows 非开发者模式/无权限时建不了符号链接：退化成复制目标内容（最稳的兜底）
+            const tgt = path.resolve(path.dirname(abs2), rel);
+            try {
+              const st = fs.statSync(tgt);
+              if (st.isDirectory()) fs.cpSync(tgt, abs2, { recursive: true, force: true });
+              else fs.copyFileSync(tgt, abs2);
+            } catch { /* 目标还没解出来：留到下一轮 */ }
+          }
+        }
+        pos = dataStart + dataBlocks * BLOCK; continue;
+      }
       const abs = path.join(destDir, name);
       ensureDir(path.dirname(abs));
       const out = fs.openSync(abs, 'w');
@@ -336,6 +381,11 @@ function verify(entries) {
     if (e.dir) continue; // 目录由 tar 按需创建，不单独校验
     const abs = path.join(opts.dest, ...e.name.split('/'));
     try {
+      // 链接条目（e.link）要用 lstat：stat 会跟随链接，断链会误判为缺失
+      if (e.link) {
+        fs.lstatSync(abs);
+        continue;
+      }
       if (!fs.statSync(abs).isFile()) missing.push(e.name);
     } catch {
       missing.push(e.name);

@@ -134,10 +134,20 @@ const pkg = JSON.parse(fs.readFileSync(path.join(srcDir, 'apps', 'cli', 'package
 log('上游版本 ' + pkg.version + ' @ ' + shortSha);
 
 // ── 2) 安装依赖 ─────────────────────────────────────────────────────────────
-log('pnpm install --frozen-lockfile（最多 3 次）');
+// ⚠️ 必须用 **hoisted** 链接器：pnpm 默认的 isolated 布局把 node_modules 里每个包
+//    都做成指向 .pnpm/ 的**符号链接**，而我们的运行时分发链（bsdtar 打包 → 纯 JS 解压）
+//    只处理普通文件与目录 —— 符号链接会被**静默丢掉**，装出来的运行时缺一堆包。
+//    实测：nightly 10.4.8 装完后 dsh 起不来，报
+//      Cannot find package 'semver' imported from .../dsh-app-boot/lib/index.js
+//    （semver 正是被丢掉的符号链接之一）。hoisted 产出的是 npm 那种扁平真目录，
+//    与主线 resources/dsh-runtime 形态一致 —— 主线树里符号链接数为 0。
+log('pnpm install --frozen-lockfile --config.node-linker=hoisted（最多 3 次）');
 let installOk = false;
 for (let i = 1; i <= 3; i++) {
-  const code = run('pnpm', ['install', '--frozen-lockfile', '--reporter=append-only'], {
+  const code = run(
+    'pnpm',
+    ['install', '--frozen-lockfile', '--config.node-linker=hoisted', '--reporter=append-only'],
+    {
     cwd: srcDir,
     env: {
       ...process.env,
@@ -147,7 +157,8 @@ for (let i = 1; i <= 3; i++) {
       npm_config_fetch_retry_mintimeout: '20000',
       npm_config_fetch_retry_maxtimeout: '120000',
     },
-  });
+    },
+  );
   if (code === 0) { installOk = true; break; }
   log('第 ' + i + ' 次 install 失败（exit=' + code + '），重试…');
 }
@@ -221,6 +232,15 @@ fs.mkdirSync(dshDir, { recursive: true });
 fs.copyFileSync(path.join(srcDir, 'apps', 'cli', 'package.json'), path.join(dshDir, 'package.json'));
 copyTree(path.join(srcDir, 'apps', 'cli', 'lib'), path.join(dshDir, 'lib'));
 
+// 组装自检：整棵树里不允许有符号链接 —— 打包/解压链会丢掉它们（见上面 hoisted 的说明）。
+// 这里提前失败，别等用户在安装器里撞上 ERR_MODULE_NOT_FOUND。
+const links = findSymlinks(path.join(targetDir, 'node_modules'), 5);
+if (links.length) {
+  die('组装后的 node_modules 里仍有符号链接（打包会被静默丢弃）：' + links.join(' | ') +
+      '\n  → pnpm install 必须带 --config.node-linker=hoisted，且 workspace 包要被物化。');
+}
+log('  自检通过：node_modules 无符号链接');
+
 const nightlyVersion = pkg.version + '+nightly.' + shortSha;
 fs.writeFileSync(
   path.join(targetDir, 'package.json'),
@@ -248,6 +268,25 @@ log('  入口 ' + path.relative(root, checkBin));
 if (!keepSrc) {
   log('清理源码树（--keep-src 可保留）');
   fs.rmSync(srcDir, { recursive: true, force: true });
+}
+
+/** 找符号链接（最多返回 limit 个，够报错用就行） */
+function findSymlinks(dir, limit = 5) {
+  const out = [];
+  const stack = [dir];
+  while (stack.length && out.length < limit) {
+    const d = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      let st;
+      try { st = fs.lstatSync(p); } catch { continue; }
+      if (st.isSymbolicLink()) { out.push(p); if (out.length >= limit) break; continue; }
+      if (e.isDirectory()) stack.push(p);
+    }
+  }
+  return out;
 }
 
 /** 递归找含 package.json 的包目录（深度 3，覆盖 packages/x/y 与 vendor/x） */

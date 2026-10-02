@@ -118,11 +118,13 @@ jobs:
         run: npm run gen:assets
 
       # ── 构建安装包（唯一的重活）──────────────────────────────────────────────
-      - name: 构建 nightly 安装包
+      - name: 构建 nightly 安装包（主线 + w7）
         shell: pwsh
         run: |
           # 独立脚本：只构建，不发 Release、不打热壳、不碰 feed。
           # 它会自检运行时树确实是 nightly（package.json 里有 dshNightly 段）。
+          # 主线 10.4.x（官方 Electron）与 w7 7.4.x（fork + 指纹补丁）两条线都出，
+          # 免得 Win7 用户被「没有 nightly」落下。
           pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/release-nightly.ps1 `
             -Version '${{ steps.v.outputs.version }}'
 
@@ -147,4 +149,5 @@ jobs:
           Write-Host "  上游 dsh   = ${{ steps.upstream.outputs.upstream }}"
           Write-Host "  上游提交   = ${{ steps.upstream.outputs.short }}"
           Write-Host '  产物       = Actions 页面本次 run 的 Artifacts（保留 14 天）'
+          Write-Host '  通道       = 主线 10.4.x（Win10/11）+ w7 7.4.x（Windows 7）'
           Write-Host '  说明       = nightly 只构建验证，不发布 Release、不生成 feed'

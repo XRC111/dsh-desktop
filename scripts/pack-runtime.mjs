@@ -25,6 +25,20 @@ if (!fs.existsSync(runtimeDir)) {
 fs.mkdirSync(path.dirname(outFile), { recursive: true });
 if (fs.existsSync(outFile)) fs.rmSync(outFile, { force: true });
 
+// 自检：运行时树里不允许有**符号链接**。
+// 为什么：打包（bsdtar）与解压（内置解压器）这条链对符号链接支持很脆 ——
+// pnpm 的 isolated 布局会把 node_modules 里大量包做成指向 .pnpm/ 的符号链接，
+// 一旦链接在打包/解压途中被丢掉，装出来的运行时就会**静默缺包**：
+// 实测 nightly 10.4.8 装完 dsh 起不来，报 Cannot find package 'semver'。
+// 所以这里提前拦下，让人去改 fetch-nightly 的 --config.node-linker=hoisted。
+const links = findSymlinks(runtimeDir, 8);
+if (links.length) {
+  console.error('[pack-runtime] 运行时树里存在符号链接，打包后会被丢掉：');
+  for (const l of links) console.error('  · ' + path.relative(root, l));
+  console.error('[pack-runtime] 请改用扁平布局（pnpm: --config.node-linker=hoisted），或把链接物化成真目录。');
+  process.exit(1);
+}
+
 console.log('[pack-runtime] 正在打包 dsh-runtime.tar …');
 
 // 必须使用 Windows 自带的 bsdtar：Git Bash / MSYS 自带的 GNU tar 会把
@@ -44,6 +58,24 @@ if (res.status !== 0) {
     `[pack-runtime] tar 打包失败（exit=${res.status}）。需要系统自带 ${tarExe}（Windows 10 1803+）。`,
   );
   process.exit(res.status ?? 1);
+}
+
+function findSymlinks(dir, limit = 8) {
+  const out = [];
+  const stack = [dir];
+  while (stack.length && out.length < limit) {
+    const d = stack.pop();
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      let st;
+      try { st = fs.lstatSync(p); } catch { continue; }
+      if (st.isSymbolicLink()) { out.push(p); if (out.length >= limit) break; continue; }
+      if (e.isDirectory()) stack.push(p);
+    }
+  }
+  return out;
 }
 
 const mb = (fs.statSync(outFile).size / 1024 / 1024).toFixed(1);
