@@ -240,17 +240,26 @@ const nmDir = path.join(targetDir, 'node_modules');
 const leftover = findSymlinks(nmDir, 0);
 if (leftover.length) {
   let done = 0;
+  let dropped = 0;
   for (const link of leftover) {
-    let real;
-    try { real = fs.realpathSync(link); } catch { die('符号链接指向不存在的目标：' + link); }
+    // 断链（realpath 解析不了）直接删掉 —— 它指向的东西本来就不在这棵树里，
+    // 留着只会让打包/解压链报错。实测 pnpm 的 .pnpm/node_modules 下有这种残留
+    // （如 dsh-python-runtime-closure）。
+    let real = null;
+    try { real = fs.realpathSync(link); } catch { real = null; }
+    if (!real || !fs.existsSync(real)) {
+      fs.rmSync(link, { recursive: true, force: true });
+      dropped++;
+      continue;
+    }
     let st;
-    try { st = fs.statSync(real); } catch { die('符号链接目标读不到：' + link + ' -> ' + real); }
+    try { st = fs.statSync(real); } catch { fs.rmSync(link, { recursive: true, force: true }); dropped++; continue; }
     fs.rmSync(link, { recursive: true, force: true });
     if (st.isDirectory()) fs.cpSync(real, link, { recursive: true, force: true, dereference: true });
     else fs.copyFileSync(real, link);
     done++;
   }
-  log('  物化残留符号链接 ' + done + ' 个');
+  log('  物化残留符号链接 ' + done + ' 个' + (dropped ? '，删除断链 ' + dropped + ' 个' : ''));
 }
 
 // 组装自检：整棵树里不允许再有符号链接 —— 打包/解压链会丢掉它们（见上面说明）。
@@ -260,6 +269,15 @@ if (links.length) {
   die('组装后的 node_modules 里仍有符号链接（打包会被静默丢弃）：' + links.join(' | '));
 }
 log('  自检通过：node_modules 无符号链接');
+
+// 依赖闭包自检：从入口出发，沿 dependencies 走一遍，确认每个包都真的在树里。
+// 这是「符号链接被丢掉」那类事故的**通用兜底** —— 缺任何一个都会在用户机器上
+// 变成 ERR_MODULE_NOT_FOUND（实测 semver 就是这么炸的），在这里提前抓出来。
+const missingDeps = verifyDependencyClosure(nmDir, ['@deepseek-ai/dsh', '@deepseek-ai/dsh-app-boot']);
+if (missingDeps.length) {
+  die('运行时依赖闭包不完整（共 ' + missingDeps.length + ' 个缺失）：\n  ' + missingDeps.slice(0, 20).join('\n  '));
+}
+log('  自检通过：依赖闭包完整');
 
 const nightlyVersion = pkg.version + '+nightly.' + shortSha;
 fs.writeFileSync(
@@ -291,6 +309,41 @@ if (!keepSrc) {
 }
 
 /** 找符号链接（最多返回 limit 个，够报错用就行） */
+/**
+ * 从若干入口包出发，沿 dependencies 走一遍，返回**缺失**的依赖。
+ *
+ * 只跟 dependencies（不跟 dev/peer/optional）—— 生产运行时只该有这一层。
+ * 解析规则与 Node 一致：从包所在目录逐级向上找 node_modules/<name>。
+ */
+function verifyDependencyClosure(nmDir, entries) {
+  const seen = new Set();
+  const missing = new Set();
+  const queue = [...entries];
+  while (queue.length) {
+    const name = queue.shift();
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const dir = resolvePackageDir(nmDir, name);
+    if (!dir) { missing.add(name); continue; }
+    let pj;
+    try { pj = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8')); } catch { continue; }
+    for (const dep of Object.keys(pj.dependencies ?? {})) queue.push(dep);
+  }
+  return [...missing].sort();
+}
+
+/** 按 Node 的解析规则找包目录（从 nmDir 开始逐级向上） */
+function resolvePackageDir(nmDir, name) {
+  let d = nmDir;
+  for (;;) {
+    const cand = path.join(d, ...name.split('/'));
+    if (fs.existsSync(path.join(cand, 'package.json'))) return cand;
+    const up = path.dirname(d);
+    if (up === d) return null;
+    d = up;
+  }
+}
+
 /** 找符号链接；limit <= 0 表示不限数量 */
 function findSymlinks(dir, limit = 5) {
   const cap = limit > 0 ? limit : Infinity;
