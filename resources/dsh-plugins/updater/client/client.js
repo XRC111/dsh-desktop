@@ -19,6 +19,12 @@ window.__ModuleLoader__.load({
     var react = require('react');
     var h = react.createElement;
 
+    // UI 原语（宿主注入）。缺了就退回原生元素 —— 绝不因为取不到原语而把设置页搞崩。
+    var P = null;
+    try { P = require('@deepseek-ai/dsh-client-ui-primitives'); } catch (e) { P = null; }
+    var SegmentedControl = P && P.SegmentedControl ? P.SegmentedControl : null;
+    var Tag = P && P.Tag ? P.Tag : null;
+
     // UI 原语（宿主注入）。老版本可能缺某些导出，缺了就退回原生元素，
     // 绝不因为取不到原语而把整个设置页搞崩。
     var primitives = null;
@@ -315,37 +321,35 @@ window.__ModuleLoader__.load({
       return h(
         'div',
         { style: sectionStyle },
-        h('div', { style: titleStyle }, t('title')),
-        h(Row, { label: t('shell'), value: v.shell || t('unknown') }),
-        h(Row, { label: t('dsh'), value: v.dsh || t('unknown') }),
-        v.feedUrl ? h(Row, { label: t('feed'), value: v.feedUrl }) : null,
+        h('div', { style: formStyle },
+          h(Row, { label: t('shell'), value: v.shell || t('unknown') }),
+          h(Row, { label: t('dsh'), value: v.dsh || t('unknown') }),
+          v.feedUrl ? h(Row, { label: t('feed'), value: v.feedUrl }) : null,
+        ),
         // 分通道：老外壳没有 getChannel 时整行不显示，页面其余部分照常
         chan.supported && chan.channel
-          ? h(
-              'div',
-              { style: rowStyle },
-              h('span', { style: labelStyle }, t('channel')),
-              h(
-                'span',
-                { style: chanButtonsStyle },
-                CHANNELS.map(function (c) {
-                  var on = c.id === chan.channel;
-                  return h(
-                    'button',
-                    {
-                      type: 'button',
-                      key: c.id,
-                      onClick: function () {
-                        switchChannel(c.id);
-                      },
-                      disabled: !!chan.busy,
-                      style: on ? chanButtonOnStyle : chanButtonStyle,
-                    },
-                    t(c.key),
-                  );
-                }),
-              ),
-            )
+          ? h(FieldRow, {
+              label: t('channel'),
+              control: SegmentedControl
+                ? h(SegmentedControl, {
+                    id: 'dsh-desktop-channel',
+                    value: chan.channel,
+                    options: CHANNELS.map(function (c) { return { value: c.id, label: t(c.key) }; }),
+                    onChange: function (id) { switchChannel(id); },
+                    label: t('channel'),
+                    disabled: !!chan.busy,
+                  })
+                : h('span', { style: chanButtonsStyle },
+                    CHANNELS.map(function (c) {
+                      var on = c.id === chan.channel;
+                      return h('button', {
+                        type: 'button', key: c.id,
+                        onClick: function () { switchChannel(c.id); },
+                        disabled: !!chan.busy,
+                        style: on ? chanButtonOnStyle : chanButtonStyle,
+                      }, t(c.key));
+                    })),
+            })
           : null,
         chan.supported && chan.channel ? h('div', { style: hintStyle }, t('chanHint')) : null,
         h(
@@ -375,52 +379,65 @@ window.__ModuleLoader__.load({
       return parts.length ? '（' + parts.join(' + ') + '）' : '';
     }
 
+    /** 键值对行：左侧标签，右侧等宽字体值（版本号/更新源用） */
     function Row(props) {
-      return h(
-        'div',
-        { style: rowStyle },
+      return h('div', { style: rowStyle },
         h('span', { style: labelStyle }, props.label),
         h('span', { style: valueStyle }, props.value),
       );
     }
 
-    // 尽量克制：只用原生元素与中性配色，避免与 dsh 主题冲突
+    /** 字段行：左侧标签，右侧放控件（通道切换用）。与宿主 settings-form 的 .field 同构 */
+    function FieldRow(props) {
+      return h('div', { style: rowStyle },
+        h('span', { style: labelStyle }, props.label),
+        h('span', { style: fieldControlStyle }, props.control),
+      );
+    }
+
+    // 样式：一律走宿主设计变量（--dsw-alias-*），深浅色主题自动跟随，
+    // 与插件市场/桌面适配面板保持同一套观感。
     var sectionStyle = { display: 'flex', flexDirection: 'column', gap: '8px', padding: '4px 0' };
-    var titleStyle = { fontSize: '14px', fontWeight: 600, marginBottom: '4px' };
-    var rowStyle = { display: 'flex', gap: '12px', fontSize: '13px', alignItems: 'baseline' };
-    var labelStyle = { opacity: 0.65, minWidth: '120px' };
-    var valueStyle = { fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' };
-    var actionsStyle = { display: 'flex', gap: '8px', marginTop: '6px', flexWrap: 'wrap' };
-    var buttonStyle = {
-      border: '1px solid rgba(127,127,127,.35)',
-      background: 'transparent',
-      color: 'inherit',
-      borderRadius: '6px',
-      padding: '5px 12px',
-      fontSize: '13px',
-      cursor: 'pointer',
+    var formStyle = { display: 'flex', flexDirection: 'column', marginBottom: '12px' };
+    var rowStyle = {
+      display: 'flex', gap: '16px', fontSize: '13px', alignItems: 'center',
+      padding: '12px 0', borderTop: '0.5px solid var(--dsw-alias-border-l2)',
     };
-    var primaryButtonStyle = Object.assign({}, buttonStyle, {
-      borderColor: 'transparent',
-      background: '#2563eb',
-      color: '#fff',
-    });
+    var labelStyle = { color: 'var(--dsw-alias-label-tertiary)', minWidth: '120px', flex: 'none' };
+    var valueStyle = {
+      fontFamily: 'var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace)',
+      color: 'var(--dsw-alias-label-primary)', wordBreak: 'break-all',
+    };
+    var fieldControlStyle = { flex: '1', display: 'flex', justifyContent: 'flex-end', minWidth: 0 };
+    var actionsStyle = { display: 'flex', gap: '8px', marginTop: '4px', flexWrap: 'wrap' };
+    var buttonStyle = {
+      appearance: 'none', border: '0.5px solid var(--dsw-alias-border-l4)',
+      background: 'none', color: 'var(--dsw-alias-label-primary)',
+      borderRadius: 'var(--dsw-radius-md)', padding: '5px 14px',
+      font: 'inherit', fontSize: '13px', lineHeight: 1.5, cursor: 'pointer',
+    };
+    var primaryButtonStyle = {
+      appearance: 'none', border: '1px solid transparent',
+      background: 'var(--dsw-alias-label-primary)',
+      color: 'var(--dsw-alias-bg-layer-3)',
+      borderRadius: 'var(--dsw-radius-md)', padding: '5px 14px',
+      font: 'inherit', fontSize: '13px', lineHeight: 1.5, cursor: 'pointer',
+    };
     var chanButtonsStyle = { display: 'flex', gap: '6px', flexWrap: 'wrap' };
     var chanButtonStyle = {
-      border: '1px solid rgba(127,127,127,.35)',
-      background: 'transparent',
-      color: 'inherit',
-      borderRadius: '6px',
-      padding: '3px 10px',
-      fontSize: '12px',
-      cursor: 'pointer',
+      appearance: 'none', border: '0.5px solid var(--dsw-alias-border-l4)',
+      background: 'none', color: 'var(--dsw-alias-label-secondary)',
+      borderRadius: 'var(--dsw-radius-sm)', padding: '3px 10px',
+      font: 'inherit', fontSize: '12px', cursor: 'pointer',
     };
-    var chanButtonOnStyle = Object.assign({}, chanButtonStyle, {
-      borderColor: 'transparent',
-      background: '#2563eb',
-      color: '#fff',
-    });
-    var hintStyle = { fontSize: '12px', opacity: 0.7, marginTop: '2px' };
+    var chanButtonOnStyle = {
+      appearance: 'none', border: '1px solid transparent',
+      background: 'var(--dsw-alias-button-ghost-active-fill)',
+      color: 'var(--dsw-alias-label-primary)',
+      borderRadius: 'var(--dsw-radius-sm)', padding: '3px 10px',
+      font: 'inherit', fontSize: '12px', cursor: 'pointer',
+    };
+    var hintStyle = { margin: '2px 0 0', fontSize: '12px', lineHeight: 1.5, color: 'var(--dsw-alias-label-tertiary)' };
 
     return exports;
   },
