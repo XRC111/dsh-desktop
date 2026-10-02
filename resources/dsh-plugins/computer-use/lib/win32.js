@@ -426,6 +426,68 @@ export function typeUnicode(text) {
   return { sent };
 }
 
+/**
+ * 把一串按键事件**一次性**发出去（原子组合键）。
+ *
+ * 为什么不能逐个 keybd_event 发（实测踩到）：
+ *   keyDown(Ctrl) → keyPress(Home) → keyUp(Ctrl) 是三次独立系统调用，中间任何时刻
+ *   目标窗口失焦（弹窗抢焦点、窗口切换），修饰键就会**落在别的窗口上**，
+ *   目标窗口只收到不带修饰键的主键 —— 表现为「组合键无效」。
+ *   实测复现：焦点被抢后发 shift+end，文本框得到的是「end」（光标到末尾、无选中），
+ *   而不是「选中到行尾」。
+ * 一次 SendInput 发送整个序列，由系统**原子地**注入，不会与焦点变化交错。
+ *
+ * @param steps [{ vk, up, extended }] —— 按数组顺序发送
+ */
+/**
+ * 把窗口切到前台，并**等它真的成为前台**再返回。
+ *
+ * 为什么不能调完 SetForegroundWindow 立刻发按键（实测踩到）：
+ *   SetForegroundWindow 只是**请求**，实际切换由系统异步完成（还要走焦点/激活队列）。
+ *   立刻发按键时前台可能还是旧窗口 —— 按键落到别人身上，
+ *   表现为「组合键无效」（实测：带 hwnd 激活后立刻发 shift+end，文本框收到 0,0）。
+ * 这里轮询到前台真的变了（或超时）再返回，把切换成本显式化。
+ *
+ * @param timeoutMs 最长等待，默认 500ms（切换通常 10-50ms 内完成）
+ */
+export function activateAndWait(hwnd, timeoutMs = 500) {
+  const f = funcs();
+  const target = BigInt(hwnd);
+  activateWindow(hwnd);
+  const deadline = Date.now() + timeoutMs;
+  let cur = f.GetForegroundWindow();
+  while (cur !== target && Date.now() < deadline) {
+    // 忙等一小段：这里在 dsh 子进程里跑，阻塞几十毫秒可接受
+    const until = Date.now() + 10;
+    while (Date.now() < until) { /* spin */ }
+    cur = f.GetForegroundWindow();
+  }
+  return { hwnd: String(hwnd), foreground: String(cur), settled: cur === target };
+}
+
+export function sendKeySteps(steps) {
+  const f = funcs();
+  const INPUT_SIZE = 40;
+  const KEYEVENTF_KEYUP = 0x0002;
+  const KEYEVENTF_EXTENDEDKEY = 0x0001;
+  const buf = Buffer.alloc(INPUT_SIZE * steps.length);
+  steps.forEach((s, i) => {
+    const o = i * INPUT_SIZE;
+    buf.writeUInt32LE(1, o); // INPUT_KEYBOARD
+    buf.writeUInt16LE(s.vk, o + 8);
+    buf.writeUInt16LE(f.MapVirtualKeyW(s.vk, 0), o + 10);
+    let flags = 0;
+    if (s.extended) flags |= KEYEVENTF_EXTENDEDKEY;
+    if (s.up) flags |= KEYEVENTF_KEYUP;
+    buf.writeUInt32LE(flags, o + 12);
+  });
+  const sent = f.SendInput(steps.length, buf, INPUT_SIZE);
+  if (sent !== steps.length) {
+    throw new Error(`按键注入失败：SendInput 只接受 ${sent}/${steps.length} 个事件`);
+  }
+  return { sent };
+}
+
 export function keyPress(vk, extended = false) {
   const f = funcs();
   const flags = extended ? KEYEVENTF.EXTENDEDKEY : 0;

@@ -383,22 +383,45 @@ function apply(ctx, config) {
     name: 'key_press',
     description:
       '按一次键，或按组合键。keys 是数组：单个键直接按；多个键则前面的按住、最后一个按下抬起，' +
-      '例如 ["ctrl","c"] 表示 Ctrl+C，["enter"] 表示回车。',
+      '例如 ["ctrl","c"] 表示 Ctrl+C，["enter"] 表示回车。' +
+      '强烈建议带 hwnd：按键是发给**当前前台窗口**的，若中途有弹窗抢走焦点，' +
+      '按键就会落到别的窗口上，表现为「组合键无效」。带 hwnd 会先把目标切到前台并确认。',
     parameters: {
       keys: { type: 'array', required: true, items: { type: 'string' }, description: '键名数组' },
+      hwnd: {
+        type: 'string',
+        description: '可选：先把该窗口切到前台再发按键（强烈建议传，避免按键落到抢焦点的弹窗上）',
+      },
     },
-    output: textOut({ keys: { type: 'array', items: { type: 'string' } } }),
+    output: textOut({
+      keys: { type: 'array', items: { type: 'string' } },
+      // 把「按键实际发给了谁」报出来 —— 这是诊断「组合键无效」的唯一线索
+      foreground: { type: 'string' },
+    }),
     execute(args) {
       const keys = Array.isArray(args?.keys) ? args.keys : [];
       if (keys.length === 0) throw new Error('keys 不能为空');
       const codes = keys.map((k) => ({ k, vk: vkOf(k), ext: EXTENDED.has(String(k).toLowerCase()) }));
-      // 修饰键先按下
-      for (let i = 0; i < codes.length - 1; i++) w32.keyDown(codes[i].vk, codes[i].ext);
+      // ⚠️ 必须**一次 SendInput 发完整序列**，不能逐个 keybd_event：
+      //    逐个发是多次独立系统调用，中间只要目标窗口失焦（弹窗抢焦点、窗口切换），
+      //    修饰键就会落到别的窗口上，目标窗口只收到不带修饰键的主键 ——
+      //    实测表现为「ctrl+home / shift+end 无效」（文本框收到裸的 end）。
+      //    原子注入由系统保证不会与焦点变化交错。详见 win32.sendKeySteps。
+      // 带 hwnd 时先把目标切到前台 —— 按键只发给前台窗口，
+      // 不先切的话，任何抢焦点的弹窗（实测：NSIS Error 对话框）都会把按键吃掉。
+      // activateAndWait 会等前台**真的**切过去再返回；直接 activateWindow 后立刻发按键
+      // 会因为切换是异步的而落到旧窗口上（实测：0,0）。
+      if (args?.hwnd) w32.activateAndWait(String(args.hwnd));
+
+      const steps = [];
+      for (let i = 0; i < codes.length - 1; i++) steps.push({ vk: codes[i].vk, up: false, extended: codes[i].ext });
       const last = codes[codes.length - 1];
-      w32.keyPress(last.vk, last.ext);
-      // 逆序抬起
-      for (let i = codes.length - 2; i >= 0; i--) w32.keyUp(codes[i].vk, codes[i].ext);
-      return Promise.resolve({ keys });
+      steps.push({ vk: last.vk, up: false, extended: last.ext });
+      steps.push({ vk: last.vk, up: true, extended: last.ext });
+      for (let i = codes.length - 2; i >= 0; i--) steps.push({ vk: codes[i].vk, up: true, extended: codes[i].ext });
+      w32.sendKeySteps(steps);
+      // 回报按键实际落到了哪个窗口：调用方据此判断有没有被抢焦点
+      return Promise.resolve({ keys, foreground: w32.foregroundWindow().hwnd });
     },
     presentCall: (args) => ({ card: 'generic', title: `按键 ${(args?.keys ?? []).join('+')}`, kind: 'other', rawInput: args }),
   }));
