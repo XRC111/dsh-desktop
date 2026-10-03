@@ -24,6 +24,7 @@ import {
   logsDir,
   mainLogFile,
   packagedRuntimeDir,
+  profileModulesDir,
   rendererDir,
   runtimeManifestFile,
   runtimeRoot,
@@ -67,6 +68,7 @@ import {
 } from './skill-mcp';
 import { diagnose, FIXES, currentSafeMode, environmentSummary } from './recovery';
 import { prepareBundles } from './safe-mode';
+import { ensureProfileModuleLinks } from './profile-links';
 
 /** dsh web 的首选端口，被占用时自动回退到系统分配端口 */
 const PREFERRED_PORT = 3080;
@@ -313,6 +315,13 @@ async function startService(): Promise<void> {
   // 桌面适配插件：必须放在 dsh 能解析到的 profile 共享 node_modules 里，
   // 且必须在 dsh 起来之前完成（加载器是启动时一次性解析插件包名的）。
   installPlugins();
+
+  // 陈旧链接自检：profile 共享 node_modules 里的包链接是「当时那份运行时」链进去的，
+  // 且没有任何版本校验。机器上先后跑过两份运行时（开发态 + 安装版、或换过安装路径）时，
+  // 会残留指向旧运行时的链接，而入口用的是新运行时 —— 同一个进程里两套 harness 并存，
+  // 同名插件被实例化两次（实测：resume 会话报 tool "read" is already registered）。
+  // 这里把目标不在**当前活动运行时**下的链接一律替换（无同名包则删除）；详见 profile-links.ts。
+  ensureProfileModuleLinks(profileModulesDir(), runtimeDir);
 
   // 自愈：dsh 若上次是被强杀（taskkill /F），会留下 profiles/*.lock，
   // 导致本次启动卡在「timed out waiting for the writer lock」。启动前先清理失效锁。
