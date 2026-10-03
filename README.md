@@ -603,6 +603,8 @@ node scripts\verify-feeds.mjs --only latest,latest-w7
 | 装到一半报「无法调用系统 tar」 | **Win7 上不该再出现**（7.1.9 起解压器自带纯 JS 兜底）。若仍出现，说明包里的 `resources\extract-runtime.cjs` 是旧版 —— 见 [8.4](#84-win7-支持) |
 | 更新一直提示但版本不变 | feed 里缺**前向热壳**（`base` 高于当前安装版，`pickHot` 挑不到） |
 | 命令执行弹控制台窗口 | 见 `win-console.ts`：外壳启动前分配隐藏控制台，沙箱子进程继承它 |
+| `git push` 报 `SSL_ERROR_SYSCALL` / `Failed to connect to github.com port 443: Timed out`，但同一台机器 `curl https://api.github.com` 正常 | **HTTP/2 的问题**（实测：`api.github.com` 通、`gh` 能用，唯独 git over HTTPS 连不上）。加 `-c http.version=HTTP/1.1` 即可，实测一次成功：`git -c http.version=HTTP/1.1 push origin main` |
+| Windows 沙箱下 `pwsh` 工具每次调用都以 `0xC0000142` 结算、无任何输出 | 令牌默认 DACL 只挂了 restricting 列表里的能力 SID，缺正常 SID 列表的主体（pass-1 不过）。已由 `acl-patch.ts` 在启动时幂等修复；见 [8.8](#88-windows-沙箱的-workspace-write-修复) |
 
 **手动复现 dsh 启动**（绕过外壳）：
 

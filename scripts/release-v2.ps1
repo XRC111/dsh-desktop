@@ -387,6 +387,44 @@ try {
 Step '0/7 环境自检'
 # ---------------------------------------------------------------------------
 Info "工作目录：$root"
+
+# 目录完整性级别自检（实测踩过，且**极难排查**）。
+#
+# 症状：NSIS 步骤失败，electron-builder 只报 `process failed` + `Exit code: 2`
+#（或 null），**stderr 里什么都没有**。真相是中间 stub 弹了一个模态框：
+#     NSIS Error / Error writing temporary file. Make sure your temp folder is valid.
+# 它卡在对话框上等人点确定，直到 electron-builder 超时把它杀掉。
+#
+# 根因：目录被打上「低完整性级别」（Mandatory Label\Low）。NSIS 要在临时目录里
+# 反复创建/删除 nsXXXX.tmp，被完整性策略拦截。谁打的？本机实测是火绒 HIPS ——
+# 它会给「存放可执行文件的目录」自动降权隔离，而 dist\ 里全是安装包。
+#
+# 修法：icacls <dir> /setintegritylevel "(OI)(CI)H"
+#   ⚠️ **不要加 /T**：(OI)(CI) 的继承会自动覆盖子项，加 /T 只是白遍历整棵树
+#      （实测：对本仓库加 /T 会递归几万个文件，跑 448 秒并写出 1.9 GB 的备份）。
+function Test-LowIntegrity {
+    param([string]$Path)
+    try {
+        $out = & icacls $Path 2>&1 | Out-String
+        return ($out -match 'Mandatory Label\\Low')
+    } catch { return $false }
+}
+foreach ($dir in @($root, (Join-Path $root 'dist'))) {
+    if (-not (Test-Path -LiteralPath $dir)) { continue }
+    if (Test-LowIntegrity $dir) {
+        Warn "目录被打上低完整性级别，NSIS 会失败：$dir"
+        Info '  自动修复中（icacls /setintegritylevel H）…'
+        & icacls $dir /setintegritylevel '(OI)(CI)H' 2>&1 | Out-Null
+        if (Test-LowIntegrity $dir) {
+            throw ("无法修复低完整性级别：$dir" +
+                   "`n请手动执行：icacls `"$dir`" /setintegritylevel `"(OI)(CI)H`"" +
+                   "`n并检查安全软件（本机实测是火绒 HIPS）是否在持续打标签。")
+        }
+        Ok "已修复完整性级别：$dir"
+    } else {
+        Ok "完整性级别正常：$dir"
+    }
+}
 foreach ($f in @($PkgPath, $CfgPath, $CfgW7Path)) {
     if (-not (Test-Path -LiteralPath $f)) { throw "缺少文件：$f" }
 }
