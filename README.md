@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 
 ---
 
-## 2. 设计原则
+## 2. 设计原则（铁律）
 
 这几条是硬约束，改动前请先读——它们解释了为什么代码长这样。
 
@@ -507,6 +507,93 @@ dsh 0.1.7 起有宿主指纹白名单（见 [5.2](#52-dsh-017-起的宿主指纹
 
 ---
 
+### 8.8 Windows 沙箱：`workspace-write` 下命令全挂（`0xC0000142`）
+
+**症状**：Windows + `workspace-write` 下，`pwsh` 工具**每一次**调用都以
+`3221225794`（`0xC0000142`，`STATUS_DLL_INIT_FAILED`）结算，stdout/stderr 全空。
+同参数换 `read-only` 正常，换 `danger-full-access` 也正常。前景/后台/换 workdir/
+子智能体都一样 —— 看起来像「命令根本跑不起来」，很容易误判成 exe 或路径问题。
+
+**根因**：`dsh-sandbox-windows-acl` 往令牌的**默认 DACL** 合并全权 ACE 时，两种模式传的
+SID 不同：
+
+| 模式 | 合并进默认 DACL 的 SID | 结果 |
+| --- | --- | --- |
+| `read-only` | `world`（Everyone） | ✅ 正常 |
+| `workspace-write` | 能力 SID（`S-1-4-*`） | ❌ `0xC0000142` |
+
+Windows 对写类访问做**两次**检查：先用令牌的**正常 SID 列表**（pass-1），再用 **restricting 列表**
+（pass-2）。能力 SID **只在 restricting 列表里**，不在正常列表里 —— 于是 `workspace-write` 下
+子进程启动时新建的无显式安全描述符对象（控制台、section、管道）只满足 pass-2，pass-1 无任何
+SID 可匹配，对象不可用，进程在 DLL 初始化阶段就死。`read-only` 合并的是 Everyone（保活组成员，
+在正常列表里），两次都过。
+
+上游注释写的是「so each new object's own DACL passes **pass-2**」—— 精确命中了遗漏：
+只考虑了 pass-2，漏了 pass-1。
+
+**修法**：`src/main/acl-patch.ts` 在启动时给运行时**幂等打补丁** —— 在原有那次合并之后
+再合并一次 `world`，补上 pass-1。四条路径都实测过：首次应用 / 重打不叠加 /
+上游已自行修复则跳过 / 锚点失配则跳过。
+
+**为什么这不削弱写边界**：默认 DACL 只作用于「本令牌新建的对象」，**对象创建本身**仍由父容器
+DACL 把关。实测打完补丁：写工作区 ✅ / 写桌面 ❌ / 写 `C:\Windows` ❌ / 写 `D:\` 根 ❌。
+
+---
+
+### 8.9 打包：目录被降权导致 NSIS 失败（且**日志里什么都没有**）
+
+**症状**：`npm run dist` 或发版脚本走到 NSIS 步骤失败，报
+
+```
+⨯ D:\...\dist\DSH-Desktop-Setup-<版本>.exe process failed ERR_ELECTRON_BUILDER_CANNOT_EXECUTE
+Exit code: 2      （或 null）
+```
+
+**stderr 是空的** —— electron-builder 的 `exec()` 什么都捕获不到，看起来毫无线索。
+
+**真相**：中间 stub 弹了一个**模态框**，在等人点确定：
+
+```
+NSIS Error
+Error writing temporary file. Make sure your temp folder is valid.
+```
+
+它卡在对话框上，直到 electron-builder 超时把进程杀掉（所以 exit code 是 `null`；
+有人点了确定则是 `2`）。**这个框只有截图才看得到** —— 这就是它难查的原因。
+
+**根因**：目录被打上**低完整性级别**：
+
+```
+icacls D:\code
+        Mandatory Label\Low Mandatory Level:(OI)(CI)(NW)
+```
+
+NSIS 启动时要在临时目录里反复创建/删除 `nsXXXX.tmp`，被完整性策略拦截。
+本机来源是**火绒 HIPS** —— 它会给「存放可执行文件的目录」自动降权隔离，
+而 `dist\` 里全是安装包 exe。
+
+**修法**：
+
+```powershell
+# 查
+icacls D:\code | Select-String 'Mandatory'
+# 修（⚠️ 不要加 /T，见下）
+icacls D:\code /setintegritylevel "(OI)(CI)H"
+```
+
+> **为什么不要加 `/T`**：`(OI)(CI)` 的继承会自动覆盖子项，加 `/T` 只是白遍历整棵树。
+> 实测：对本仓库加 `/T` 会递归几万个文件，跑 448 秒并写出 **1.9 GB** 的备份文件
+> （如果同时用了 `/save`）。这条是踩过的坑。
+
+`scripts/release-v2.ps1` 的 **0/7 环境自检**已内置检查 + 自动修复：发现 `$root` 或 `dist\`
+带 Low 标签就自动改回 High，改不动才报错中止。所以即使被重新打标签，脚本也会自己修好并
+打印日志，不会再卡在那个无日志的弹窗上。
+
+> **注意**：这不是一次性问题。安全软件会持续打标签 —— 如果反复出现，请在火绒里把工作目录
+> 加进**信任目录/排除列表**，从源头解决。
+
+---
+
 ## 9. 发版流程
 
 ### 9.1 一键发版
@@ -603,8 +690,9 @@ node scripts\verify-feeds.mjs --only latest,latest-w7
 | 装到一半报「无法调用系统 tar」 | **Win7 上不该再出现**（7.1.9 起解压器自带纯 JS 兜底）。若仍出现，说明包里的 `resources\extract-runtime.cjs` 是旧版 —— 见 [8.4](#84-win7-支持) |
 | 更新一直提示但版本不变 | feed 里缺**前向热壳**（`base` 高于当前安装版，`pickHot` 挑不到） |
 | 命令执行弹控制台窗口 | 见 `win-console.ts`：外壳启动前分配隐藏控制台，沙箱子进程继承它 |
-| `git push` 报 `SSL_ERROR_SYSCALL` / `Failed to connect to github.com port 443: Timed out`，但同一台机器 `curl https://api.github.com` 正常 | **HTTP/2 的问题**（实测：`api.github.com` 通、`gh` 能用，唯独 git over HTTPS 连不上）。加 `-c http.version=HTTP/1.1` 即可，实测一次成功：`git -c http.version=HTTP/1.1 push origin main` |
-| Windows 沙箱下 `pwsh` 工具每次调用都以 `0xC0000142` 结算、无任何输出 | 令牌默认 DACL 只挂了 restricting 列表里的能力 SID，缺正常 SID 列表的主体（pass-1 不过）。已由 `acl-patch.ts` 在启动时幂等修复；见 [8.8](#88-windows-沙箱的-workspace-write-修复) |
+| `git push` 报 `SSL_ERROR_SYSCALL` / `Failed to connect to github.com port 443: Timed out` | 多数是**网络抖动**（实测：同一时段 `api.github.com` 200、`uploads.github.com` 302，只有 `github.com` 超时；过一阵自己就好了）。先探测再重试：`curl -sS -o NUL -w '%{http_code}' https://github.com`。也可试 `git -c http.version=HTTP/1.1 push origin main`（有一次网络较差时它成功了，但不是根治）。**注意**：`gh` 走 `api.github.com`，所以 release 与资产上传不受影响 —— 只有源码推送会卡 |。加 `-c http.version=HTTP/1.1` 即可，实测一次成功：`git -c http.version=HTTP/1.1 push origin main` |
+| Windows 沙箱下 `pwsh` 工具每次调用都以 `0xC0000142` 结算、无任何输出 | 令牌默认 DACL 只挂了 restricting 列表里的能力 SID，缺正常 SID 列表的主体（pass-1 不过）。已由 `acl-patch.ts` 在启动时幂等修复；见 [8.8](#88-windows-沙箱workspace-write-下命令全挂0xc0000142) |
+| **打包到 NSIS 步骤失败，`exit 2` 或 `exit null`，日志里什么都没有** | 目录被打上**低完整性级别**（`Mandatory Label\Low`）。NSIS 要在临时目录反复建删 `nsXXXX.tmp`，被拦截后弹模态框 `NSIS Error: Error writing temporary file`，卡住直到 electron-builder 超时杀进程 —— 所以日志是空的。本机来源是**火绒 HIPS**（给「存放可执行文件的目录」自动降权）。修：`icacls <目录> /setintegritylevel "(OI)(CI)H"`（**不要加 `/T`**，见 [8.8](#88-windows-沙箱workspace-write-下命令全挂0xc0000142)）。`release-v2.ps1` 的 0/7 自检已会自动检查并修复 |
 
 **手动复现 dsh 启动**（绕过外壳）：
 
