@@ -132,8 +132,18 @@ export async function diagnose(): Promise<CheckResult[]> {
   }
 
   // 2) 运行时完整性
+  //
+  // ⚠️ runtimeManifestFile() 依赖 process.resourcesPath —— 它在打包后才有值，
+  // 开发态/非 Electron 宿主下是 undefined，path.join 会抛。这里先判空再走，
+  // 否则这一项会变成「检查失败」的噪音，掩盖真正的问题。
   try {
-    const manifest = loadManifest(runtimeManifestFile());
+    const manifestFile = typeof process.resourcesPath === 'string' && process.resourcesPath
+      ? runtimeManifestFile()
+      : null;
+    const manifest = manifestFile === null ? null : loadManifest(manifestFile);
+    if (manifestFile === null) {
+      out.push({ id: 'runtime', label: 'Harness 运行时', status: 'warn', detail: '无法定位运行时清单（非打包环境），跳过' });
+    } else
     if (manifest === null) {
       out.push({ id: 'runtime', label: 'Harness 运行时', status: 'warn', detail: '读不到运行时清单，无法核对' });
     } else {
