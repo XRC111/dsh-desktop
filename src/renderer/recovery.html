@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:;"
+    />
+    <title>DSH Desktop · 恢复工具</title>
+    <style>
+      :root {
+        --bg: #f6f7f9; --card: #ffffff; --text: #1b1d22; --muted: #6b7280;
+        --faint: #9ca3af; --line: #e8eaee; --brand: #4d6bfe;
+        --brand-soft: rgba(77, 107, 254, 0.1);
+        --ok: #16a34a; --ok-soft: rgba(22, 163, 74, 0.12);
+        --warn: #b45309; --warn-soft: rgba(180, 83, 9, 0.1);
+        --danger: #d92d20; --danger-soft: rgba(217, 45, 32, 0.08);
+        --code: #f3f4f6;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14161b; --card: #1e2127; --text: #ecedf0; --muted: #9aa1ad;
+          --faint: #6b7280; --line: #2c3038; --brand: #7b90ff;
+          --brand-soft: rgba(123, 144, 255, 0.14);
+          --ok: #4ade80; --ok-soft: rgba(74, 222, 128, 0.14);
+          --warn: #fbbf24; --warn-soft: rgba(251, 191, 36, 0.12);
+          --danger: #ff6b5e; --danger-soft: rgba(255, 107, 94, 0.12);
+          --code: #262a31;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        background: var(--bg); color: var(--text);
+        font: 14px/1.6 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        overflow-y: auto;
+      }
+      .wrap { max-width: 780px; margin: 0 auto; padding: 28px 24px 40px; }
+      h1 { font-size: 19px; margin: 0 0 4px; font-weight: 650; }
+      .sub { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
+      .banner {
+        display: flex; gap: 10px; align-items: flex-start;
+        padding: 12px 14px; border-radius: 10px; margin-bottom: 18px;
+        background: var(--warn-soft); color: var(--warn); font-size: 13px;
+      }
+      .banner.safe { background: var(--ok-soft); color: var(--ok); }
+      .banner b { font-weight: 650; }
+      .card {
+        background: var(--card); border: 1px solid var(--line);
+        border-radius: 12px; padding: 4px 0; margin-bottom: 16px;
+      }
+      .row {
+        display: flex; gap: 12px; align-items: flex-start;
+        padding: 12px 16px; border-top: 1px solid var(--line);
+      }
+      .row:first-child { border-top: 0; }
+      .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 7px; flex: none; }
+      .dot.ok { background: var(--ok); }
+      .dot.warn { background: var(--warn); }
+      .dot.bad { background: var(--danger); }
+      .rowmain { flex: 1; min-width: 0; }
+      .label { font-weight: 550; font-size: 13px; }
+      .detail { color: var(--muted); font-size: 12.5px; margin-top: 2px; word-break: break-word; }
+      button {
+        font: inherit; font-size: 12.5px; cursor: pointer;
+        border-radius: 7px; padding: 5px 12px; border: 1px solid var(--line);
+        background: transparent; color: var(--text); flex: none;
+      }
+      button:hover:not(:disabled) { border-color: var(--brand); color: var(--brand); }
+      button:disabled { opacity: .5; cursor: default; }
+      button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+      button.primary:hover:not(:disabled) { color: #fff; opacity: .9; }
+      .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+      .actions button { margin: 0; }
+      h2 { font-size: 13px; font-weight: 600; color: var(--muted); margin: 22px 0 8px; }
+      pre {
+        background: var(--code); border-radius: 8px; padding: 10px 12px;
+        font: 12px/1.5 Consolas, monospace; overflow-x: auto; margin: 0;
+        white-space: pre-wrap; word-break: break-all;
+      }
+      .env { display: grid; grid-template-columns: 88px 1fr; gap: 2px 12px; font-size: 12.5px; }
+      .env dt { color: var(--faint); }
+      .env dd { margin: 0; color: var(--muted); word-break: break-all; }
+      .log { margin-top: 16px; }
+      .toast {
+        position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+        background: var(--card); border: 1px solid var(--line); border-radius: 9px;
+        padding: 9px 16px; font-size: 13px; box-shadow: 0 8px 28px rgba(0,0,0,.18);
+        max-width: 90%; display: none;
+      }
+      .toast.show { display: block; }
+      .spin { display: inline-block; animation: sp 1s linear infinite; }
+      @keyframes sp { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <h1>恢复工具</h1>
+      <p class="sub">
+        这个界面由桌面外壳自己提供，<b>不依赖 Harness</b> —— 所以即使 Harness 起不来也能用它修复。
+      </p>
+
+      <div id="safeBanner" class="banner safe" style="display:none">
+        <span>🛡</span>
+        <div><b>当前处于安全模式</b>：只加载内置模块，第三方插件已停用。修好插件后可点「恢复正常启动」。</div>
+      </div>
+      <div id="failBanner" class="banner" style="display:none">
+        <span>⚠</span>
+        <div id="failText"></div>
+      </div>
+
+      <h2>体检</h2>
+      <div class="card" id="checks"><div class="row"><div class="dot warn"></div><div class="rowmain"><div class="detail">正在检查…</div></div></div></div>
+
+      <div class="actions">
+        <button class="primary" id="btnRecheck">重新检查</button>
+        <button id="btnRestart">重启应用</button>
+        <button id="btnOpenData">打开数据目录</button>
+      </div>
+
+      <h2>环境</h2>
+      <dl class="env" id="env"></dl>
+
+      <div class="log" id="logBox" style="display:none">
+        <h2>操作输出</h2>
+        <pre id="log"></pre>
+      </div>
+    </div>
+    <div class="toast" id="toast"></div>
+
+    <script>
+      (function () {
+        var api = window.recovery;
+        var $ = function (id) { return document.getElementById(id); };
+
+        function toast(msg, ms) {
+          var el = $('toast');
+          el.textContent = msg;
+          el.classList.add('show');
+          clearTimeout(el._t);
+          el._t = setTimeout(function () { el.classList.remove('show'); }, ms || 4200);
+        }
+        function log(text) {
+          $('logBox').style.display = 'block';
+          $('log').textContent += (new Date().toLocaleTimeString()) + '  ' + text + '\n';
+          $('log').scrollTop = $('log').scrollHeight;
+        }
+
+        if (!api) {
+          $('failBanner').style.display = 'flex';
+          $('failText').textContent = '恢复接口未注入（preload 未加载）。请重新安装应用。';
+          return;
+        }
+
+        function renderChecks(checks) {
+          var box = $('checks');
+          box.innerHTML = '';
+          if (!checks.length) {
+            box.innerHTML = '<div class="row"><div class="rowmain"><div class="detail">没有检查项</div></div></div>';
+            return;
+          }
+          checks.forEach(function (c) {
+            var row = document.createElement('div');
+            row.className = 'row';
+            var dot = document.createElement('div');
+            dot.className = 'dot ' + c.status;
+            var main = document.createElement('div');
+            main.className = 'rowmain';
+            var label = document.createElement('div');
+            label.className = 'label';
+            label.textContent = c.label;
+            var detail = document.createElement('div');
+            detail.className = 'detail';
+            detail.textContent = c.detail;
+            main.appendChild(label);
+            main.appendChild(detail);
+            row.appendChild(dot);
+            row.appendChild(main);
+            if (c.fix) {
+              var btn = document.createElement('button');
+              btn.textContent = c.fix === 'safe-mode' ? '进入安全模式' : '修复';
+              btn.className = 'primary';
+              btn.onclick = function () { runFix(c.fix, btn); };
+              row.appendChild(btn);
+            }
+            box.appendChild(row);
+          });
+        }
+
+        function runFix(id, btn) {
+          var original = btn.textContent;
+          btn.disabled = true;
+          btn.innerHTML = '<span class="spin">◌</span> 处理中';
+          log('执行修复：' + id);
+          api.runFix(id).then(function (r) {
+            btn.disabled = false;
+            btn.textContent = original;
+            log((r.ok ? '成功：' : '失败：') + r.message);
+            toast(r.ok ? r.message : ('失败：' + r.message), 9000);
+            if (r.ok && r.needsRestart) {
+              toast('需要重启应用才生效 —— 点上方「重启应用」', 9000);
+            }
+            return refresh();
+          }).catch(function (e) {
+            btn.disabled = false;
+            btn.textContent = original;
+            log('异常：' + e);
+            toast('执行失败：' + e, 9000);
+          });
+        }
+
+        function refresh() {
+          return api.diagnose().then(function (checks) {
+            renderChecks(checks);
+          }).catch(function (e) {
+            toast('检查失败：' + e);
+          });
+        }
+
+        function loadEnv() {
+          api.environment().then(function (env) {
+            var dl = $('env');
+            dl.innerHTML = '';
+            Object.keys(env).forEach(function (k) {
+              var dt = document.createElement('dt'); dt.textContent = k;
+              var dd = document.createElement('dd'); dd.textContent = env[k];
+              dl.appendChild(dt); dl.appendChild(dd);
+            });
+          }).catch(function () {});
+        }
+
+        function loadState() {
+          api.state().then(function (s) {
+            if (s.safe) {
+              $('safeBanner').style.display = 'flex';
+              // 安全模式下提供「恢复正常启动」
+              var acts = document.querySelector('.actions');
+              if (!document.getElementById('btnNormal')) {
+                var b = document.createElement('button');
+                b.id = 'btnNormal';
+                b.textContent = '恢复正常启动';
+                b.onclick = function () { runFix('normal-mode', b); };
+                acts.appendChild(b);
+              }
+            } else {
+              $('safeBanner').style.display = 'none';
+            }
+            if (s.lastError) {
+              $('failBanner').style.display = 'flex';
+              $('failText').textContent = '上次启动失败：' + s.lastError;
+            }
+          }).catch(function () {});
+        }
+
+        $('btnRecheck').onclick = function () { refresh(); };
+        $('btnRestart').onclick = function () {
+          if (!confirm('重启应用？Harness 会一起重启。')) return;
+          api.restart().catch(function (e) { toast('重启失败：' + e); });
+        };
+        $('btnOpenData').onclick = function () { api.openDataDir().catch(function () {}); };
+
+        loadEnv();
+        loadState();
+        refresh();
+      })();
+    </script>
+  </body>
+</html>

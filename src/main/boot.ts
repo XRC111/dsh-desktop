@@ -65,6 +65,8 @@ import {
   mcpConfigFile,
   userSkillsDir,
 } from './skill-mcp';
+import { diagnose, FIXES, currentSafeMode, environmentSummary } from './recovery';
+import { prepareBundles } from './safe-mode';
 
 /** dsh web 的首选端口，被占用时自动回退到系统分配端口 */
 const PREFERRED_PORT = 3080;
@@ -113,6 +115,8 @@ const service = new DshService();
 let windowManager: WindowManager | null = null;
 let trayManager: TrayManager | null = null;
 let computerUseBall: ComputerUseBall | null = null;
+/** 上次启动失败的原因（恢复页显示用）。进程内变量即可 —— 恢复页是同一次运行里打开的。 */
+let lastStartupError: string | null = null;
 /** 外壳功能开关（用户数据目录持久化；见 shell-features.ts） */
 let shellFeatures: ShellFeatures | null = null;
 let updater: Updater | null = null;
@@ -293,6 +297,19 @@ async function startService(): Promise<void> {
 
   const install = verify.install;
 
+  // 安全模式：把 profile 的 bundles 收敛为内置集合（或从安全模式恢复）。
+  //
+  // 必须在 installPlugins() **之前**：它改的是「dsh 要加载哪些 bundle」，
+  // 而插件落位是往 profile 里放包 —— 顺序反了会让安全模式下的本次启动
+  // 仍然落位一批第三方插件（虽然不会被加载，但没必要）。
+  //
+  // 这一步是幂等的：无论上次是正常退出、崩溃还是被强杀，本次启动都会按
+  // 当前模式把 bundles 写成该有的样子（而不是依赖「退出时恢复」）。
+  const safe = prepareBundles('web');
+  if (safe.safe) {
+    log('⚠ 安全模式：本次只加载内置模块，已停用 ' + safe.excluded.length + ' 个第三方插件');
+  }
+
   // 桌面适配插件：必须放在 dsh 能解析到的 profile 共享 node_modules 里，
   // 且必须在 dsh 起来之前完成（加载器是启动时一次性解析插件包名的）。
   installPlugins();
@@ -393,7 +410,17 @@ async function startService(): Promise<void> {
 
   if (status.state === 'ready' && status.url) {
     windowManager?.loadDshUi(status.url);
+    return;
   }
+
+  // 启动失败 → 自动切到恢复工具。
+  //
+  // 这是本功能的意义所在：dsh 起不来时，用户原本只有一个转圈的加载页，
+  // 没有任何可操作的东西（界面本身跑在 dsh 里）。现在直接把他带到恢复页，
+  // 那里能体检、能一键进安全模式、能补运行时。
+  lastStartupError = status.message ?? 'Harness 未能启动';
+  log('Harness 启动失败，切换到恢复工具：' + lastStartupError);
+  windowManager?.loadRecoveryPage();
 }
 
 async function restartService(): Promise<void> {
@@ -670,6 +697,40 @@ function registerIpc(): void {
   });
 
   // ── 更新 ──────────────────────────────────────────────────────────────────
+  // ── 恢复工具（不依赖 dsh）───────────────────────────────────────────────
+  // 这个界面在外壳自己的本地页面里跑（renderer/recovery.html），不走 dsh web ——
+  // 它要解决的场景就是「dsh 起不来」。
+  ipcMain.handle('recovery:diagnose', async () => {
+    try {
+      return await diagnose();
+    } catch (err) {
+      return [{ id: 'fatal', label: '体检', status: 'bad', detail: '体检本身失败：' + String(err) }];
+    }
+  });
+  ipcMain.handle('recovery:fix', async (_e, payload: unknown) => {
+    const p = (payload ?? {}) as { id?: unknown };
+    const id = String(p.id ?? '');
+    const fn = FIXES[id];
+    if (!fn) return { ok: false, message: '未知的修复动作：' + id };
+    try {
+      const r = await fn();
+      log('恢复工具执行了 ' + id + '：' + r.message);
+      return r;
+    } catch (err) {
+      return { ok: false, message: String((err as Error)?.message ?? err) };
+    }
+  });
+  ipcMain.handle('recovery:state', () => ({
+    safe: currentSafeMode(),
+    lastError: lastStartupError,
+  }));
+  ipcMain.handle('recovery:environment', () => environmentSummary());
+  ipcMain.handle('recovery:restart', () => {
+    app.relaunch();
+    app.exit(0);
+  });
+  ipcMain.handle('recovery:open-data-dir', () => shell.openPath(dshHomeDir()));
+
   // ── 技能与 MCP 管理 ──────────────────────────────────────────────────────
   // 这两个都是「文件/配置驱动、没有界面」的东西，这里给界面提供读写入口。
   // 所有写入都做校验（见 skill-mcp.ts）—— 写坏配置会让 dsh 起不来。
@@ -846,6 +907,10 @@ app.whenReady().then(async () => {
 
   trayManager = new TrayManager({
     onToggleWindow: () => windowManager?.toggle(),
+    onOpenRecovery: () => {
+      windowManager?.loadRecoveryPage();
+      windowManager?.show();
+    },
     onRestart: () => void restartService(),
     onRestartApp: () => void restartApp('用户手动重启'),
     onRollbackHot: () => {

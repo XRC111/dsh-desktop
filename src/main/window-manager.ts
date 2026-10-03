@@ -341,6 +341,40 @@ export class WindowManager {
     void this.contentView.webContents.loadFile(path.join(rendererDir(), 'loading.html'));
   }
 
+  /**
+   * 加载**恢复工具**页面。
+   *
+   * 这是外壳自带的本地页面（renderer/recovery.html），**不依赖 dsh** ——
+   * 它要解决的场景就是「dsh 起不来」，所以绝不能跑在 dsh web 里。
+   *
+   * 换 preload：主 preload 是给 Harness UI 用的（面大、跟 dsh 走），
+   * 恢复页只该拿到 recovery.* 那一小组方法。WebContentsView 的 preload
+   * 只能在创建时定，所以这里重建一个视图，用完再换回来。
+   */
+  loadRecoveryPage(): void {
+    if (!this.win || this.win.isDestroyed()) return;
+    const { WebContentsView } = require('electron') as typeof import('electron');
+    if (this.contentView) {
+      this.win.contentView.removeChildView(this.contentView);
+      this.contentView.webContents.close();
+    }
+    const view = new WebContentsView({
+      webPreferences: {
+        preload: path.join(__dirname, '..', 'preload', 'recovery.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        spellcheck: false,
+        devTools: !app.isPackaged,
+      },
+    });
+    this.contentView = view;
+    this.win.contentView.addChildView(view);
+    this.applyContentInset();
+    void view.webContents.loadFile(path.join(rendererDir(), 'recovery.html'));
+    log('已加载恢复工具页面（不依赖 Harness）');
+  }
+
   /** dsh 就绪后加载 Harness 原生 Web UI（必须使用带 token 的完整地址） */
   loadDshUi(url: string): void {
     this.dshUrl = url;

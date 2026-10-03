@@ -14,6 +14,8 @@ export interface TrayHandlers {
   onUpdateAction: () => void;
   onOpenLogs: () => void;
   onOpenDataDir: () => void;
+  /** 打开恢复工具（不依赖 dsh —— dsh 起不来时的入口） */
+  onOpenRecovery: () => void;
   onQuit: () => void;
 }
 
@@ -187,6 +189,7 @@ export class TrayManager {
       { type: 'separator' },
       { label: '打开日志目录', click: () => this.handlers.onOpenLogs() },
       { label: '打开数据目录', click: () => this.handlers.onOpenDataDir() },
+      { label: '恢复工具（Harness 起不来时用）', click: () => this.handlers.onOpenRecovery() },
       { type: 'separator' },
       {
         label: '完全退出',
