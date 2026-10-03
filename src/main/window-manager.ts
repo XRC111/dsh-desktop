@@ -1,6 +1,8 @@
 import {
   BaseWindow,
   WebContentsView,
+  Menu,
+  clipboard,
   shell,
   app,
   nativeTheme,
@@ -169,6 +171,7 @@ export class WindowManager {
       },
     });
     this.win.contentView.addChildView(this.contentView);
+    this.bindContextMenu(this.contentView);
 
     const layout = (): void => this.layoutViews();
     this.win.on('resize', layout);
@@ -336,6 +339,75 @@ export class WindowManager {
   }
 
   /** 显示本地加载页 */
+  /**
+   * 给内容视图挂上**原生右键菜单**。
+   *
+   * ── 为什么必须自己做 ──────────────────────────────────────────────────
+   * Electron 默认**不提供**右键菜单（这点和浏览器不同）：不给 webContents 挂
+   * context-menu 处理，右键就是完全没反应。而 dsh 的 Web UI 自己也没实现
+   * （实测 dsh-client-ui-conversation / dsh-client-ui-chat 里 contextmenu 零命中）。
+   * 结果就是「右键没菜单、连复制粘贴都没有」—— 但 Ctrl+C/V 是 Chromium 原生
+   * 处理的，所以键盘能用。
+   *
+   * ── 做法 ──────────────────────────────────────────────────────────────
+   * 用 Electron 的 context-menu 事件 + Menu.popup，动作走 webContents 的
+   * 编辑命令（undo/cut/copy/paste…）。菜单项按 params.editFlags 动态启用/禁用，
+   * 所以「没选中文字时复制是灰的」这种基本体验是对的。
+   *
+   * 标签用中文（与外壳其余部分一致）。
+   */
+  private bindContextMenu(view: WebContentsView): void {
+    view.webContents.on('context-menu', (_event, params) => {
+      if (!this.win || this.win.isDestroyed()) return;
+      const wc = view.webContents;
+      const f = params.editFlags;
+      const items: Electron.MenuItemConstructorOptions[] = [
+        { label: '撤销', accelerator: 'CmdOrCtrl+Z', enabled: f.canUndo, click: () => wc.undo() },
+        { label: '重做', accelerator: 'CmdOrCtrl+Y', enabled: f.canRedo, click: () => wc.redo() },
+        { type: 'separator' },
+        { label: '剪切', accelerator: 'CmdOrCtrl+X', enabled: f.canCut, click: () => wc.cut() },
+        { label: '复制', accelerator: 'CmdOrCtrl+C', enabled: f.canCopy, click: () => wc.copy() },
+        { label: '粘贴', accelerator: 'CmdOrCtrl+V', enabled: f.canPaste, click: () => wc.paste() },
+        { label: '删除', accelerator: 'Delete', enabled: f.canDelete, click: () => wc.delete() },
+        { type: 'separator' },
+        { label: '全选', accelerator: 'CmdOrCtrl+A', enabled: f.canSelectAll, click: () => wc.selectAll() },
+      ];
+
+      // 链接：复制地址 + 在浏览器打开（后者受「外链」开关约束）
+      if (params.linkURL) {
+        items.push({ type: 'separator' });
+        items.push({ label: '复制链接地址', click: () => clipboard.writeText(params.linkURL) });
+        if (this.on('externalLinks') && /^https?:\/\//i.test(params.linkURL)) {
+          items.push({
+            label: '在浏览器中打开链接',
+            click: () => void shell.openExternal(params.linkURL),
+          });
+        }
+      }
+
+      // 图片：复制到剪贴板 / 另存为
+      if (params.hasImageContents && params.srcURL) {
+        const { x, y } = params;
+        items.push({ type: 'separator' });
+        items.push({ label: '复制图片', click: () => wc.copyImageAt(x, y) });
+        items.push({ label: '图片另存为…', click: () => wc.downloadURL(params.srcURL) });
+      }
+
+      // 选中文字时给个「复制」的补充入口（有些区域不是可编辑元素，editFlags.canCopy 可能为假）
+      if (params.selectionText && !f.canCopy) {
+        items.push({ type: 'separator' });
+        items.push({ label: '复制选中文字', click: () => clipboard.writeText(params.selectionText) });
+      }
+
+      if (!app.isPackaged) {
+        items.push({ type: 'separator' });
+        items.push({ label: '检查元素', click: () => wc.inspectElement(params.x, params.y) });
+      }
+
+      Menu.buildFromTemplate(items).popup({ window: this.win });
+    });
+  }
+
   loadLoadingPage(): void {
     if (!this.contentView) return;
     void this.contentView.webContents.loadFile(path.join(rendererDir(), 'loading.html'));
@@ -369,6 +441,7 @@ export class WindowManager {
       },
     });
     this.contentView = view;
+    this.bindContextMenu(view); // 重建视图要重新挂右键菜单
     this.win.contentView.addChildView(view);
     this.applyContentInset();
     void view.webContents.loadFile(path.join(rendererDir(), 'recovery.html'));
