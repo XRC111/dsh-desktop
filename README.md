@@ -1,6 +1,6 @@
 # DSH Desktop
 
-把 **DeepSeek Harness**（npm 包 `@deepseek-ai/dsh`）封装成开箱即用的 Windows 桌面应用。
+把 **DeepSeek Harness**封装成开箱即用的 Windows 桌面应用。
 
 双击安装包即用，**用户机器不需要安装 Node.js / npm / pnpm 或任何运行时**。
 
