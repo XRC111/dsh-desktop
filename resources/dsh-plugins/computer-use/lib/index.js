@@ -425,22 +425,9 @@ function apply(ctx, config) {
       },
     }),
     execute(args) {
-      // 与 key_press / key_type 同样的前台守卫。点击比输入更直观，也更容易误伤：
-      // 坐标算对了但前台不是目标时，这一下会落到挡在上面的窗口上。
-      if (args?.hwnd) {
-        const a = w32.activateAndWait(String(args.hwnd));
-        if (!a.settled) {
-          const info = w32.processOfWindow(a.foreground);
-          const err = new Error(
-            `点击中止：无法把目标窗口切到前台。期望 hwnd=${String(args.hwnd)}，` +
-              `实际 hwnd=${a.foreground}` + (info.name ? `（${info.name}）` : ''),
-          );
-          err.expectedHwnd = String(args.hwnd);
-          err.actualHwnd = a.foreground;
-          err.actualProcess = info.name ?? '';
-          throw err;
-        }
-      }
+      // 前台守卫（内含自动重试）：坐标算对了但前台不是目标时，这一下会落到挡在
+      // 上面的窗口上。ensureForeground 失败会抛结构化错误。
+      w32.ensureForeground(args?.hwnd);
       return Promise.resolve(
         w32.mouseClick(
           typeof args?.x === 'number' ? args.x : undefined,
@@ -510,21 +497,7 @@ function apply(ctx, config) {
       // ⚠️ 但 activateAndWait 的返回值只是**那一刻**的快照。DSH 自己的 Electron GUI
       // （或 IM 宿主）可能在注入前又把前台抢回去。所以注入前再校验一次，
       // 不一致就报错，绝不带着「以为成功」继续 —— 否则输入会落到用户当前窗口上。
-      if (args?.hwnd) {
-        const r = w32.activateAndWait(String(args.hwnd));
-        if (!r.settled) {
-          const info = w32.processOfWindow(r.foreground);
-          const err = new Error(
-            `注入中止：无法把目标窗口切到前台。期望 hwnd=${String(args.hwnd)}，` +
-              `实际 hwnd=${r.foreground}` + (info.name ? `（${info.name}）` : ''),
-          );
-          err.expectedHwnd = String(args.hwnd);
-          err.actualHwnd = r.foreground;
-          err.actualProcess = info.name ?? '';
-          throw err;
-        }
-      }
-      w32.assertForeground(args?.hwnd);
+      w32.ensureForeground(args?.hwnd);
 
       const steps = [];
       for (let i = 0; i < codes.length - 1; i++) steps.push({ vk: codes[i].vk, up: false, extended: codes[i].ext });
@@ -575,21 +548,7 @@ function apply(ctx, config) {
       // 需要快捷键请用 key_press。这里只负责「打字」。
       // 与 key_press 同样的前台守卫：先切、等生效、注入前再校验。
       // 文本注入比按键更危险 —— 几百字进错窗口几乎无法察觉，只能靠事后截图发现。
-      if (args?.hwnd) {
-        const a = w32.activateAndWait(String(args.hwnd));
-        if (!a.settled) {
-          const info = w32.processOfWindow(a.foreground);
-          const err = new Error(
-            `输入中止：无法把目标窗口切到前台。期望 hwnd=${String(args.hwnd)}，` +
-              `实际 hwnd=${a.foreground}` + (info.name ? `（${info.name}）` : ''),
-          );
-          err.expectedHwnd = String(args.hwnd);
-          err.actualHwnd = a.foreground;
-          err.actualProcess = info.name ?? '';
-          throw err;
-        }
-      }
-      w32.assertForeground(args?.hwnd);
+      w32.ensureForeground(args?.hwnd);
 
       const r = w32.typeUnicode(text);
       if (r.failed) {

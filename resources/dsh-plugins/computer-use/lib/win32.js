@@ -576,6 +576,48 @@ export function activateAndWait(hwnd, timeoutMs = 500) {
   return { hwnd: String(hwnd), foreground: cur, settled: cur === target };
 }
 
+/**
+ * 把目标窗口切到前台，并**确认它真的在前台**；失败自动重试。
+ *
+ * 为什么需要重试（实测）：DSH 自己的 Electron 窗口会在激活的瞬间抢一下前台，
+ * 导致第一次 activateAndWait 返回 settled=false。但紧接着再切一次就稳了 ——
+ * 实测「第一次失败、第二次成功」。把这个重试放在工具内部，调用方就不用手动重来。
+ *
+ * @param hwnd 目标窗口；空值表示不需要切换（返回 ok）。
+ * @param attempts 最多尝试几次（含首次）。
+ * @returns { ok, expected, actual, actualProcess, attempts }
+ * @throws 全部尝试都失败时抛出结构化错误（带 expected/actual/进程名）。
+ */
+export function ensureForeground(hwnd, attempts = 4) {
+  if (hwnd === undefined || hwnd === null || hwnd === '') return { ok: true };
+  const target = String(BigInt(hwnd));
+  let last = target;
+  for (let i = 1; i <= attempts; i++) {
+    const r = activateAndWait(hwnd, i === 1 ? 500 : 300);
+    if (r.settled) return { ok: true, expected: target, actual: r.foreground, attempts: i };
+    last = r.foreground;
+    // 失败后稍等再试：抢前台的那个瞬间过去之后，第二次基本都能成
+    const until = Date.now() + 120;
+    while (Date.now() < until) { /* spin */ }
+  }
+  const info = processOfWindow(last);
+  const f = funcs();
+  const tbuf = Buffer.alloc(1024);
+  const tn = f.GetWindowTextW(BigInt(last), tbuf, 512);
+  const title = wstr(tbuf, tn);
+  const err = new Error(
+    `注入中止：连续 ${attempts} 次都无法把目标窗口切到前台。` +
+      `期望 hwnd=${target}，实际 hwnd=${last}` +
+      (info.name ? `（${info.name}）` : '') +
+      (title ? `“${title}”` : ''),
+  );
+  err.expectedHwnd = target;
+  err.actualHwnd = last;
+  err.actualProcess = info.name ?? '';
+  err.actualTitle = title;
+  throw err;
+}
+
 export function sendKeySteps(steps) {
   const f = funcs();
   const INPUT_SIZE = 40;
