@@ -31,6 +31,47 @@ import path from 'node:path';
 import { defineTool } from '@deepseek-ai/dsh-tools';
 import * as w32 from './win32.js';
 
+/**
+ * 活跃心跳：把「computer use 正在跑」写到一个状态文件里，外壳读它决定是否显示悬浮球、
+ * 以及是否抑制主窗口抢焦点。
+ *
+ * 为什么走文件而不是 IPC / 客户端插件：
+ *   computer use 的工具跑在 dsh 子进程里，而抢焦点的是外壳的 Electron 窗口 ——
+ *   两边不同进程。客户端插件那条路依赖宿主的事件 API（各版本形状不一，
+ *   实测 `ctx.events` 并不存在，会话事件是 `tool/result` 这种 session 事件类型，
+ *   要通过 `ctx.sessions` 订阅），耦合太深。
+ *   而这个插件**在每次 execute 时天然知道**自己跑了什么 —— 那是确定的信号源。
+ *   写文件是最低耦合的跨进程方式，且外壳可以顺手做超时兜底。
+ *
+ * 文件位置：$DSH_HOME/computer-use-active.json（DSH_HOME 由外壳传入）。
+ * 失败一律静默 —— 心跳只影响 UI 提示，绝不能因为它拖垮工具本身。
+ */
+function heartbeatPath() {
+  const home = process.env.DSH_HOME;
+  if (!home) return null;
+  return path.join(home, 'computer-use-active.json');
+}
+
+/** 写一次心跳。active=false 表示结束。 */
+function beat(active, action) {
+  try {
+    const file = heartbeatPath();
+    if (!file) return;
+    if (!active) {
+      // 结束时直接删掉：外壳读不到就是「没在跑」，比写 active:false 更省事
+      fs.rmSync(file, { force: true });
+      return;
+    }
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ active: true, action: action || '', pid: process.pid, at: Date.now() }),
+      'utf8',
+    );
+  } catch {
+    /* 心跳失败不影响工具 */
+  }
+}
+
 const name = 'computer-use';
 // 只注入 tools；attachments / 其它服务一律 ctx.get() 惰性取（缺失可降级）
 const inject = ['tools'];
@@ -160,6 +201,39 @@ function apply(ctx, config) {
   const canWindows = allowWindows || legacyAll;
 
   // ── 只读：列窗口 ──────────────────────────────────────────────────────────
+  // ── 活跃心跳包装 ────────────────────────────────────────────────────────
+  // 把 register 包一层：每个工具 execute 前后自动打心跳，工具实现本身不用改。
+  // 这样「哪个工具在跑」这个信息只在一处维护，新增工具也不会漏。
+  const registerRaw = ctx.tools.register.bind(ctx.tools);
+  const ACTION_LABEL = {
+    screen_shot: '正在截图',
+    screen_windows: '正在查看窗口列表',
+    screen_elements: '正在识别界面元素',
+    screen_activate: '正在切换窗口',
+    screen_resize: '正在调整窗口',
+    mouse_move: '正在移动鼠标',
+    mouse_click: '正在点击',
+    mouse_scroll: '正在滚动',
+    key_press: '正在按键',
+    key_type: '正在输入文本',
+  };
+  ctx.tools.register = (tool) => {
+    const inner = tool.execute;
+    if (typeof inner === 'function') {
+      tool.execute = async function (args, ...rest) {
+        beat(true, ACTION_LABEL[tool.name] || '正在操作本机');
+        try {
+          return await inner.call(this, args, ...rest);
+        } finally {
+          // 只读工具（截图/列表）不改变系统状态，不算「正在操作」；
+          // 会动鼠标键盘/窗口的才需要在结束后保持一段可见状态。
+          if (/^(screen_|mouse_move)/.test(tool.name)) beat(false);
+        }
+      };
+    }
+    return registerRaw(tool);
+  };
+
   ctx.tools.register(defineTool({
     name: 'screen_windows',
     description:

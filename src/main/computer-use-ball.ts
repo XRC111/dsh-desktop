@@ -19,8 +19,16 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { BrowserWindow, nativeImage, app, ipcMain } from 'electron';
 import { log } from './logger';
+import { dshHomeDir } from './paths';
 
 const BALL_SIZE = 56;
+
+/** 心跳文件：computer-use 宿主插件在每次工具执行时写，外壳读它。 */
+const HEARTBEAT_FILE = () => path.join(dshHomeDir(), 'computer-use-active.json');
+/** 轮询间隔。心跳是「有没有在跑」的粗粒度信号，500ms 足够且几乎不耗资源。 */
+const POLL_MS = 500;
+/** 超过这个时间没更新就认为已结束（工具卡死/进程被杀时的兜底）。 */
+const STALE_MS = 15000;
 /** 悬浮球专用 preload：只暴露一个 click()，不暴露 node。 */
 const BALL_PRELOAD =
   'data:text/javascript;base64,' +
@@ -30,7 +38,6 @@ const BALL_PRELOAD =
       `  click: () => ipcRenderer.send('app:ball-click')` +
       `});`
   ).toString('base64');
-const IPC_SET_STATE = 'app:computer-use-state';
 
 export interface ComputerUseState {
   active: boolean;
@@ -49,6 +56,7 @@ export class ComputerUseBall {
   private action = '';
   /** 主窗口当前是否可见（由外壳同步进来，决定是否允许显示悬浮球） */
   private mainVisible = true;
+  private timer: NodeJS.Timeout | null = null;
   /** 自动化激活且主窗口隐藏时回调，外壳据此设置 suppressAutoFocus */
   onActiveChange?: (suppress: boolean) => void;
 
@@ -111,25 +119,46 @@ export class ComputerUseBall {
       `).catch(() => { /* ignore */ });
     });
 
-    this.registerIpc();
-    log('computer use 悬浮球已创建（初始隐藏）');
+    if (ipcMain.listenerCount('app:ball-click') === 0) {
+      ipcMain.on('app:ball-click', () => this.handlers.onOpenMainWindow());
+    }
+    this.startPolling();
+    log('computer use 悬浮球已创建（初始隐藏，轮询 ' + HEARTBEAT_FILE() + '）');
   }
 
-  /** 供渲染进程上报 computer use 活跃状态 */
-  private registerIpc(): void {
-    if (ipcMain.listenerCount('app:ball-click') === 0) {
-      ipcMain.on('app:ball-click', () => {
-        this.handlers.onOpenMainWindow();
-      });
+  /**
+   * 轮询心跳文件。
+   *
+   * 为什么不用客户端插件上报：computer use 的工具跑在 dsh 子进程里，
+   * 客户端插件要订阅宿主的会话事件（`tool/result` 是 session 事件类型，
+   * 得经 `ctx.sessions` 拿），各版本形状不一、耦合深。
+   * 而宿主侧插件在每次 execute 时天然知道自己在跑 —— 它写文件，外壳读文件，
+   * 是最低耦合的跨进程方式。
+   */
+  private startPolling(): void {
+    if (this.timer) return;
+    this.timer = setInterval(() => this.poll(), POLL_MS);
+    // 不让这个定时器拖住进程退出
+    this.timer.unref?.();
+    this.poll();
+  }
+
+  private poll(): void {
+    let active = false;
+    let action = '';
+    try {
+      const file = HEARTBEAT_FILE();
+      const raw = fs.readFileSync(file, 'utf8');
+      const data = JSON.parse(raw) as { active?: boolean; action?: string; at?: number };
+      const at = typeof data.at === 'number' ? data.at : 0;
+      if (data.active === true && Date.now() - at < STALE_MS) {
+        active = true;
+        action = typeof data.action === 'string' ? data.action : '';
+      }
+    } catch {
+      // 文件不存在 / 正在写 / 内容不完整 —— 都按「没在跑」处理
     }
-    if (ipcMain.listenerCount(IPC_SET_STATE) > 0) return;
-    ipcMain.on(IPC_SET_STATE, (_e, payload: unknown) => {
-      const p = (payload ?? {}) as Partial<ComputerUseState>;
-      this.setState({
-        active: p.active === true,
-        action: typeof p.action === 'string' ? p.action : '',
-      });
-    });
+    this.setState({ active, action });
   }
 
   /** 同步主窗口可见性：主窗口可见时不显示悬浮球（避免和主窗口抢注意力） */
@@ -177,6 +206,7 @@ export class ComputerUseBall {
   }
 
   destroy(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
     if (this.win && !this.win.isDestroyed()) {
       this.win.destroy();
     }
