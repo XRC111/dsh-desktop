@@ -89,8 +89,13 @@ export function dshPluginsSourceDir(): string {
  *
  * dsh 的加载器是**以 profile 目录为基准**解析包名的
  * （报错形如 `Cannot find package 'X' imported from …/profiles/web/`），
- * 而它自己的 `healProfilesModuleFallback` 只会把**自身依赖闭包里**的包
- * 链进这里。我们的插件不在那个闭包里，所以必须由外壳自己放进去。
+ * 而它自己只会把**自身依赖闭包里**的包链进这里（0.1.x 的 healProfilesModuleFallback；
+ * 0.2.0 已不再新建，只保留 removeLinkProjections 清理旧式 .dsh-module-fallback）。
+ * 我们的插件不在那个闭包里，所以必须由外壳自己放进去。
+ *
+ * 注意：dsh 链进来的那些链接**按当时那份运行时写死目标且无版本校验** —— 先后跑过两份
+ * 运行时（开发态 + 安装版、或换过安装路径）就会残留指向旧运行时的链接，而入口用的是
+ * 新的，同一个进程里两套 harness 并存。启动时的替换逻辑见 profile-links.ts。
  */
 export function profileModulesDir(): string {
   return path.join(dshHomeDir(), 'profiles', 'node_modules');
