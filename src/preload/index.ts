@@ -79,6 +79,18 @@ const api = {
    */
   reportTaskState: (state: { running: boolean; unloading?: boolean }) =>
     ipcRenderer.send('app:task-state', state),
+
+  // ── 技能与 MCP 管理（设置页「技能与 MCP」面板）────────────────────────────
+  // 这两样在 DSH 里都是文件/配置驱动的，没有界面。这里把宿主侧的读写包一层。
+  // 所有写操作都返回 { error } 而不是抛异常 —— 界面要能把错误显示出来。
+  listSkills: () => ipcRenderer.invoke('app:skills-list'),
+  createSkill: (name: string, description: string) =>
+    ipcRenderer.invoke('app:skills-create', { name, description }),
+  deleteSkill: (name: string) => ipcRenderer.invoke('app:skills-delete', { name }),
+  openSkillsDir: () => ipcRenderer.invoke('app:open-skills-dir'),
+  listMcpServers: () => ipcRenderer.invoke('app:mcp-list'),
+  saveMcpServers: (servers: unknown[]) =>
+    ipcRenderer.invoke('app:mcp-save', { servers }),
 };
 
 contextBridge.exposeInMainWorld('dshDesktop', api);

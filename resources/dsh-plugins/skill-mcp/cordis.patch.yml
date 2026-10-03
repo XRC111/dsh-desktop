@@ -1,0 +1,5 @@
+# 「技能与 MCP」管理面板：把这一节挂进 Harness 设置页。
+# 与 @dsh-desktop/shell、@dsh-desktop/updater 同一套路（禁用/新增都靠 insert）。
+- insert:
+    - id: dsh-desktop-skill-mcp
+      name: '@dsh-desktop/skill-mcp'

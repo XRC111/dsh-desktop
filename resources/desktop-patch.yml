@@ -104,6 +104,20 @@
     - id: dsh-desktop-computer-use
       name: '@dsh-desktop/computer-use'
 
+    # 技能与 MCP 管理面板：设置 → 技能与 MCP
+    #
+    # 这两样在 DSH 里都是**文件/配置驱动、没有界面**的：
+    #   · 技能 = 技能根目录下的 <name>/SKILL.md，靠 dsh-skill-filesystem 扫描发现
+    #   · MCP  = 补丁层里的 insert 条目（name = @deepseek-ai/dsh-mcp-client），手写 YAML
+    #
+    # 本插件把它们收敛成可点可填的界面。读写由外壳主进程的 src/main/skill-mcp.ts 完成：
+    #   · 技能写在 $DSH_HOME/skills/（dsh 的 user-dsh 根，天然被发现）
+    #   · MCP 配置存在 $APPDATA/DSH-Desktop/mcp-servers.json
+    #     启动时由 patch-guard 生成 YAML 追加进「生效补丁」——
+    #     不直接写 desktop-patch.yml，因为那是仓库产物，热更新会整份覆盖、抹掉用户配置。
+    - id: dsh-desktop-skill-mcp
+      name: '@dsh-desktop/skill-mcp'
+
 # ── 4) Windows：命令执行改用「本地」后端，消除控制台窗口弹出 ────────────────
 #
 # 【现象】在 Windows 上让 Harness 跑命令时，会莫名其妙弹出一个控制台窗口。

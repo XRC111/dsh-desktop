@@ -55,6 +55,16 @@ import { injectAttachmentPicker, registerAttachmentPickerHandlers } from './atta
 import { ensureHiddenConsole, ensureWin32ProcessNoWindowPatch } from './win-console';
 import { ensureAclDefaultDaclPatch } from './acl-patch';
 import { ComputerUseBall } from './computer-use-ball';
+import {
+  listMcpServers,
+  buildMcpPatchYaml,
+  listSkills,
+  createSkill,
+  deleteSkill,
+  saveMcpServers,
+  mcpConfigFile,
+  userSkillsDir,
+} from './skill-mcp';
 
 /** dsh web 的首选端口，被占用时自动回退到系统分配端口 */
 const PREFERRED_PORT = 3080;
@@ -323,6 +333,24 @@ async function startService(): Promise<void> {
     { 'dsh-desktop-computer-use': cuConfig },
   );
 
+  // 把用户配置的 MCP 服务器追加进「生效补丁」。
+  //
+  // 为什么不直接写 desktop-patch.yml：那个文件是**仓库产物**，热更新会整份覆盖，
+  // 用户配置会被抹掉。所以 MCP 配置存在自己的 mcp-servers.json，这里生成 YAML 追加。
+  // 生成而不是让用户手写：args 里常带 Windows 路径（反斜杠+盘符），YAML 转义写错
+  // 会让整个补丁解析失败 → dsh 起不来。
+  let patchFile = patchGuard.file;
+  try {
+    const mcpYaml = buildMcpPatchYaml(listMcpServers());
+    if (mcpYaml) {
+      fs.appendFileSync(patchFile, mcpYaml, 'utf8');
+      log('已把 MCP 服务器配置追加进生效补丁：' + patchFile);
+    }
+  } catch (err) {
+    // 追加失败不能阻断启动：最多是 MCP 不生效，比起不来强
+    log('追加 MCP 配置失败（不影响启动）：' + String(err));
+  }
+
   // 插件兼容层：dsh 0.2.0 起按 manifest 的 peerDependencies 强制校验，声明写死在
   // 旧区间的插件会被**静默禁用**（如 dshmarket 的 dsh-settings: ^0.1.x 不含 0.2.x）。
   // 对「声明过时但依赖包仍在运行时」的插件写官方豁免（profiles/web/compatibility.json），
@@ -355,7 +383,7 @@ async function startService(): Promise<void> {
     listenPort: port,
     portFallback: fallback,
     dshHome: dshHomeDir(),
-    patchFile: patchGuard.file,
+    patchFile,
     version: install.version,
     // 首次启动 dsh 会在 DSH_HOME/profiles 下建立 profile 依赖（数百个符号链接/文件）。
     // 在启用实时防护的机械盘或企业管控机器上，这一步实测可能持续数分钟，
@@ -642,6 +670,57 @@ function registerIpc(): void {
   });
 
   // ── 更新 ──────────────────────────────────────────────────────────────────
+  // ── 技能与 MCP 管理 ──────────────────────────────────────────────────────
+  // 这两个都是「文件/配置驱动、没有界面」的东西，这里给界面提供读写入口。
+  // 所有写入都做校验（见 skill-mcp.ts）—— 写坏配置会让 dsh 起不来。
+  ipcMain.handle('app:skills-list', () => {
+    try {
+      return { skills: listSkills(process.cwd()) };
+    } catch (err) {
+      return { skills: [], error: String((err as Error)?.message ?? err) };
+    }
+  });
+  ipcMain.handle('app:skills-create', (_e, payload: unknown) => {
+    const p = (payload ?? {}) as { name?: unknown; description?: unknown };
+    try {
+      return { skill: createSkill(String(p.name ?? ''), String(p.description ?? '')) };
+    } catch (err) {
+      return { error: String((err as Error)?.message ?? err) };
+    }
+  });
+  ipcMain.handle('app:skills-delete', (_e, payload: unknown) => {
+    const p = (payload ?? {}) as { name?: unknown };
+    try {
+      deleteSkill(String(p.name ?? ''));
+      return { ok: true };
+    } catch (err) {
+      return { error: String((err as Error)?.message ?? err) };
+    }
+  });
+  ipcMain.handle('app:mcp-list', () => {
+    try {
+      return { servers: listMcpServers(), file: mcpConfigFile() };
+    } catch (err) {
+      return { servers: [], error: String((err as Error)?.message ?? err) };
+    }
+  });
+  ipcMain.handle('app:mcp-save', (_e, payload: unknown) => {
+    const p = (payload ?? {}) as { servers?: unknown };
+    try {
+      if (!Array.isArray(p.servers)) throw new Error('servers 必须是数组');
+      saveMcpServers(p.servers as never);
+      return { ok: true, servers: listMcpServers() };
+    } catch (err) {
+      return { error: String((err as Error)?.message ?? err) };
+    }
+  });
+  ipcMain.handle('app:open-skills-dir', async () => {
+    const dir = userSkillsDir();
+    await fs.promises.mkdir(dir, { recursive: true }).catch(() => {});
+    await shell.openPath(dir);
+    return { ok: true, dir };
+  });
+
   ipcMain.handle('app:get-update-state', () => updater?.getState() ?? null);
   /**
    * 版本信息（页面内小部件用）：外壳版本 + Harness 运行时版本 + 更新源。
