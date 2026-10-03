@@ -4,7 +4,7 @@
 
 双击安装包即用，**用户机器不需要安装 Node.js / npm / pnpm 或任何运行时**。
 
-[![Release](https://img.shields.io/github/v/release/XRC111/dsh-desktop?label=release)](https://github.com/XRC111/dsh-desktop/releases/tag/packages)
+[![Release](https://img.shields.io/github/v/release/XRC111/dsh-desktop?label=release)](https://github.com/XRC111/dsh-desktop/releases/)
 [![License](https://img.shields.io/badge/license-MIT-blue)](./package.json)
 
 ---
@@ -12,7 +12,7 @@
 ## 目录
 
 - [1. 快速开始](#1-快速开始)
-- [2. 设计原则（铁律）](#2-设计原则铁律)
+- [2. 设计原则](#2-设计原则铁律)
 - [3. 架构](#3-架构)
 - [4. 目录结构](#4-目录结构)
 - [5. 关键集成边界](#5-关键集成边界实测结论)
@@ -30,7 +30,7 @@
 
 ### 装（最终用户）
 
-安装包**一版一个 release**，tag 用日期+序号（如 [`2026.10.01-1`](https://github.com/XRC111/dsh-desktop/releases/tag/2026.10.01-1)），不再堆在一个 `packages` tag 里。
+安装包**一版一个 release**，tag 用日期+序号（如 [`2026.10.01-1`](https://github.com/XRC111/dsh-desktop/releases/tag/2026.10.01-1)）。
 
 | 安装包 | 通道 | 内嵌 dsh | 适用 |
 | --- | --- | --- | --- |
@@ -58,7 +58,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build.ps1
 
 ---
 
-## 2. 设计原则（铁律）
+## 2. 设计原则
 
 这几条是硬约束，改动前请先读——它们解释了为什么代码长这样。
 
