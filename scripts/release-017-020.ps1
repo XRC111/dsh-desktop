@@ -129,6 +129,9 @@ $psArgs = New-Object System.Collections.ArrayList
 [void]$psArgs.Add('-ExecutionPolicy'); [void]$psArgs.Add('Bypass')
 [void]$psArgs.Add('-File'); [void]$psArgs.Add('scripts\release-v2.ps1')
 
+# nightly runs in CI only - never build it locally (without -SkipNightly, release-v2.ps1 tries a source build and throws)
+[void]$psArgs.Add('-SkipNightly')
+
 # 未选中的通道 → 加对应的 -Skip 开关
 foreach ($k in $all) {
     if ($wanted -notcontains $k) { [void]$psArgs.Add($skip[$k]) }
