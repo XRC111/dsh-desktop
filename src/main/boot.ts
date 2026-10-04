@@ -69,6 +69,7 @@ import {
 import { diagnose, FIXES, currentSafeMode, environmentSummary } from './recovery';
 import { prepareBundles } from './safe-mode';
 import { ensureProfileModuleLinks } from './profile-links';
+import { envWarnings } from './env-check';
 
 /** dsh web 的首选端口，被占用时自动回退到系统分配端口 */
 const PREFERRED_PORT = 3080;
@@ -478,6 +479,17 @@ async function quitApp(): Promise<void> {
   app.exit(0);
 }
 
+/** 环境体检结论：有问题时写明，没问题不占地方 */
+function describeEnvCheck(): string {
+  try {
+    const list = envWarnings();
+    if (list.length === 0) return '';
+    return `环境告警: ${list.map((w) => w.title).join('；')}`;
+  } catch {
+    return '';
+  }
+}
+
 /** 插件落位概况：有影子/自愈时写进诊断，平时不占地方 */
 function describePluginInstall(): string {
   const r = lastPluginInstall();
@@ -584,6 +596,7 @@ function buildDiagnostics(): string {
         ? `差分补丁（补丁版本 ${appliedPatch(findRuntimeDir())!.version}）`
         : '内置/完整包'
     }`,
+    describeEnvCheck(),
     `profile 目录: ${profileModulesDir()}`,
     describeProfileLinks(),
     describePluginInstall(),
@@ -755,6 +768,8 @@ function registerIpc(): void {
     clipboard.writeText(buildDiagnostics());
     return true;
   });
+  // 环境依赖体检：结果只依赖本机环境，模块内缓存一次
+  ipcMain.handle('app:get-env-warnings', () => envWarnings());
   // ── 功能开关（设置页「桌面」面板）─────────────────────────────────────────
   ipcMain.handle('app:get-features', () => shellFeatures?.snapshot() ?? { values: {}, defs: [] });
   ipcMain.handle('app:set-feature', (_e, payload: unknown) => {
@@ -999,6 +1014,8 @@ app.whenReady().then(async () => {
   registerAttachmentPickerHandlers();
   injectAttachmentPicker(windowManager.content);
   injectClientScript(windowManager.content, 'update-banner.client.js', '更新横幅');
+  // 环境依赖告警（如 Win7 的 PowerShell 2.0）：说明「为什么命令工具一直失败」
+  injectClientScript(windowManager.content, 'env-banner.client.js', '环境告警横幅');
   // 拖放附件与任务状态上报：都是页面侧脚本，各自读开关决定要不要生效
   injectClientScript(windowManager.content, 'drag-drop-attach.client.js', '拖放附件');
   injectClientScript(windowManager.content, 'task-reporter.client.js', '任务状态上报');

@@ -26,6 +26,11 @@ const api = {
   /** 复制诊断信息 */
   copyDiagnostics: () => ipcRenderer.invoke('app:copy-diagnostics'),
   /**
+   * 环境依赖体检结果（目前只有 Windows 上 PowerShell 版本过低一项）。
+   * 返回数组，可能为空。只读；界面拿它决定要不要显示告警横幅。
+   */
+  getEnvWarnings: () => ipcRenderer.invoke('app:get-env-warnings'),
+  /**
    * 更新相关（供页面内小部件使用，见 renderer/updater.client.js）
    * 只暴露状态查询与已存在的动作，不暴露任意下载/执行能力。
    */

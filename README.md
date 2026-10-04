@@ -448,6 +448,18 @@ dsh 0.1.7 起有宿主指纹白名单（见 [5.2](#52-dsh-017-起的宿主指纹
 
 纯 JS 解压实测：26617 个文件 / 474 MB 用时 **12.5 s**（NVMe，单线程）；热壳（33 文件）、运行时差分（441 文件）、插件包三份真实产物与系统 tar 的结果**逐文件 SHA256 完全一致**。
 
+**Win7 的 PowerShell 版本要求（5.0 以上）。**
+
+Harness 的 `pwsh` 工具走 `@deepseek-ai/dsh-pwsh-local`，它按固定顺序解析可执行文件：`%ProgramFiles%\PowerShell\7\pwsh.exe` → `PATH` 里的 `pwsh.exe` → `%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe`。
+
+- Win10/11 通常命中前两者（PowerShell 7，自带 UTF-8），无问题；
+- **Win7 必然命中最后一条**：装不了应用商店版的 pwsh，且 PowerShell 7 从 .NET 6 那一代起不再支持 Win7；
+- 而该执行器给每条命令加的前导用了 `[Type]::new(...)`，这是 **PowerShell 5.0** 才有的语法。Win7 SP1 出厂自带 2.0（WMF 3 / WMF 4 也都不满足），前导会直接抛「找不到 new 的重载」→ **每条命令都失败且没有任何输出**，用户看不出原因。
+
+外壳现在会在启动时做一次探测（`src/main/env-check.ts`，按与 dsh **完全相同**的顺序解析出「实际会用哪个」，再问它的主版本号），低于 5 就在页面顶部显示告警横幅（`src/renderer/env-banner.client.js`），附官方下载页与「复制修法 / 复制诊断信息」。探测失败一律**不报警**（宁可漏报，也不要因一次超时或杀软拦截就天天弹假警告）。
+
+> 修复办法：安装 **Windows Management Framework 5.1**（<https://www.microsoft.com/download/details.aspx?id=54616>）后重启应用。
+
 ### 8.5 桌面适配开关
 
 十一个开关，可在 设置 → 桌面 单独开关。前六个是**桌面适配**，后五个是 **computer use（让 AI 操作本机）** 的能力闸门：
