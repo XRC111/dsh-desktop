@@ -140,3 +140,25 @@
 # "children share the host console" —— 只要**宿主进程本身有控制台**（哪怕是隐藏的），
 # 沙箱子进程就会继承它，不再新建窗口。
 # 所以由桌面外壳在启动 dsh 前分配并隐藏一个控制台即可（见 src/main/win-console.ts）。
+
+# ── 5) 远程联动（手机 ↔ 桌面）─────────────────────────────────────────────
+#
+# 让桌面与手机互为「远程设备」：
+#   link_host_start / link_host_status / link_host_code / link_host_stop
+#       桌面侧开服务、生成 6 位配对码（一次性、默认 5 分钟有效）；
+#   phone_*   操作已配对的手机（状态/截图/元素/点击/滚动/输入/按键/推文件）；
+#   link_share_model  把桌面模型配置发给手机（含 API Key 时走会话密钥加密）。
+#
+# 手机侧对应插件是 @dsh-android/link（随 DSH Android 发布），用 link_connect 配对。
+# 链路是局域网明文 TCP + 配对令牌；凭据字段用握手时 ECDH 派生的会话密钥 AES-GCM
+# 封装后才进帧 —— 被动嗅探拿不到 Key，但**不防中间人**，界面文案不要写成端到端加密。
+#
+# computer.* 的实现直接复用 computer-use 的 lib/win32.js（相对路径从 lib/ 往上两级）。
+# 不用 ctx.tools.execute 是因为那是给模型用的分发入口，插件间调用会绕开它的前置检查，
+# 且 PTC 模式下无 parent 的调用会被判 UNKNOWN_TOOL。缺 computer-use 时联动仍可用，
+# 只是 computer.* 明确报错 —— 刻意的降级。
+#
+# 包本体由外壳落位（resources/dsh-plugins/link → profiles/node_modules/@dsh-desktop/link）。
+- insert:
+    - id: dsh-desktop-link
+      name: '@dsh-desktop/link'
