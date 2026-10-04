@@ -1,6 +1,6 @@
 {
   "name": "@dsh-desktop/shell",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DSH Desktop shell panel: desktop integration feature toggles inside Harness settings",
   "type": "module",
   "main": "./lib/index.js",
@@ -30,5 +30,6 @@
     }
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "dshDesktopBuild": "e3544c69320e3f41"
 }
