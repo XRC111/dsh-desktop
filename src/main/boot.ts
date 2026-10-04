@@ -478,6 +478,68 @@ async function quitApp(): Promise<void> {
   app.exit(0);
 }
 
+/** 读日志文件最后 n 行；文件缺失/读失败返回空串（不进诊断，避免噪音） */
+function tailOf(file: string, n: number, label: string): string {
+  try {
+    const tail = fs
+      .readFileSync(file, 'utf8')
+      .split(/\r?\n/)
+      .filter((l) => l.trim());
+    return tail.length ? `${label}（末 ${Math.min(n, tail.length)} 行）:\n${tail.slice(-n).join('\n')}` : '';
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * profile 共享 node_modules 里链接的健康度。
+ *
+ * 这些链接是「当时那份运行时」链进去的，且没有版本校验 —— 机器上先后跑过两份运行时
+ * （开发态 + 安装版、或换过安装路径）时会残留指向旧运行时的链接，而入口用的是新运行时。
+ * 这里只统计不修改（修复见 profile-links.ts 的 ensureProfileModuleLinks）。
+ */
+function describeProfileLinks(): string {
+  const root = profileModulesDir();
+  const runtimeNm = path.join(findRuntimeDir(), 'node_modules').toLowerCase();
+  let total = 0;
+  let mismatched = 0;
+  const samples: string[] = [];
+
+  const visit = (dir: string, prefix: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      if (e.name.startsWith('@')) {
+        visit(full, `${prefix}${e.name}/`);
+        continue;
+      }
+      let real: string;
+      try {
+        real = fs.realpathSync(full);
+      } catch {
+        continue;
+      }
+      if (real.toLowerCase() === full.toLowerCase()) continue; // 不是链接
+      total++;
+      if (!real.toLowerCase().startsWith(runtimeNm)) {
+        mismatched++;
+        if (samples.length < 3) samples.push(`${prefix}${e.name} → ${real}`);
+      }
+    }
+  };
+  visit(root, '');
+
+  if (total === 0) return `profile 链接: 无（${root}）`;
+  if (mismatched === 0) return `profile 链接: ${total} 个，全部指向当前运行时`;
+  return `profile 链接: ${total} 个，其中 ${mismatched} 个指向其它运行时 → ${samples.join('；')}`;
+}
+
 function buildDiagnostics(): string {
   const lines = [
     'DSH Desktop 诊断信息',
@@ -499,6 +561,16 @@ function buildDiagnostics(): string {
     `日志目录: ${logsDir()}`,
     `主日志: ${mainLogFile()}`,
     `dsh 日志: ${dshLogFile()}`,
+    `通道: ${updater?.getChannel() ?? 'stable'}`,
+    `运行时来源: ${
+      appliedPatch(findRuntimeDir())
+        ? `差分补丁（补丁版本 ${appliedPatch(findRuntimeDir())!.version}）`
+        : '内置/完整包'
+    }`,
+    `profile 目录: ${profileModulesDir()}`,
+    describeProfileLinks(),
+    tailOf(mainLogFile(), 50, '主日志尾部'),
+    tailOf(dshLogFile(), 50, 'dsh 日志尾部'),
   ];
   return lines.filter(Boolean).join('\n');
 }

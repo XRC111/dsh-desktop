@@ -128,6 +128,15 @@ export function installPlugins(): PluginInstallResult {
 
   const plan: Array<{ srcDir: string; pkg: PkgInfo; dest: string; lastSegment: string; tag: string }> = [];
   const byName = new Map<string, (typeof plan)[number]>();
+  /**
+   * 被「热更新」源盖住、且内容指纹与内置不同的条目。
+   *
+   * 实测过的静默降级：用户数据目录里留着一份旧的同名插件，会一直赢过安装包内置的那份，
+   * 而两者的 package.json version 可能**完全相同**（都是 1.0.0），只有内容指纹能区分 ——
+   * 表现就是「明明升级了，设置页优化却没出现」。
+   * 这里不改行为（热更新优先是设计意图），只把事实说出来。
+   */
+  const shadowed: Array<{ name: string; builtin: string; hot: string; hotFrom: string }> = [];
 
   for (const { dir: source, tag } of sources) {
     if (!fs.existsSync(source)) continue; // 开发态/未安装插件的机器可能没有
@@ -155,11 +164,31 @@ export function installPlugins(): PluginInstallResult {
         lastSegment: pkg.name.split('/').pop() ?? name,
         tag,
       };
+      const shadow = byName.get(pkg.name);
+      if (
+        shadow &&
+        shadow.tag === '内置' &&
+        tag !== '内置' &&
+        shadow.pkg.fingerprint !== pkg.fingerprint
+      ) {
+        shadowed.push({
+          name: pkg.name,
+          builtin: shadow.pkg.version,
+          hot: pkg.version,
+          hotFrom: srcDir,
+        });
+      }
       byName.set(pkg.name, item); // 后面的来源覆盖前面的
     }
   }
   {
     for (const item of byName.values()) plan.push(item);
+  }
+  for (const s of shadowed) {
+    log(
+      `注意：插件 ${s.name} 由用户数据目录提供（v${s.hot}），与安装包内置的 v${s.builtin} 内容不同 —— ` +
+        `内置版本不会生效。若非有意锁旧版，删掉 ${s.hotFrom} 即可。`,
+    );
   }
   if (plan.length === 0) return result;
 
