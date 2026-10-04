@@ -5,7 +5,23 @@
   "type": "module",
   "main": "./lib/index.js",
   "exports": {
-    ".": "./lib/index.js",
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./client/client.js",
     "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "client"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
   }
 }

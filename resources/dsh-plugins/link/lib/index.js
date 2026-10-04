@@ -32,6 +32,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools';
 import { startLinkServer } from './link-protocol/endpoint.js';
 import { DESKTOP_METHODS, COMMON_METHODS, DEFAULT_PORT, makePairingCode, makeToken, fileChunks } from './link-protocol/protocol.js';
 import { seal, open } from './link-protocol/secret.js';
+import { registerRoutes } from './link-protocol/routes.js';
 
 /** 配对码有效期。短一点更安全，长了用户也记不住。 */
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -287,6 +288,81 @@ function apply(ctx, config = {}) {
         return state.conn;
     }
 
+    // ── 主机侧操作 ───────────────────────────────────────────────────────────
+    // 抽成具名函数：工具（给模型）和 HTTP 路由（给界面）调的是**同一份**逻辑。
+    // 否则界面和模型两条路径会各自漂移 —— 那种不一致最难查。
+    async function opStart(args = {}) {
+        await ensureToken();
+        if (state.server) {
+            return { running: true, port: state.server.port, code: state.code, addresses: lanAddresses() };
+        }
+        state.server = await startLinkServer({
+            port: args.port ?? config.port ?? DEFAULT_PORT,
+            host: config.host ?? '0.0.0.0',
+            authorize,
+            device: { name: os.hostname(), platform: process.platform + '-' + process.arch },
+            methods: [...DESKTOP_METHODS, ...COMMON_METHODS],
+            log,
+            onConnection(conn) {
+                state.conn = conn;
+                registerHostMethods(conn);
+                conn.on('close', () => { if (state.conn === conn) state.conn = null; });
+            },
+        });
+        newCode();
+        return {
+            running: true,
+            port: state.server.port,
+            code: state.code,
+            codeExpiresInSeconds: Math.round(CODE_TTL_MS / 1000),
+            addresses: lanAddresses(),
+            hint: '在手机上执行 link_connect，host 填上面任一地址，port 填端口，code 填配对码。',
+        };
+    }
+
+    /** 状态：界面和 link_host_status 共用。 */
+    function opStatus() {
+        return {
+            running: Boolean(state.server),
+            port: state.server?.port ?? null,
+            code: state.code && Date.now() <= state.codeExpiresAt ? state.code : null,
+            codeExpiresInSeconds: state.code ? Math.max(0, Math.round((state.codeExpiresAt - Date.now()) / 1000)) : 0,
+            addresses: lanAddresses(),
+            connected: state.conn && !state.conn.closed
+                ? {
+                    device: state.conn.peer,
+                    methods: state.conn.peerMethods,
+                    encrypted: Boolean(state.conn.sessionKey),
+                }
+                : null,
+        };
+    }
+
+    /** 停服务。 */
+    async function opStop() {
+        if (!state.server) return { running: false };
+        await state.server.close();
+        state.server = null;
+        state.conn = null;
+        state.code = null;
+        return { running: false };
+    }
+
+    /** 换新配对码。 */
+    function opCode() {
+        if (!state.server) throw new Error('联动服务还没启动，先启动服务。');
+        newCode();
+        return { code: state.code, codeExpiresInSeconds: Math.round(CODE_TTL_MS / 1000) };
+    }
+
+    // GUI 用的 HTTP 路由（挂在已鉴权的 Connection 上，见 routes.js 的说明）。
+    registerRoutes(ctx, {
+        status: () => opStatus(),
+        start: (body) => opStart(body ?? {}),
+        stop: () => opStop(),
+        code: () => opCode(),
+    });
+
     defineAndRegister();
 
     /** 注册全部桌面侧工具。 */
@@ -296,72 +372,25 @@ function apply(ctx, config = {}) {
                 name: 'link_host_start',
                 description: '启动远程联动服务（桌面侧）：在局域网开端口等手机接入，并生成 6 位配对码。手机用 link_connect 输入该码完成配对。',
                 parameters: { port: { type: 'number', description: '端口，默认 45731。' } },
-                async execute(args) {
-                    await ensureToken();
-                    if (state.server) return { running: true, port: state.server.port, code: state.code, addresses: lanAddresses() };
-                    state.server = await startLinkServer({
-                        port: args.port ?? config.port ?? DEFAULT_PORT,
-                        host: config.host ?? '0.0.0.0',
-                        authorize,
-                        device: { name: os.hostname(), platform: process.platform + '-' + process.arch },
-                        methods: [...DESKTOP_METHODS, ...COMMON_METHODS],
-                        log,
-                        onConnection(conn) {
-                            state.conn = conn;
-                            registerHostMethods(conn);
-                            conn.on('close', () => { if (state.conn === conn) state.conn = null; });
-                        },
-                    });
-                    newCode();
-                    return {
-                        running: true,
-                        port: state.server.port,
-                        code: state.code,
-                        codeExpiresInSeconds: Math.round(CODE_TTL_MS / 1000),
-                        addresses: lanAddresses(),
-                        hint: '在手机上执行 link_connect，host 填上面任一地址，port 填端口，code 填配对码。',
-                    };
-                },
+                async execute(args) { return opStart(args); },
             },
             {
                 name: 'link_host_status',
                 description: '查看远程联动服务状态：是否运行、端口、配对码、已连设备。',
                 parameters: {},
-                async execute() {
-                    return {
-                        running: Boolean(state.server),
-                        port: state.server?.port ?? null,
-                        code: state.code && Date.now() <= state.codeExpiresAt ? state.code : null,
-                        codeExpiresInSeconds: state.code ? Math.max(0, Math.round((state.codeExpiresAt - Date.now()) / 1000)) : 0,
-                        addresses: lanAddresses(),
-                        connected: state.conn && !state.conn.closed
-                            ? { device: state.conn.peer, methods: state.conn.peerMethods, encrypted: Boolean(state.conn.sessionKey) }
-                            : null,
-                    };
-                },
+                async execute() { return opStatus(); },
             },
             {
                 name: 'link_host_code',
                 description: '重新生成 6 位配对码（旧码立即失效）。',
                 parameters: {},
-                async execute() {
-                    if (!state.server) throw new Error('联动服务还没启动，先跑 link_host_start。');
-                    newCode();
-                    return { code: state.code, codeExpiresInSeconds: Math.round(CODE_TTL_MS / 1000) };
-                },
+                async execute() { return opCode(); },
             },
             {
                 name: 'link_host_stop',
                 description: '停止远程联动服务并断开已配对设备。',
                 parameters: {},
-                async execute() {
-                    if (!state.server) return { running: false };
-                    await state.server.close();
-                    state.server = null;
-                    state.conn = null;
-                    state.code = null;
-                    return { running: false };
-                },
+                async execute() { return opStop(); },
             },
             // ── 操作手机 ────────────────────────────────────────────────────────
             {
@@ -465,6 +494,6 @@ function apply(ctx, config = {}) {
 }
 
 export const name = '@dsh-desktop/link';
-export const inject = ['tools'];
+export const inject = ['tools', 'connection'];
 
 export { apply };
