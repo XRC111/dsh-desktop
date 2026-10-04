@@ -134,4 +134,11 @@ channelFor?: ReadonlyMap<string, Channel>,
  * the generations the desktop host links in (#497). Any other `link:` is
  * a development workspace and is never opted into online updates.
  */
-onlineSourceFor?: ReadonlyMap<string, string>): Promise<Record<string, UpdateStatus>>;
+onlineSourceFor?: ReadonlyMap<string, string>, 
+/**
+ * Registry names an archive-URL install may be checked against, keyed by
+ * the GitHub repo (`owner/repo`) the archive came from (#768). Without an
+ * entry that owns both the repo and the name, the npm fallback would
+ * compare the install with whatever package merely shares its name.
+ */
+catalogNpmByRepo?: ReadonlyMap<string, string>): Promise<Record<string, UpdateStatus>>;

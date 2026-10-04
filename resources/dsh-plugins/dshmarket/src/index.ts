@@ -202,16 +202,30 @@ export function apply(ctx: Context, config?: Config): void {
       // every install (#702). A third-party shell announces itself through
       // `desktopProfiles`, and this whole block runs only when that service
       // is absent, so this never takes a third-party shell's profile.
+      const configured = config?.profile
+      const configuredDesktop = configured !== undefined && configured.toLowerCase() === 'desktop'
       const officialElectron = launched !== undefined && launched.name.toLowerCase() === 'desktop'
-      if (officialElectron && config?.profile === undefined) {
+      // An explicitly configured `profile: desktop` takes this branch too. The
+      // CLI refuses that profile by NAME, so routing it there — which is what
+      // an operator's own workaround for a host that hides `profileContext`
+      // does (#744) — makes every install fail for certain. The configuration
+      // still wins over the launcher for the name; it just cannot win a branch
+      // that is guaranteed to fail.
+      if (configuredDesktop || (configured === undefined && officialElectron)) {
+        const profileName = configured ?? launched!.name
+        // The launcher owns where a profile lives — and its directory rides
+        // along only when the launcher is the one that named this profile.
+        const profileDirectory = launched !== undefined && launched.name.toLowerCase() === profileName.toLowerCase()
+          ? launched.dir
+          : undefined
         const runtime = createOfficialDesktopRuntime(
           () => hostCtx.get('pluginManager') as OfficialPluginManagerLike | undefined,
-          launched.name,
-          launched.dir,
+          profileName,
+          profileDirectory,
         )
         const resolved: MarketConfig = {
-          profile: launched.name,
-          profileDirectory: launched.dir,
+          profile: profileName,
+          ...(profileDirectory === undefined ? {} : { profileDirectory }),
           desktopHost: true,
           allowRestart: false,
           maxSnapshots: config?.maxSnapshots,

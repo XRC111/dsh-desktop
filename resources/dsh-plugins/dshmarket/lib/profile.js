@@ -1222,27 +1222,41 @@ function splitReleaseAgeExclude(entry) {
     return { name, selector };
 }
 /**
- * Merge one package's several `minimumReleaseAgeExclude` entries into one
- * (#732).
+ * Make a profile's `minimumReleaseAgeExclude` readable again (#732).
  *
- * pnpm 11.7.0 APPENDS an entry when it lets a version through a profile's
- * `minimumReleaseAge` instead of folding it into the rule that already names
- * that package — and its own `evaluateVersionPolicy` then honours only the
- * FIRST rule per package name. The entry pnpm just wrote is therefore
- * shadowed by the older one, the young version stays unexcluded, and pnpm
- * fails lockfile verification with ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION on
- * EVERY later command in that profile: installs, updates and uninstalls
- * alike, including ones that have nothing to do with the package. Reported
- * as #732, where the market's own self-update planted exactly that pair and
- * every plugin operation on the desktop profile stopped working.
+ * pnpm appends a second rule for a package that already has one, while its
+ * `evaluateVersionPolicy` honours only the FIRST rule per package name — so
+ * its own new entry is dead, the young version stays unexcluded, and every
+ * later command in that profile fails lockfile verification with
+ * ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION, including commands that have nothing
+ * to do with that package.
  *
- * Merging keeps the union of what the file already says, so nothing is
- * loosened or tightened: the entries pnpm wrote were meant to be read, and
- * after the merge they are. A file with no same-name duplicate is untouched,
- * as is one whose block this cannot read exactly (a flow list, an inline
- * comment, a line it would have to guess at).
+ * (#733 reported a separate, unexplained 80 GiB allocation abort on pnpm
+ * 12.4.1 that its author first tied to the union spelling. Review on that
+ * issue — and the reporter's own follow-up, which could no longer reproduce it
+ * — settled that `name@a || b` is a documented pnpm form, that the validator's
+ * "Use exact versions only" is about ranges and name patterns, and that the
+ * abort is not this market's to fix. Do not "repair" a union into a bare name
+ * on the strength of it: see below.)
  *
- * @returns the package names whose entries were merged; empty when the file
+ * pnpm WRITES this key itself, and one of the forms it writes is what breaks a
+ * profile (#732): pnpm 11.7.0 APPENDS a second rule for a package that already
+ * has one, while its `evaluateVersionPolicy` honours only the FIRST rule per
+ * package name. Its own new entry is therefore dead, the young version stays
+ * unexcluded, and every later command in that profile fails lockfile
+ * verification with ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION — installs, updates
+ * and uninstalls alike, including ones that have nothing to do with that
+ * package. Merging the same-name rules into one makes the file readable again.
+ *
+ * The merge keeps the UNION of the versions the file already lists
+ * (`name@1.2.3 || 1.4.0`), which is a documented pnpm spelling. What this
+ * deliberately does NOT do is collapse a version list to a bare package name:
+ * a bare name exempts EVERY version of that package from the cooldown, which
+ * is wider than what the file says, and the market pins exact versions
+ * precisely so a fresh install cannot silently land on an older release
+ * (#594). A form the file cannot be read exactly from is left alone.
+ *
+ * @returns the package names whose rules were merged; empty when the file
  *   needed no repair or could not be repaired, in which case it is left
  *   byte-for-byte as it was.
  */
@@ -1274,40 +1288,58 @@ export function mergeDuplicateReleaseAgeExcludes(profile, explicitDir) {
         const rule = splitReleaseAgeExclude(m[1]);
         if (rule === null)
             return [];
-        entries.push({ rule, quoted: /^['"]/.test(m[1]) });
+        entries.push({ rule, quoted: /^['"]/.test(m[1]), line });
     }
     const byName = new Map();
     const order = [];
-    for (const { rule, quoted } of entries) {
+    for (const { rule, quoted, line } of entries) {
         let group = byName.get(rule.name);
         if (group === undefined) {
-            group = { selectors: new Set(), allVersions: false, quoted: false, count: 0 };
+            group = { selectors: new Set(), originals: [], lines: [], allVersions: false, quoted: false, count: 0 };
             byName.set(rule.name, group);
             order.push(rule.name);
         }
         group.count += 1;
         group.quoted = group.quoted || quoted;
+        group.originals.push(rule.selector ?? '');
+        group.lines.push(line);
         if (rule.selector === null)
             group.allVersions = true;
         else
             group.selectors.add(rule.selector);
     }
-    const merged = order.filter(name => (byName.get(name)?.count ?? 0) > 1);
-    if (merged.length === 0)
-        return [];
-    const lines = order.map(name => {
+    /** The one line this package's entry is written as. */
+    const produced = (name) => {
         const group = byName.get(name);
         if (group === undefined)
             return '';
-        const text = group.allVersions ? name : `${name}@${[...group.selectors].join(' || ')}`;
+        // A bare name already covers every version, so it stays bare and nothing
+        // is widened; one rule stays exactly as it was written, union included.
+        // Several rules for one name are the #732 breakage — only the first is
+        // ever read — so they become one, as the union of the versions the file
+        // already lists.
+        const text = group.allVersions
+            ? name
+            : group.count === 1
+                ? `${name}@${group.originals[0] ?? ''}`
+                : `${name}@${[...group.selectors].join(' || ')}`;
         // `@` cannot start a plain scalar in YAML, so a scoped name is written
         // quoted — the way pnpm itself writes one.
         const quoted = group.quoted || text.startsWith('@');
         return `${indent}- ${quoted ? `'${text.replaceAll("'", "''")}'` : text}`;
+    };
+    const rewritten = order.filter(name => {
+        const group = byName.get(name);
+        if (group === undefined)
+            return false;
+        return group.count > 1 || group.lines[0] !== produced(name);
     });
+    if (rewritten.length === 0)
+        return [];
+    const lines = order.map(produced);
     const blockText = `minimumReleaseAgeExclude:${eol}${lines.join(eol)}${eol}`;
     // A function replacement: `$&` and friends in a string replacement would
     // be read as capture references.
     writeFileSync(file, yaml.replace(blockRe, () => blockText));
-    return merged;
+    return rewritten;
 }
