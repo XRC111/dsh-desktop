@@ -1,7 +1,7 @@
 {
   "name": "@dsh-desktop/link",
-  "version": "1.0.1",
-  "description": "DSH 远程联动（桌面侧）：在局域网提供服务，供手机配对；双向设备操作、文件互通、会话与模型共用。",
+  "version": "1.1.0",
+  "description": "DSH 远程联动（桌面侧）：局域网服务、双向设备操作、凭据转发；含设置页面板。",
   "type": "module",
   "main": "./lib/index.js",
   "exports": {

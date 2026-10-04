@@ -1,6 +1,6 @@
 {
   "name": "@dsh-desktop/skill-mcp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "DSH Desktop skills & MCP servers management panel",
   "type": "module",
   "main": "./lib/index.js",
@@ -30,5 +30,6 @@
     }
   },
   "license": "MIT",
-  "private": true
+  "private": true,
+  "dshDesktopBuild": "7996c5f727af55bb"
 }

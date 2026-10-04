@@ -40,13 +40,41 @@ import { describeAddresses } from './link-protocol/netinfo.js';
 /** 配对码有效期。短一点更安全，长了用户也记不住。 */
 const CODE_TTL_MS = 5 * 60 * 1000;
 
-/** 文本输出 schema 的样板。 */
+/**
+ * 文本输出的样板。
+ *
+ * ⚠️⚠️ 这里踩过一个 100% 触发的坑，值得记下来：
+ * 第一版所有工具共用 `textOut({})`（空 properties + `additionalProperties:false`），
+ * 语义等于「只接受空对象」。而每个工具都返回带字段的对象，于是 dsh-tools 的
+ * `validateJsonSchemaValue` 必然抛 `INVALID_TOOL_OUTPUT` ——
+ * **副作用照常执行，但返回值 100% 丢失**。表现是「服务真的起来了、配对码却读不到」，
+ * 极难自查（数据层是好的，只是被 schema 挡在门外）。
+ *
+ * 所以现在每个工具**显式声明**自己会返回哪些字段。
+ *
+ * dsh-tools 的 schema 子集（已核对 lib/types/schema.js）：
+ *   · `type` 必须是**单个字符串**，不能写 `['number','null']`；要可空用 `oneOf`；
+ *   · `object` 节点**必须**显式写 `additionalProperties: true|false`，否则编译期报错；
+ *   · 支持 type: object / array / string / number / integer / boolean / null。
+ *
+ * @param {object} props - 该工具返回值的字段声明。
+ * @returns {object} dsh-tools 的 output 定义。
+ */
 const textOut = (props) => ({
     schema: { type: 'object', additionalProperties: false, properties: props },
     render: (_args, value) => [
         { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) },
     ],
 });
+
+/** 可空字符串（schema 子集不接受 type 数组，用 oneOf）。 */
+const nullableString = { oneOf: [{ type: 'string' }, { type: 'null' }] };
+/** 可空数字。 */
+const nullableNumber = { oneOf: [{ type: 'number' }, { type: 'null' }] };
+/** 任意对象（联动状态里嵌了不少第三方结构，不逐字段约束）。 */
+const anyObject = { type: 'object', additionalProperties: true, properties: {} };
+/** 地址列表：逐项都是任意对象。 */
+const addressList = { type: 'array', items: anyObject };
 
 /**
  * 列出本机地址供用户挑选。
@@ -72,6 +100,56 @@ function lanAddresses() {
  * @param {object} ctx - Cordis 上下文。
  * @param {object} [config] - 配置。
  */
+/**
+ * 每个工具的**返回字段声明**。
+ *
+ * 为什么必须逐个写：dsh-tools 会用 output.schema 校验 execute 的返回值，
+ * `additionalProperties: false` 下少声明一个字段就会抛 INVALID_TOOL_OUTPUT，
+ * 而副作用已经执行完了 —— 所以"返回值丢失"看起来像功能没生效，其实是 schema 挡的。
+ */
+const OUTPUT_SCHEMAS = {
+    link_host_start: {
+        running: { type: 'boolean' },
+        port: { type: 'number' },
+        code: nullableString,
+        codeExpiresInSeconds: { type: 'number' },
+        addresses: addressList,
+        primary: nullableString,
+        hint: { type: 'string' },
+    },
+    link_host_status: {
+        running: { type: 'boolean' },
+        port: nullableNumber,
+        code: nullableString,
+        codeExpiresInSeconds: { type: 'number' },
+        addresses: addressList,
+        connected: { oneOf: [anyObject, { type: 'null' }] },
+    },
+    link_host_code: { code: { type: 'string' }, codeExpiresInSeconds: { type: 'number' } },
+    link_host_stop: { running: { type: 'boolean' } },
+};
+
+/**
+ * 透传型工具（phone_* / link_share_model）的 output。
+ *
+ * 手机返回的结构由 mobile-use / 插件决定，逐字段声明会随上游变动而失效，
+ * 所以这里用**开放对象**：additionalProperties:true，既不漏字段也不误拒。
+ *
+ * ⚠️ 不能把它塞进 textOut(props) —— 那样会被当成"字段名到 schema 的映射"，
+ *    里面的 type 键会被当成一个叫 type 的属性，编译期直接报
+ *    "schema.properties.type must be a value schema object"（实测踩过）。
+ */
+const passthroughOut = {
+    schema: { type: 'object', additionalProperties: true, properties: {} },
+    render: (_args, value) => [
+        { type: 'text', text: typeof value === 'string' ? value : JSON.stringify(value, null, 2) },
+    ],
+};
+const PASSTHROUGH = new Set([
+    'phone_status', 'phone_screen_shot', 'phone_screen_elements', 'phone_click',
+    'phone_scroll', 'phone_type', 'phone_key', 'phone_push_file', 'link_share_model',
+]);
+
 function apply(ctx, config = {}) {
     const log = (msg) => ctx.logger?.info?.('[link] ' + msg) ?? console.log('[link] ' + msg);
     const home = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh');
@@ -468,9 +546,36 @@ function apply(ctx, config = {}) {
             },
             {
                 name: 'phone_scroll',
-                description: '在已配对手机上滚动。',
+                description:
+                    '在已配对手机上滚动。delta 是"滚多少"：正数向上（内容下移），负数向下。'
+                    + '桌面侧会换算成手机屏幕坐标再发过去。',
                 parameters: { delta: { type: 'number', required: true, description: '正数向上、负数向下。' } },
-                async execute(args) { return requireConn().call('mobile.scroll', args); },
+                // ⚠️ 契约换算：手机端的 swipe 收的是 x1/y1/x2/y2（四个坐标），
+                // 而这里对外暴露的是"滚多少"。两者必须在这里对上 ——
+                // 否则手机端会报 "swipe 需要 x1 / y1 / x2 / y2"（这是实测报出来的）。
+                async execute(args) {
+                    const conn = requireConn();
+                    const delta = Number(args.delta);
+                    if (!Number.isFinite(delta) || delta === 0) {
+                        throw new Error('delta 必须是非零数字（正数向上、负数向下）。');
+                    }
+                    // 取屏幕尺寸来算落点；拿不到就用一个保守的默认值并说明。
+                    let width = 540;
+                    let height = 1200;
+                    try {
+                        const st = await conn.call('mobile.status', {}, { timeoutMs: 8000 });
+                        if (Number.isFinite(st?.width) && Number.isFinite(st?.height)) {
+                            width = st.width; height = st.height;
+                        }
+                    } catch (error) {
+                        log('phone_scroll: 取不到屏幕尺寸（' + (error?.message ?? error) + '），按默认值换算');
+                    }
+                    const cx = Math.round(width / 2);
+                    // 从屏幕下方 70% 处起滚；向上滚(delta>0)内容上移，所以终点更靠上。
+                    const y1 = Math.round(height * 0.7);
+                    const y2 = Math.max(0, Math.min(height - 1, y1 - delta));
+                    return conn.call('mobile.scroll', { x1: cx, y1, x2: cx, y2 });
+                },
             },
             {
                 name: 'phone_type',
@@ -480,9 +585,22 @@ function apply(ctx, config = {}) {
             },
             {
                 name: 'phone_key',
-                description: '在已配对手机上按一个键或组合键，如 ["back"]、["enter"]、["ctrl","c"]。',
-                parameters: { keys: { type: 'array', items: { type: 'string' }, required: true, description: '键名数组。' } },
-                async execute(args) { return requireConn().call('mobile.key', args); },
+                description: '在已配对手机上按一个键。可用键名：back / home / recents / notifications / quick_settings。',
+                // ⚠️ 契约对齐：手机端读的是 `name`（单数、字符串），我早先发的是
+                // `keys`（数组）→ 手机端拿到 undefined，报出"未知按键：（空）"。
+                parameters: {
+                    keys: { type: 'array', items: { type: 'string' }, description: '键名数组，取第一个。' },
+                    name: { type: 'string', required: true, description: '要按的键名：back / home / recents / notifications / quick_settings。' },
+                },
+                async execute(args) {
+                    const name = typeof args.name === 'string' && args.name !== ''
+                        ? args.name
+                        : String((Array.isArray(args.keys) ? args.keys[0] : '') ?? '');
+                    if (!name) {
+                        throw new Error('需要键名：back / home / recents / notifications / quick_settings');
+                    }
+                    return requireConn().call('mobile.key', { name });
+                },
             },
             // ── 文件 / 模型 ─────────────────────────────────────────────────────
             {
@@ -514,14 +632,19 @@ function apply(ctx, config = {}) {
             },
         ];
 
-        for (const spec of registry) {
+    
+
+    for (const spec of registry) {
             // ⚠️ 必填是**逐属性**的 `required: true` 注解，不是参数级数组、
             //    也不是 `optional` 字段（我第一版写错了，dsh 的 schema 不认）。
             ctx.tools.register(defineTool({
                 name: spec.name,
                 description: spec.description,
                 parameters: spec.parameters ?? {},
-                output: textOut({}),
+                // 声明该工具真实返回的字段；phone_* 透传手机结构，用开放对象。
+                output: PASSTHROUGH.has(spec.name)
+                    ? passthroughOut
+                    : textOut(OUTPUT_SCHEMAS[spec.name] ?? {}),
                 async execute(args) { return spec.execute(args ?? {}); },
                 presentCall: () => ({ card: 'generic', title: spec.name, kind: 'read', rawInput: {} }),
             }));
@@ -529,6 +652,15 @@ function apply(ctx, config = {}) {
         log('已注册 ' + registry.length + ' 个桌面侧联动工具');
     }
 }
+
+/**
+ * 导出 output schema 表，供测试直接 import 校验。
+ *
+ * 之前那个 bug（textOut({}) 拒绝所有返回值）之所以能溜过去，正是因为没有任何测试
+ * 真的拿它去过一遍 dsh-tools 的校验器。导出后就能这样测：
+ *   import { OUTPUT_SCHEMAS, PASSTHROUGH } from '.../link/lib/index.js'
+ */
+export { OUTPUT_SCHEMAS, PASSTHROUGH, passthroughOut };
 
 export const name = '@dsh-desktop/link';
 export const inject = ['tools', 'connection', 'llm'];

@@ -1,5 +1,5 @@
 {
-  "$comment": "随 feed 热更下发的插件白名单（单一来源）。release-v2.ps1 与 release-017-020.ps1 都从这里读，避免两处写死走样。mode 取值：upstream=先从 npm 拉上游最新版再打包（第三方插件）；auto=内容变了自动升 patch 版本号；frozen=只打包，绝不改插件的 package.json（插件正在开发中）。",
+  "$comment": "随 feed 热更下发的插件白名单（单一来源）。release-v2.ps1 与 release-017-020.ps1 都从这里读，避免两处写死走样。mode 取值：upstream=先从 npm 拉上游最新版再打包（第三方插件）；auto=内容变了自动升 patch 版本号；frozen=只打包，绝不改插件的 package.json（插件正在开发中）。\n\n注意 dsh-univer-office 刻意不在白名单里：它 57MB 且历史构建的切片不完整，全量探测会把 feed 撑爆并让部署 die（README 8.4/7.3 有记录）。它随安装包分发即可。",
   "plugins": [
     {
       "name": "dshmarket",
@@ -15,7 +15,19 @@
     },
     {
       "name": "link",
-      "mode": "frozen"
+      "mode": "auto"
+    },
+    {
+      "name": "computer-use",
+      "mode": "auto"
+    },
+    {
+      "name": "skill-mcp",
+      "mode": "auto"
+    },
+    {
+      "name": "directory-picker",
+      "mode": "auto"
     }
   ]
 }
