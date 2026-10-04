@@ -161,6 +161,21 @@ switch ($Stage) {
 }
 
 # ── 执行前自检 ────────────────────────────────────────────────────────────────
+# ── 插件打包（含上游同步 + 版本号迭代）─────────────────────────────────────
+# 放在自检之前：自检第 4 项要核「插件 meta 齐备」，而 build/ 不入库，
+# 换机器就是空的 —— 先打齐再看，才不会报一堆假的「缺 meta」。
+# 也必须在 release-v2.ps1 之前：它按 build/ 下的 meta 挂 feed。
+if ($Stage -ne 'deploy') {
+    Step '打包插件（内容变了会自动迭代版本号）'
+    if ($DryRun) {
+        Warn '-DryRun：只打印，不执行'
+        Info 'node scripts\pack-all-plugins.mjs --dry-run'
+    } else {
+        & node scripts\pack-all-plugins.mjs
+        if ($LASTEXITCODE -ne 0) { throw "插件打包失败（exit=$LASTEXITCODE）" }
+    }
+}
+
 Step '发版前自检'
 
 Info "阶段：$Stage"
@@ -204,7 +219,12 @@ foreach ($t in @('build\rt-015')) {
 }
 
 # 4) 插件 meta 齐备
-foreach ($n in @('dshmarket', 'shell', 'updater', 'link')) {
+# 清单以 scripts/plugins.json 为准（与 pack-all-plugins.mjs 同一份），避免两处走样
+$pluginListFile = Join-Path $PSScriptRoot 'plugins.json'
+$pluginNames = if (Test-Path $pluginListFile) {
+    @((Get-Content -Raw -Encoding UTF8 $pluginListFile | ConvertFrom-Json).plugins | ForEach-Object { $_.name })
+} else { @('dshmarket', 'shell', 'updater', 'link') }
+foreach ($n in $pluginNames) {
     # 必须按 mtime 取最新（与 release-v2.ps1 的探测逻辑一致）；
     # 直接取 $c[0] 会拿到**字母序第一个**（可能是 1.0.0 而最新是 1.1.0），显示会误导。
     $c = @(Get-ChildItem "build\plugins-$n-*.meta.json" -ErrorAction SilentlyContinue |

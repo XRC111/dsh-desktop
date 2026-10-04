@@ -112,6 +112,15 @@ $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 Set-Location $root
 Remove-Item Env:NODE_OPTIONS -ErrorAction SilentlyContinue
 
+# 插件白名单以 scripts/plugins.json 为准（与 pack-all-plugins.mjs 同一份），
+# 避免「发了新插件但白名单没加」——实测踩过：link 加进来时两处写死的列表都漏了。
+if (-not $PSBoundParameters.ContainsKey('Plugins')) {
+    $pluginsListFile = Join-Path $PSScriptRoot 'plugins.json'
+    if (Test-Path $pluginsListFile) {
+        $Plugins = @((Get-Content -Raw -Encoding UTF8 $pluginsListFile | ConvertFrom-Json).plugins | ForEach-Object { $_.name })
+    }
+}
+
 $PkgPath    = Join-Path $root 'package.json'
 $CfgPath    = Join-Path $root 'resources\update-config.json'
 $CfgW7Path  = Join-Path $root 'resources\update-config.w7.json'
