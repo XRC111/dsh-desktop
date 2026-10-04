@@ -204,7 +204,7 @@ foreach ($t in @('build\rt-015')) {
 }
 
 # 4) 插件 meta 齐备
-foreach ($n in @('dshmarket', 'shell', 'updater')) {
+foreach ($n in @('dshmarket', 'shell', 'updater', 'link')) {
     # 必须按 mtime 取最新（与 release-v2.ps1 的探测逻辑一致）；
     # 直接取 $c[0] 会拿到**字母序第一个**（可能是 1.0.0 而最新是 1.1.0），显示会误导。
     $c = @(Get-ChildItem "build\plugins-$n-*.meta.json" -ErrorAction SilentlyContinue |

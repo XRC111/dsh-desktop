@@ -93,7 +93,7 @@ param(
     # 为什么是白名单而不是「build 下有什么就发什么」：dsh-univer-office 有 57MB，
     # 且历史构建的切片不完整（只有 part01）→ 全量探测会把 feed 撑爆并让部署 die。
     # 它随安装包分发即可，不参与热更。
-    [string[]]$Plugins       = @('dshmarket', 'shell', 'updater'),
+    [string[]]$Plugins       = @('dshmarket', 'shell', 'updater', 'link'),
     # 直接指定 meta 路径（优先级最高，可多个）。用于临时发某个插件的特定版本。
     [string[]]$PluginsMeta   = @(),
     # 运行时**升级**差分源：把比当前 stable 更旧的运行时树，各打一个「→ 新 stable」的差分。

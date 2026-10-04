@@ -50,3 +50,7 @@ resources/dsh-plugins/*/artifacts/
 # 154 个文件且可随时用 npm 重新取回，不入库。
 resources/dsh-plugins/*.bak/
 resources/dsh-plugins/*.bak
+
+# 改补丁时留的本地备份（*.linkbak 之类），不入库
+resources/*.linkbak
+resources/*.bak
