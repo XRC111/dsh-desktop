@@ -74,12 +74,12 @@ Set-Location $root
 
 # ── 本次发版的版本号（改这里就能发下一版）────────────────────────────────────
 $Versions = [ordered]@{
-    Stable = '10.1.12'   # 主线 stable（dsh 0.1.7-rc.2）
-    Beta   = '10.2.11'   # 主线 beta  （dsh 0.2.0-rc.2）
-    Dev    = '10.3.10'   # 主线 dev   （dsh 0.2.0-rc.2）
-    W7     = '7.1.13'   # w7 stable  （dsh 0.1.7-rc.2）
-    W7Beta = '7.2.10'    # w7 beta    （dsh 0.2.0-rc.2）
-    W7Dev  = '7.3.10'    # w7 dev     （dsh 0.2.0-rc.2）
+    Stable = '10.1.13'   # 主线 stable（dsh 0.1.7-rc.2）
+    Beta   = '10.2.12'   # 主线 beta  （dsh 0.2.0-rc.2）
+    Dev    = '10.3.11'   # 主线 dev   （dsh 0.2.0-rc.2）
+    W7     = '7.1.14'   # w7 stable  （dsh 0.1.7-rc.2）
+    W7Beta = '7.2.11'    # w7 beta    （dsh 0.2.0-rc.2）
+    W7Dev  = '7.3.11'    # w7 dev     （dsh 0.2.0-rc.2）
 }
 
 # ── 安装包外链（GitHub Release；tag = 日期-序号，每次发版一个）──────────────
