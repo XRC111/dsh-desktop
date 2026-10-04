@@ -42,7 +42,7 @@ import {
   sampleMissing,
 } from './runtime-installer';
 import { pickPort } from './port';
-import { installPlugins } from './plugin-installer';
+import { installPlugins, lastPluginInstall } from './plugin-installer';
 import { guardPatch } from './patch-guard';
 import { ensurePluginCompatibility } from './plugin-compat';
 import { ensureScheduleBundle } from './optional-bundles';
@@ -314,7 +314,7 @@ async function startService(): Promise<void> {
 
   // 桌面适配插件：必须放在 dsh 能解析到的 profile 共享 node_modules 里，
   // 且必须在 dsh 起来之前完成（加载器是启动时一次性解析插件包名的）。
-  installPlugins();
+  installPlugins({ appVersion: app.getVersion() });
 
   // 陈旧链接自检：profile 共享 node_modules 里的包链接是「当时那份运行时」链进去的，
   // 且没有任何版本校验。机器上先后跑过两份运行时（开发态 + 安装版、或换过安装路径）时，
@@ -478,6 +478,23 @@ async function quitApp(): Promise<void> {
   app.exit(0);
 }
 
+/** 插件落位概况：有影子/自愈时写进诊断，平时不占地方 */
+function describePluginInstall(): string {
+  const r = lastPluginInstall();
+  if (!r) return '';
+  const parts = [`插件 ${r.installed.length} 个`];
+  if (r.healed.length > 0) {
+    parts.push(
+      `已自动顶回内置 ${r.healed.length} 个（${r.healed.map((h) => `${h.name} v${h.hot}→v${h.builtin}`).join('、')}）`,
+    );
+  }
+  if (r.shadowed.length > 0) {
+    parts.push(`内容不一致但保留用户目录版 ${r.shadowed.length} 个（${r.shadowed.map((s) => s.name).join('、')}）`);
+  }
+  if (r.problems.length > 0) parts.push(`问题 ${r.problems.length} 条`);
+  return `插件: ${parts.join('；')}`;
+}
+
 /** 读日志文件最后 n 行；文件缺失/读失败返回空串（不进诊断，避免噪音） */
 function tailOf(file: string, n: number, label: string): string {
   try {
@@ -569,6 +586,7 @@ function buildDiagnostics(): string {
     }`,
     `profile 目录: ${profileModulesDir()}`,
     describeProfileLinks(),
+    describePluginInstall(),
     tailOf(mainLogFile(), 50, '主日志尾部'),
     tailOf(dshLogFile(), 50, 'dsh 日志尾部'),
   ];

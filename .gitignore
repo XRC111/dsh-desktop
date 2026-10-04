@@ -4,6 +4,9 @@ out/
 dist/
 resources/dsh-runtime/
 
+# 插件落位逻辑的回归脚手架（build/.plugintest/run.cjs）
+build/.plugintest/
+
 # 探测 / 临时目录
 .probe/
 *.log

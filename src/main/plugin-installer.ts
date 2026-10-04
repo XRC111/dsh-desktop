@@ -44,6 +44,16 @@ export interface PluginInstallResult {
   removed: string[];
   /** 出错信息（安装失败不阻断启动，只记日志）。 */
   problems: string[];
+  /** 被自动顶回内置版的插件（用户目录那份更旧）。 */
+  healed: Array<{ name: string; builtin: string; hot: string; from: string }>;
+  /** 内容不一致但**没有**自动修复的（第三方插件，或热更新那份更新）。 */
+  shadowed: Array<{ name: string; builtin: string; hot: string; hotFrom: string; reason: string }>;
+}
+
+/** 最近一次 installPlugins 的结果，供诊断信息使用。 */
+let lastResult: PluginInstallResult | null = null;
+export function lastPluginInstall(): PluginInstallResult | null {
+  return lastResult;
 }
 
 interface PkgInfo {
@@ -82,6 +92,72 @@ function fingerprintOf(dir: string): string {
   return createHash('sha256').update(parts.join('\n')).digest('hex').slice(0, 16);
 }
 
+/**
+ * **内容**哈希（不含 mtime）。
+ *
+ * 与 fingerprintOf 的区别很关键：fingerprintOf 掺了 mtime，只要两份拷贝的写入时间不同，
+ * 哪怕字节完全一样也会得出不同指纹（实测：内置与用户目录的 shell/client.js sha256 都是
+ * 7cf1dcdbd108，fingerprintOf 却给出 548171b5 / 91956aef）。所以它只能用来判断
+ * 「源变没变、要不要重新复制」，**不能**用来判断「两份是不是同一份代码」。
+ */
+function contentHashOf(dir: string): string {
+  const parts: string[] = [];
+  const walk = (d: string, rel: string) => {
+    let entries;
+    try { entries = fs.readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = path.join(d, e.name);
+      const r = rel ? rel + '/' + e.name : e.name;
+      if (e.isDirectory()) { walk(p, r); continue; }
+      if (!e.isFile()) continue;
+      try {
+        parts.push(r + ':' + createHash('sha256').update(fs.readFileSync(p)).digest('hex'));
+      } catch { /* 读不到就忽略 */ }
+    }
+  };
+  walk(dir, '');
+  parts.sort();
+  return createHash('sha256').update(parts.join('\n')).digest('hex').slice(0, 16);
+}
+
+const HASH_CACHE = 'plugin-content-hash-cache.json';
+
+/**
+ * 内容哈希缓存。
+ *
+ * 为什么要缓存：dshmarket 连依赖有 400+ 个文件、5.8MB，全量哈希实测约 115ms，
+ * 两个源都算就是 230ms —— 每次启动都付这个代价不合理。
+ * 缓存键用 fingerprintOf（含 mtime）：它一变内容必变，所以命中缓存的结果一定有效。
+ */
+function openHashCache(): { get: (dir: string, fp: string) => string; save: () => void } {
+  const cacheFile = path.join(path.dirname(userPluginsDir()), HASH_CACHE);
+  let cache: Record<string, { fp: string; hash: string }> = {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
+    if (raw && typeof raw === 'object') cache = raw as typeof cache;
+  } catch { /* 首次运行或文件损坏都无所谓，重算一遍即可 */ }
+  const memo = new Map<string, string>();
+  return {
+    get(dir, fp) {
+      const done = memo.get(dir);
+      if (done !== undefined) return done;
+      const hit = cache[dir];
+      const hash = hit && hit.fp === fp && typeof hit.hash === 'string' ? hit.hash : contentHashOf(dir);
+      cache[dir] = { fp, hash };
+      memo.set(dir, hash);
+      return hash;
+    },
+    save() {
+      try { fs.writeFileSync(cacheFile, JSON.stringify(cache)); } catch { /* 写不了就每次重算 */ }
+    },
+  };
+}
+
+/** 目录 mtime（取不到按 0，一律走保守分支） */
+function mtimeOf(dir: string): number {
+  try { return fs.statSync(dir).mtimeMs; } catch { return 0; }
+}
+
 function readPkgInfo(dir: string, fallbackName: string): PkgInfo | null {
   const pkgFile = path.join(dir, 'package.json');
   if (!fs.existsSync(pkgFile)) {
@@ -113,30 +189,28 @@ function copyDir(from: string, to: string): void {
   }
 }
 
-export function installPlugins(): PluginInstallResult {
-  const result: PluginInstallResult = { installed: [], removed: [], problems: [] };
+export function installPlugins(opts: { appVersion?: string } = {}): PluginInstallResult {
+  const result: PluginInstallResult = {
+    installed: [],
+    removed: [],
+    problems: [],
+    healed: [],
+    shadowed: [],
+  };
   const modulesRoot = profileModulesDir();
 
   // 插件来源（后面的优先）：
   //   1) 安装目录里随包分发的（resources/dsh-plugins）
   //   2) 用户数据目录里的（热更新/手动安装的，见 scripts/install-plugin.ps1）
-  // 同名插件以**用户数据目录**的为准 —— 这样不用重打安装包也能换插件版本。
-  const sources: Array<{ dir: string; tag: string }> = [
+  //
+  // 同名插件**默认**以用户数据目录的为准 —— 这样不用重打安装包也能换插件版本。
+  // 但这条规则会被「残留的旧副本」滥用，所以下面要过一遍判据（见 plan 的构造）。
+  type Item = { srcDir: string; pkg: PkgInfo; dest: string; lastSegment: string; tag: '内置' | '热更新' };
+  const sources: Array<{ dir: string; tag: '内置' | '热更新' }> = [
     { dir: dshPluginsSourceDir(), tag: '内置' },
     { dir: userPluginsDir(), tag: '热更新' },
   ];
-
-  const plan: Array<{ srcDir: string; pkg: PkgInfo; dest: string; lastSegment: string; tag: string }> = [];
-  const byName = new Map<string, (typeof plan)[number]>();
-  /**
-   * 被「热更新」源盖住、且内容指纹与内置不同的条目。
-   *
-   * 实测过的静默降级：用户数据目录里留着一份旧的同名插件，会一直赢过安装包内置的那份，
-   * 而两者的 package.json version 可能**完全相同**（都是 1.0.0），只有内容指纹能区分 ——
-   * 表现就是「明明升级了，设置页优化却没出现」。
-   * 这里不改行为（热更新优先是设计意图），只把事实说出来。
-   */
-  const shadowed: Array<{ name: string; builtin: string; hot: string; hotFrom: string }> = [];
+  const slots = new Map<string, { builtin?: Item; hot?: Item }>();
 
   for (const { dir: source, tag } of sources) {
     if (!fs.existsSync(source)) continue; // 开发态/未安装插件的机器可能没有
@@ -157,40 +231,86 @@ export function installPlugins(): PluginInstallResult {
         log(`跳过非插件目录：${name}（无 package.json）`);
         continue;
       }
-      const item = {
+      const item: Item = {
         srcDir,
         pkg,
         dest: path.join(modulesRoot, ...pkg.name.split('/')),
         lastSegment: pkg.name.split('/').pop() ?? name,
         tag,
       };
-      const shadow = byName.get(pkg.name);
-      if (
-        shadow &&
-        shadow.tag === '内置' &&
-        tag !== '内置' &&
-        shadow.pkg.fingerprint !== pkg.fingerprint
-      ) {
-        shadowed.push({
-          name: pkg.name,
-          builtin: shadow.pkg.version,
-          hot: pkg.version,
-          hotFrom: srcDir,
-        });
-      }
-      byName.set(pkg.name, item); // 后面的来源覆盖前面的
+      const slot = slots.get(pkg.name) ?? {};
+      if (tag === '内置') slot.builtin = item;
+      else slot.hot = item;
+      slots.set(pkg.name, slot);
     }
   }
-  {
-    for (const item of byName.values()) plan.push(item);
+  // ── 决定每个插件由哪一份源生效 ───────────────────────────────────────────
+  //
+  // 只看 version 不够：自研插件的版本号常年不动（shell 一直是 1.0.0），内容却每版都变。
+  // 只看 fingerprintOf 也不够：它掺了 mtime，同样内容会得出不同指纹。
+  // 所以先比**内容哈希** —— 内容一致就谁赢都行；内容不同才按下面两条判据分派。
+  const hashes = openHashCache();
+  const plan: Item[] = [];
+  for (const [name, slot] of slots) {
+    if (!slot.hot) { if (slot.builtin) plan.push(slot.builtin); continue; }
+    if (!slot.builtin) { plan.push(slot.hot); continue; }
+
+    const bHash = hashes.get(slot.builtin.srcDir, slot.builtin.pkg.fingerprint);
+    const hHash = hashes.get(slot.hot.srcDir, slot.hot.pkg.fingerprint);
+    if (bHash === hHash) { plan.push(slot.hot); continue; } // 同一份代码，谁赢都一样
+
+    const ours = name.startsWith(PLUGIN_SCOPE + '/');
+    const builtinNewer = mtimeOf(slot.builtin.srcDir) > mtimeOf(slot.hot.srcDir);
+
+    // 第三方插件：**只有版本号不一致时才值得说**。
+    // 同为 1.66.1 而内容不同是正常的——安装包里那份是随包分发的目录，
+    // 用户目录那份来自 feed 的 plugins-*.tar.gz，两者打包方式本就不同。
+    // 不加这条判断就会每次启动都喊一次狼来了。
+    if (!ours && slot.hot.pkg.version === slot.builtin.pkg.version) {
+      plan.push(slot.hot);
+      continue;
+    }
+
+    if (ours && builtinNewer) {
+      // 自研插件：内置那份是随**本次安装**一起发布的，用户目录那份更旧 → 顶回内置。
+      // 实测故障就是这么来的：残留的旧副本一直赢，安装包里新的设置页优化永远不生效，
+      // 而两边版本号还都是 1.0.0，表面上看起来「版本没变」。
+      plan.push(slot.builtin);
+      result.healed.push({
+        name,
+        builtin: slot.builtin.pkg.version,
+        hot: slot.hot.pkg.version,
+        from: slot.hot.srcDir,
+      });
+      continue;
+    }
+    plan.push(slot.hot);
+    result.shadowed.push({
+      name,
+      builtin: slot.builtin.pkg.version,
+      hot: slot.hot.pkg.version,
+      hotFrom: slot.hot.srcDir,
+      reason: ours ? '用户目录那份更新，保留它' : '第三方插件归属插件市场，外壳不擅自替换',
+    });
   }
-  for (const s of shadowed) {
+  hashes.save();
+
+  for (const h of result.healed) {
     log(
-      `注意：插件 ${s.name} 由用户数据目录提供（v${s.hot}），与安装包内置的 v${s.builtin} 内容不同 —— ` +
-        `内置版本不会生效。若非有意锁旧版，删掉 ${s.hotFrom} 即可。`,
+      `已自动修复插件影子：${h.name} 安装包内置 v${h.builtin} 比用户目录的 v${h.hot} 新，改用内置（原：${h.from}）`,
     );
   }
-  if (plan.length === 0) return result;
+  for (const s of result.shadowed) {
+    log(
+      `注意：插件 ${s.name} 的用户目录副本（v${s.hot}）与安装包内置的 v${s.builtin} 内容不同，且会生效 —— ` +
+        `${s.reason}（${s.hotFrom}）`,
+    );
+  }
+
+  if (plan.length === 0) {
+    lastResult = result;
+    return result;
+  }
 
   const keepSegments = new Set(plan.map((p) => p.lastSegment));
 
@@ -238,7 +358,14 @@ export function installPlugins(): PluginInstallResult {
         markerPath,
         JSON.stringify({
           version: item.pkg.version,
+          // 源变更检测用（含 mtime）：源没动就跳过重新复制
           fingerprint: item.pkg.fingerprint,
+          // 内容哈希（不含 mtime）：用来判断「两份是不是同一份代码」
+          contentHash: hashes.get(item.srcDir, item.pkg.fingerprint),
+          // 这份是哪来的：内置随安装包，热更新来自用户数据目录
+          srcTag: item.tag,
+          // 落位时的外壳版本：判断用户目录那份是不是本次发布带来的
+          appVersion: opts.appVersion ?? null,
           managedBy: 'dsh-desktop',
         }),
       );
@@ -254,5 +381,6 @@ export function installPlugins(): PluginInstallResult {
     if (hot.length > 0) log(`  其中由用户数据目录提供（热更新/手动安装）：${hot.join('、')}`);
   }
   for (const problem of result.problems) log(problem);
+  lastResult = result;
   return result;
 }
