@@ -45,7 +45,8 @@ window.__ModuleLoader__.load({
       notRunning: '服务未启动',
       running: '服务运行中',
       port: '端口',
-      addresses: '局域网地址',
+      addresses: '可用地址（按建议顺序）',
+      recommended: '推荐',
       start: '启动服务',
       stop: '停止服务',
       newCode: '换一个配对码',
@@ -291,9 +292,28 @@ window.__ModuleLoader__.load({
         ),
         running && snap.port ? h(Row, { label: t('port'), mono: true }, String(snap.port)) : null,
         running && snap.addresses && snap.addresses.length
-          ? h(Row, { label: t('addresses'), mono: true },
-            snap.addresses.join('  ') + ' ',
-            h(CopyButton, { text: snap.addresses.join(','), t: t }))
+          ? h('div', { key: 'addrs' }, [
+            h('div', { key: 'lbl', style: labelStyle }, t('addresses')),
+            h('div', { key: 'rows' }, snap.addresses.map(function (a, i) {
+              // 地址现在带类型/网卡 —— 以前只给一串 IP，装了组网工具后用户根本
+              // 不知道填哪个。这里直接把"这是什么"写在旁边。
+              var text = typeof a === 'string' ? a : a.address;
+              var meta = typeof a === 'string' ? '' : (a.label + (a.iface ? ' · ' + a.iface : ''));
+              return h('div', { key: text + i, style: { margin: '4px 0' } }, [
+                h('div', { key: 'v', style: { display: 'flex', alignItems: 'baseline', gap: '8px' } }, [
+                  h('span', { key: 'a', style: monoStyle }, text),
+                  h(CopyButton, { key: 'c', text: text, t: t }),
+                  snap.primary === text
+                    ? h('span', { key: 'p', style: { fontSize: '11px', opacity: 0.7 } }, t('recommended'))
+                    : null,
+                ]),
+                meta ? h('div', { key: 'm', style: { fontSize: '11.5px', opacity: 0.6, marginLeft: '2px' } }, meta) : null,
+                (typeof a !== 'string' && a.hint)
+                  ? h('div', { key: 'h', style: { fontSize: '11.5px', opacity: 0.6, marginLeft: '2px' } }, a.hint)
+                  : null,
+              ]);
+            })),
+          ])
           : null,
       ));
 

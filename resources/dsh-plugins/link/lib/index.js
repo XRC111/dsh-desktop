@@ -33,6 +33,9 @@ import { startLinkServer } from './link-protocol/endpoint.js';
 import { DESKTOP_METHODS, COMMON_METHODS, DEFAULT_PORT, makePairingCode, makeToken, fileChunks } from './link-protocol/protocol.js';
 import { seal, open } from './link-protocol/secret.js';
 import { registerRoutes } from './link-protocol/routes.js';
+import { RELAY_METHOD, REMOTE_PROVIDER, REMOTE_PROVIDER_LABEL, RELAY_ADVERTISED } from './link-protocol/llmrelay.js';
+import { executeLocally } from './link-protocol/relayexec.js';
+import { describeAddresses } from './link-protocol/netinfo.js';
 
 /** 配对码有效期。短一点更安全，长了用户也记不住。 */
 const CODE_TTL_MS = 5 * 60 * 1000;
@@ -46,17 +49,22 @@ const textOut = (props) => ({
 });
 
 /**
- * 取出本机所有非回环 IPv4 地址 —— 手机要连的就是其中之一，直接告诉用户省得他找。
- * @returns {string[]} 地址列表。
+ * 列出本机地址供用户挑选。
+ *
+ * 以前这里只挑 IPv4，且不带任何说明 —— 装上组网工具（Tailscale/EasyTier/Docker）
+ * 之后会返回一串用户完全看不懂的 IP。现在交给 netinfo 分类：
+ * 每个地址带上类型、网卡名、以及"该不该给手机填"的提示，并按建议顺序排好。
+ *
+ * 同时补上了 **IPv6**：手机在移动数据或 IPv6-only 网络下只有 IPv6 地址，
+ * 只列 IPv4 等于这些用户永远连不上。
+ *
+ * @returns {{list: object[], primary: string|null}} 分类后的列表与推荐地址。
  */
 function lanAddresses() {
-    const out = [];
-    for (const list of Object.values(os.networkInterfaces())) {
-        for (const ni of list ?? []) {
-            if (ni.family === 'IPv4' && !ni.internal) out.push(ni.address);
-        }
-    }
-    return out;
+    const list = describeAddresses(os.networkInterfaces());
+    const usable = list.filter((a) => a.usable);
+    // 推荐第一个"明确可用"的：排序已经把局域网/公网排在最前、把机器内部网络沉底。
+    return { list: usable, primary: usable[0]?.address ?? null };
 }
 
 /**
@@ -132,8 +140,23 @@ function apply(ctx, config = {}) {
         return win32.mod;
     }
 
-    /** 注册对端可调用的方法。 */
+    /**
+     * 注册对端可调用的方法。
+     *
+     * `llm.relay` 是「远程凭据转发」的入口：手机把**请求内容**发过来，
+     * 本机用自己的凭据执行。注意它**只在本机 llm 服务可用时**才有意义，
+     * 所以下面用 ctx.get('llm') 判一下，缺了就回一句人话而不是抛栈。
+     */
     function registerHostMethods(conn) {
+        conn.handleStream(RELAY_METHOD, async (args, emit, meta) => {
+            const llm = ctx.get('llm');
+            if (!llm) {
+                const e = new Error('本机没有 llm 服务，无法代为执行。');
+                e.code = 'NO_LOCAL_LLM';
+                throw e;
+            }
+            return executeLocally({ llm }, emit, args, meta);
+        });
         conn.handle('computer.status', async () => {
             const w = await loadWin32();
             if (!w) throw new Error(win32.error);
@@ -294,14 +317,23 @@ function apply(ctx, config = {}) {
     async function opStart(args = {}) {
         await ensureToken();
         if (state.server) {
-            return { running: true, port: state.server.port, code: state.code, addresses: lanAddresses() };
+            const net = lanAddresses();
+            return { running: true, port: state.server.port, code: state.code, addresses: net.list, primary: net.primary };
         }
         state.server = await startLinkServer({
             port: args.port ?? config.port ?? DEFAULT_PORT,
-            host: config.host ?? '0.0.0.0',
+            // 不写 '0.0.0.0' —— 交给 endpoint 走双栈（IPv6+IPv4），
+            // 否则只有 IPv6 的手机（移动数据/V6-only Wi-Fi）永远连不上。
+            host: config.host,
             authorize,
             device: { name: os.hostname(), platform: process.platform + '-' + process.arch },
-            methods: [...DESKTOP_METHODS, ...COMMON_METHODS],
+            // 宣告 llm.relay：让手机知道这台机器能代为执行模型调用。
+            // 但**只有本机真的挂了 llm 服务**才宣告 —— 手机据此决定要不要开转发。
+            methods: [
+                ...DESKTOP_METHODS,
+                ...COMMON_METHODS,
+                ...(ctx.get('llm') ? [RELAY_ADVERTISED] : []),
+            ],
             log,
             onConnection(conn) {
                 state.conn = conn;
@@ -310,13 +342,18 @@ function apply(ctx, config = {}) {
             },
         });
         newCode();
+        const net = lanAddresses();
         return {
             running: true,
             port: state.server.port,
             code: state.code,
             codeExpiresInSeconds: Math.round(CODE_TTL_MS / 1000),
-            addresses: lanAddresses(),
-            hint: '在手机上执行 link_connect，host 填上面任一地址，port 填端口，code 填配对码。',
+            addresses: net.list,
+            primary: net.primary,
+            hint: net.primary
+                ? '在手机上执行 link_connect，host 填 ' + net.primary + '，port 填 ' + state.server.port
+                    + '，code 填配对码。'
+                : '没有找到可用地址 —— 检查是否连上了网络。',
         };
     }
 
@@ -327,7 +364,7 @@ function apply(ctx, config = {}) {
             port: state.server?.port ?? null,
             code: state.code && Date.now() <= state.codeExpiresAt ? state.code : null,
             codeExpiresInSeconds: state.code ? Math.max(0, Math.round((state.codeExpiresAt - Date.now()) / 1000)) : 0,
-            addresses: lanAddresses(),
+            addresses: lanAddresses().list,
             connected: state.conn && !state.conn.closed
                 ? {
                     device: state.conn.peer,
@@ -494,6 +531,6 @@ function apply(ctx, config = {}) {
 }
 
 export const name = '@dsh-desktop/link';
-export const inject = ['tools', 'connection'];
+export const inject = ['tools', 'connection', 'llm'];
 
 export { apply };

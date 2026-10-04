@@ -1,0 +1,84 @@
+/**
+ * 远程凭据转发 —— 协议（两端共享）。
+ *
+ * ── 要解决的问题 ────────────────────────────────────────────────────────────
+ * 用户有手机和电脑两台 dsh，但模型 API Key / 账号登录态只在其中一台上。
+ * 早先的做法是**把凭据文件复制过去**（`model.export` 传 `.credentials.yaml`），
+ * 问题是：
+ *   · 整文件带走了不相干的东西（实测把微信/QQ bot 令牌也带上了）；
+ *   · 登录态 token 往往和设备/风控绑定，搬到手机上往往不可用；
+ *   · key 离开了原机器。
+ *
+ * ── 现在的做法 ──────────────────────────────────────────────────────────────
+ * **不传凭据，传请求。**
+ *
+ *   本地策略（B）：本地有可用 provider 就**本地执行**（快、少一跳）；
+ *   本地没有 → 走 `llm.remote` provider → 经联动通道把**请求内容**发给对端，
+ *   由对端用它自己的 adapter 执行，把流式结果逐块回传。
+ *
+ * 于是：
+ *   · **凭据永远不离开它所属的机器** —— 谁发起请求，就用谁的 key；
+ *   · **插件注入的 API 一并覆盖** —— 拦截点在 `llm/stream` waterfall，
+ *     它在 adapter **之上**一层，所以第三方插件注册的 provider（Qoder、
+ *     workbuddy、任何 `llm.registerAdapter` 的）一律经过，无需逐个适配。
+ *
+ * ── 为什么拦截点选在 llm/stream ────────────────────────────────────────────
+ * `dsh-llm/lib/index.js` 里：
+ *
+ *     stream(options) {
+ *       return this.ctx.waterfall(this, "llm/stream", options,
+ *         () => this.adapterStream(options, prepared));
+ *     }
+ *
+ * 每一次模型调用都经过它，`options` 是完整请求，监听器可以：
+ *   · 调 `next()` → 正常本地执行；
+ *   · 自己 yield chunk → 短路（我们转发的情形）。
+ */
+
+/** 本地执行策略。 */
+export const RELAY_POLICY = {
+    /** 优先本地：本地有可用 provider 就本地跑。 */
+    localFirst: 'local-first',
+    /** 一律转发：所有请求都发给对端。 */
+    alwaysRemote: 'always-remote',
+};
+
+/** 转发方法名（挂在联动通道上）。 */
+export const RELAY_METHOD = 'llm.relay';
+
+/**
+ * 服务方在握手里**宣告**的方法名。
+ *
+ * 为什么单独列：`methods` 列表是给对端做能力发现的（peerMethods）。转发能力
+ * 是**可选**的（桌面得有 llm 服务），所以要能让对端看见"这台机器能代为执行模型
+ * 调用"，而不是让手机盲发过去撞 404。
+ */
+export const RELAY_ADVERTISED = RELAY_METHOD;
+
+/**
+ * 转发请求的载荷。
+ *
+ * 形状是实测出来的（真实 dsh 上跑探针确认），不是猜的：
+ *   { provider: "deepseek-account", model: "deepseek-chat",
+ *     messages: [{ role: "user", content: "…" }] }
+ *
+ * 关键：`options` 只有这三个字段，**纯 JSON**，所以可以原样跨链路转发，
+ * 接收端喂给自己的 `llm.stream()` 即可，无需反序列化任何内部结构。
+ *
+ * 但要注意：真实调用里 options 可能带更多字段（tools、system、信号…）。
+ * 所以这里转发**整个 options**，不做字段裁剪 —— 裁剪会在插件注入自定义字段时
+ * 静默丢东西，而那正是「插件注入的 API 也要走转发」这条要求要覆盖的场景。
+ */
+export const RELAY_REQUEST_KEYS = ['provider', 'model', 'messages'];
+
+/** 转发时用到的虚拟 provider 名。它会出现在模型选择器里。 */
+export const REMOTE_PROVIDER = 'llm-remote';
+
+/**
+ * 虚拟 provider 的展示名。
+ * 刻意写得显眼：用户看到「经电脑调用」就知道请求会离开本机，而不是以为在本地跑。
+ */
+export const REMOTE_PROVIDER_LABEL = '经另一台设备调用';
+
+/** 单次请求的分块转发用的分片 ID 前缀（诊断用）。 */
+export const RELAY_TRACE_PREFIX = 'llm-relay';

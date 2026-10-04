@@ -88,6 +88,8 @@ export function registerRoutes(ctx, spec) {
         ['/stop', 'POST', spec.stop],
         ['/code', 'POST', spec.code],
         ['/connect', 'POST', spec.connect],
+        // 远程凭据转发的开关（仅手机侧提供）。
+        ['/llm-relay', 'POST', spec.llmRelay],
     ];
     for (const [suffix, method, fn] of routes) {
         if (typeof fn !== 'function') continue;

@@ -40,6 +40,32 @@ function equals(a, b) {
 }
 
 /**
+ * 监听一个端口，优先双栈（IPv6 + IPv4）。
+ *
+ * ── 为什么要双栈 ────────────────────────────────────────────────────────────
+ * 以前只绑 '0.0.0.0'（纯 IPv4）。而手机在很多场景下**只有 IPv6**：移动数据、
+ * 部分 IPv6-only 的 Wi-Fi。只绑 IPv4 就等于这些用户永远连不上。
+ *
+ * '::' 在 Windows/Linux 上默认是**双栈**的（IPv4 映射到 ::ffff:a.b.c.d），
+ * 所以一个监听器同时接受两种连接。但并非所有环境都允许（内核参数、容器网络），
+ * 所以失败时明确退回 IPv4，而不是让整个服务起不来。
+ *
+ * @param {import('node:net').Server} server - 服务器。
+ * @param {number} port - 端口。
+ * @param {string|undefined} host - 显式绑定地址；未给出时走双栈自动。
+ * @returns {Promise<string>} 实际绑定的地址。
+ */
+function listen(server, port, host) {
+    return new Promise((resolve, reject) => {
+        const onError = (error) => { server.removeListener('listening', onListening); reject(error); };
+        const onListening = () => { server.removeListener('error', onError); resolve(host ?? '::'); };
+        server.once('error', onError);
+        server.once('listening', onListening);
+        server.listen(port, host);
+    });
+}
+
+/**
  * 启动桌面侧的联动服务。
  *
  * @param {object} options - 选项。
@@ -54,7 +80,7 @@ function equals(a, b) {
  * @param {(msg: string) => void} [options.log] - 日志。
  * @returns {Promise<{port: number, address: string, connections: Set<LinkConnection>, close: () => Promise<void>}>}
  */
-export async function startLinkServer({ port = 0, host = '0.0.0.0', token, authorize, device, methods, onConnection, log = () => {} }) {
+export async function startLinkServer({ port = 0, host, token, authorize, device, methods, onConnection, log = () => {} }) {
     const connections = new Set();
 
     const server = net.createServer((socket) => {
@@ -125,17 +151,22 @@ export async function startLinkServer({ port = 0, host = '0.0.0.0', token, autho
         socket.setNoDelay(true);
     });
 
-    await new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, host, () => {
-            server.removeListener('error', reject);
-            resolve();
-        });
-    });
+    // 绑定：显式 host 就照办；否则先试双栈 '::'，不行再退 IPv4。
+    let bound;
+    if (host) {
+        bound = await listen(server, port, host);
+    } else {
+        try {
+            bound = await listen(server, port, '::');
+        } catch (error) {
+            log('link: 双栈监听（::）不可用（' + (error?.code ?? error?.message) + '），退回 IPv4');
+            bound = await listen(server, port, '0.0.0.0');
+        }
+    }
     const address = server.address();
     return {
         port: typeof address === 'object' && address ? address.port : port,
-        address: host,
+        address: bound,
         connections,
         close: () => new Promise((resolve) => {
             for (const c of connections) c.close('server closing');

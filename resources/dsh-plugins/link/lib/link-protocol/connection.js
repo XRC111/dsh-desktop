@@ -43,6 +43,16 @@ export class LinkConnection extends EventEmitter {
         this.nextId = 1;
         /** @type {Map<number, {resolve: Function, reject: Function, timer: any}>} */
         this.pending = new Map();
+    /**
+     * 在途的**流式**调用。
+     *
+     * 为什么需要它：LLM 响应是逐 token 的。如果只用 call() 等整个结果再返回，
+     * 对话会变成「等十几秒然后整段蹦出来」，交互就没了。所以加了 callStream：
+     * 远端边生成边发事件，本地边收边回调。
+     */
+    this.streams = new Map();
+        /** @type {Map<string, Function>} 对端可调用的流式方法。 */
+        this.streamHandlers = new Map();
         /** @type {Map<string, (args: object) => Promise<any>|any>} */
         this.handlers = new Map();
 
@@ -74,6 +84,18 @@ export class LinkConnection extends EventEmitter {
     }
 
     /**
+     * 注册一个**流式**方法：接收方通过它把事件逐条推回。
+     *
+     * @param {string} method - 方法名。
+     * @param {(args: object, emit: (data:any) => void, meta: {signal: AbortSignal}) => Promise<any>} fn
+     *        处理器；调 `emit(data)` 推一条事件，返回值作为最终 result。
+     */
+    handleStream(method, fn) {
+        this.streamHandlers.set(method, fn);
+        return this;
+    }
+
+    /**
      * 调用对端的一个方法。
      * @param {string} method - 方法名。
      * @param {object} [args] - 参数。
@@ -92,6 +114,34 @@ export class LinkConnection extends EventEmitter {
             if (typeof timer.unref === 'function') timer.unref();
             this.pending.set(id, { resolve, reject, timer });
             this.#write({ t: 'call', id, method, args });
+        });
+    }
+
+    /**
+     * 流式调用对端的方法。
+     *
+     * 协议：本地发 `call-stream`，远端回 `call-stream-ok` 表示受理，随后用
+     * `call-stream-event` 逐条推事件，最后一条 `call-stream-end`（可能带 error）。
+     * 事件带 `seq`，本地据此**丢弃乱序的重复**（重传时不打乱顺序）。
+     *
+     * @param {string} method - 方法名。
+     * @param {object} [args] - 参数。
+     * @param {(data: any) => void} onEvent - 每收到一条事件回调一次。
+     * @param {object} [options] - { timeoutMs }，默认 10 分钟（长回答不该被半路掐断）。
+     * @returns {Promise<any>} 远端结束时给的结果。
+     */
+    callStream(method, args = {}, onEvent, { timeoutMs = 600000 } = {}) {
+        if (this.closed) return Promise.reject(new Error('link: 连接已关闭'));
+        const id = this.nextId++;
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.streams.delete(id);
+                reject(new Error('link: 流式调用 ' + method + ' 超时（' + timeoutMs + 'ms）'));
+            }, timeoutMs);
+            if (typeof timer.unref === 'function') timer.unref();
+            // lastSeq 从 -1 起：事件 seq 从 0 开始，若从 0 起会把**第一条**误判成重复丢掉。
+            this.streams.set(id, { onEvent, resolve, reject, timer, lastSeq: -1 });
+            this.#write({ t: 'call-stream', id, method, args });
         });
     }
 
@@ -138,6 +188,9 @@ export class LinkConnection extends EventEmitter {
             case 'call':
                 this.#onCall(msg);
                 break;
+            case 'call-stream':
+                this.#onCallStream(msg);
+                break;
             case 'reply': {
                 const entry = this.pending.get(msg.id);
                 if (!entry) return;
@@ -149,6 +202,30 @@ export class LinkConnection extends EventEmitter {
                     if (msg.error?.code) error.code = msg.error.code;
                     entry.reject(error);
                 }
+                break;
+            }
+            case 'call-stream-event': {
+                // 流式事件：按 seq 丢重复/乱序。TCP 本身保序，但**跨重传**不保序，
+                // 所以这里显式做一遍 —— 一个 token 重复出现会让输出错乱。
+                const entry = this.streams.get(msg.id);
+                if (!entry) break;
+                if (typeof msg.seq === 'number') {
+                    if (msg.seq <= entry.lastSeq) break;
+                    entry.lastSeq = msg.seq;
+                }
+                try { entry.onEvent(msg.data); } catch (e) { this.log('link: 流式事件回调抛错 ' + (e?.message ?? e)); }
+                break;
+            }
+            case 'call-stream-end': {
+                const entry = this.streams.get(msg.id);
+                if (!entry) break;
+                this.streams.delete(msg.id);
+                clearTimeout(entry.timer);
+                if (msg.error) {
+                    const err = new Error(msg.error.message ?? '远端流式调用失败');
+                    if (msg.error.code) err.code = msg.error.code;
+                    entry.reject(err);
+                } else entry.resolve(msg.value ?? null);
                 break;
             }
             case 'event':
@@ -193,6 +270,36 @@ export class LinkConnection extends EventEmitter {
     }
 
     /**
+     * 执行对端发来的**流式**请求：受理后逐条推事件，最后一条 end。
+     *
+     * @param {{id: number, method: string, args: object}} msg - call-stream 消息。
+     */
+    async #onCallStream(msg) {
+        const fn = this.streamHandlers.get(msg.method);
+        if (!fn) {
+            this.#write({ t: 'call-stream-end', id: msg.id, error: { code: 'METHOD_NOT_FOUND', message: '本端未提供流式方法 ' + msg.method } });
+            return;
+        }
+        const controller = new AbortController();
+        // 断线时中止对端正在跑的流：否则远端会对着一个已经没人听的 socket 一直算下去。
+        this.once('close', () => controller.abort());
+        let seq = 0;
+        const emit = (data) => { this.#write({ t: 'call-stream-event', id: msg.id, seq: seq++, data }); };
+        try {
+            const value = await fn(msg.args ?? {}, emit, { signal: controller.signal });
+            this.#write({ t: 'call-stream-end', id: msg.id, value: value === undefined ? null : value });
+        } catch (error) {
+            this.#write({
+                t: 'call-stream-end', id: msg.id,
+                error: {
+                    code: error?.code ?? 'RELAY_FAILED',
+                    message: String(error?.message ?? error).slice(0, 2000),
+                },
+            });
+        }
+    }
+
+    /**
      * 收尾：拒绝所有在途请求，关 socket，发 close 事件。
      * @param {string} reason - 关闭原因。
      */
@@ -204,6 +311,12 @@ export class LinkConnection extends EventEmitter {
             entry.reject(new Error('link: 连接关闭（' + reason + '）'));
         }
         this.pending.clear();
+        // 同样中止在途的流式调用，否则对端永远等不到 end。
+        for (const [, entry] of this.streams) {
+            clearTimeout(entry.timer);
+            entry.reject(new Error('link: 连接关闭（' + reason + '）'));
+        }
+        this.streams.clear();
         try {
             this.socket.destroy();
         } catch { /* ignore */ }
