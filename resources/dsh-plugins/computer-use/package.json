@@ -1,6 +1,6 @@
 {
   "name": "@dsh-desktop/computer-use",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Computer use for DSH Desktop: screenshot, window control, and synthetic input on Windows",
   "type": "module",
   "main": "./lib/index.js",

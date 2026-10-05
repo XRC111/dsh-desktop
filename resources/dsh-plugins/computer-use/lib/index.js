@@ -200,11 +200,13 @@ function apply(ctx, config) {
   const canKeyboard = allowKeyboard || legacyAll;
   const canWindows = allowWindows || legacyAll;
 
-  // ── 只读：列窗口 ──────────────────────────────────────────────────────────
-  // ── 活跃心跳包装 ────────────────────────────────────────────────────────
-  // 把 register 包一层：每个工具 execute 前后自动打心跳，工具实现本身不用改。
-  // 这样「哪个工具在跑」这个信息只在一处维护，新增工具也不会漏。
-  const registerRaw = ctx.tools.register.bind(ctx.tools);
+  // ── 活跃心跳：局部包装每个工具的 execute，不碰共享的 ctx.tools.register ──
+  //
+  // ⚠️ 之前的写法是 `ctx.tools.register = (tool) => {...}` —— 直接替换共享服务的
+  // register 方法。这会污染所有插件和 dsh 自身的 Agent 预设系统：切换预设时
+  // 工具经被污染的 register 重复注册，报「各种工具提示已注册」（issue #4）。
+  // 改为只在本插件作用域内包装：定义局部 register()，逐个工具包好 execute 再
+  // 调原始 ctx.tools.register，对外部零副作用。
   const ACTION_LABEL = {
     screen_shot: '正在截图',
     screen_windows: '正在查看窗口列表',
@@ -217,24 +219,26 @@ function apply(ctx, config) {
     key_press: '正在按键',
     key_type: '正在输入文本',
   };
-  ctx.tools.register = (tool) => {
+  function withHeartbeat(tool) {
     const inner = tool.execute;
-    if (typeof inner === 'function') {
-      tool.execute = async function (args, ...rest) {
-        beat(true, ACTION_LABEL[tool.name] || '正在操作本机');
-        try {
-          return await inner.call(this, args, ...rest);
-        } finally {
-          // 只读工具（截图/列表）不改变系统状态，不算「正在操作」；
-          // 会动鼠标键盘/窗口的才需要在结束后保持一段可见状态。
-          if (/^(screen_|mouse_move)/.test(tool.name)) beat(false);
-        }
-      };
-    }
-    return registerRaw(tool);
-  };
+    if (typeof inner !== 'function') return tool;
+    tool.execute = async function (args, ...rest) {
+      beat(true, ACTION_LABEL[tool.name] || '正在操作本机');
+      try {
+        return await inner.call(this, args, ...rest);
+      } finally {
+        // 只读工具（截图/列表）不改变系统状态，不算「正在操作」；
+        // 会动鼠标键盘/窗口的才需要在结束后保持一段可见状态。
+        if (/^(screen_|mouse_move)/.test(tool.name)) beat(false);
+      }
+    };
+    return tool;
+  }
+  /** 局部注册：包心跳后交给原始 register，不替换共享方法 */
+  const register = (tool) => ctx.tools.register(withHeartbeat(tool));
 
-  ctx.tools.register(defineTool({
+  // ── 只读：列窗口 ──────────────────────────────────────────────────────────
+  register(defineTool({
     name: 'screen_windows',
     description:
       '列出当前屏幕上所有可见窗口（标题、类名、进程、位置、是否最小化）。' +
@@ -292,7 +296,7 @@ function apply(ctx, config) {
   }));
 
   // ── 只读：枚举 UI 元素（精确坐标，治「点偏」）──────────────────────────────
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'screen_elements',
     description:
       '列出屏幕上所有**可交互** UI 元素及其**精确屏幕坐标**（来自 UI Automation，误差 0）。' +
@@ -355,7 +359,7 @@ function apply(ctx, config) {
 
   // ── 只读：截屏（受 allowScreenshot，默认开）────────────────────────────────
   if (allowScreenshot) {
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'screen_shot',
     description:
       '截取屏幕画面并**直接看到图片**。省略 hwnd 截整个屏幕；给 hwnd 只截那个窗口。' +
@@ -423,7 +427,7 @@ function apply(ctx, config) {
   // ── 窗口组（allowWindows / 旧 allowInput）──────────────────────────────────
   if (canWindows) {
   // 切窗口
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'screen_activate',
     description: '把指定窗口切到前台并获得焦点（必要时先还原最小化）。',
     parameters: {
@@ -437,7 +441,7 @@ function apply(ctx, config) {
   }));
 
   // 移动/缩放窗口
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'screen_resize',
     description: '移动或缩放指定窗口到给定的屏幕坐标与尺寸。',
     parameters: {
@@ -458,7 +462,7 @@ function apply(ctx, config) {
   // ── 鼠标组（allowMouse / 旧 allowInput）────────────────────────────────────
   if (canMouse) {
   // 鼠标移动
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'mouse_move',
     description: '把鼠标指针移动到屏幕绝对坐标（左上角为原点）。',
     parameters: {
@@ -473,7 +477,7 @@ function apply(ctx, config) {
   }));
 
   // 鼠标点击
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'mouse_click',
     description:
       '在屏幕坐标处点击鼠标。省略 x/y 则在当前位置点。' +
@@ -520,7 +524,7 @@ function apply(ctx, config) {
   }));
 
   // 滚轮
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'mouse_scroll',
     description: '滚动鼠标滚轮。delta 为正向上滚、负向下滚，一格通常是 120。',
     parameters: { delta: { type: 'integer', required: true } },
@@ -535,7 +539,7 @@ function apply(ctx, config) {
   // ── 键盘组（allowKeyboard / 旧 allowInput）──────────────────────────────────
   if (canKeyboard) {
   // 按键 / 组合键
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'key_press',
     description:
       '按一次键，或按组合键。keys 是数组：单个键直接按；多个键则前面的按住、最后一个按下抬起，' +
@@ -587,7 +591,7 @@ function apply(ctx, config) {
   }));
 
   // 输入文本
-  ctx.tools.register(defineTool({
+  register(defineTool({
     name: 'key_type',
     description:
       '输入一段文本。**支持中文与任意 Unicode**（走 KEYEVENTF_UNICODE 注入，' +
