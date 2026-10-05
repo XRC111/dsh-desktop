@@ -28,6 +28,14 @@ import struct
 import sys
 import os
 
+# Windows 控制台默认 cp1252 无法编码中文，强制 UTF-8 避免 UnicodeEncodeError
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 EXPECTED = {
     "v8_old": b"15.2.124.19-electron.0",
     "v8_new": b"15.2.124.13-electron.0",
