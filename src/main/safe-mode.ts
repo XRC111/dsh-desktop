@@ -13,14 +13,27 @@
  * ── 做法 ────────────────────────────────────────────────────────────────────
  * 不动用户数据，只在**启动时**把 profile 的 bundles 换成「只留内置」的最小集合：
  *
- *   1) 第一次进入安全模式前，把原始 bundles 备份到 safe-bundles.json
- *      （只备份一次，之后反复进出安全模式不会把「安全集合」当成原始值备份）
- *   2) 正常启动 → 从备份恢复原始 bundles
- *      安全启动 → 写入最小 bundles
+ *   安全启动 → 把「剥离前的那份 bundles」存进 safe-bundles.json（带 stripped
+ *              标记），再把 profile 收敛为最小集合
+ *   正常启动 → 备份带 stripped 标记 → 从备份还原（并清掉标记）
+ *              备份没带标记   → 什么都不做，只把备份刷新成当前这份
  *
  * 为什么每次启动都重写而不是「进入时改、退出时改回」：dsh 可能崩溃/被强杀，
  * 「退出时恢复」就永远不执行了。每次启动按模式重写是**幂等**的，无论上次怎么死的，
  * 状态都由本次启动决定。
+ *
+ * ── stripped 标记为什么必须有 ────────────────────────────────────────────────
+ * 备份以前是「第一次见到就写死、之后永不更新」，而正常启动**无条件**拿它覆盖
+ * profile —— 于是任何在备份建立之后才启用的插件，都会在下次启动被抹掉：备份里
+ * 没有它，覆盖就等于删掉它。
+ *
+ * 插件市场（dshmarket）启用插件正是往 dsh.profile.bundles 里追加包名，所以
+ * 「市场里点启用 → 当时好使 → 重启后全没了」就是这么来的。实测日志：
+ *   13:30:51  已备份原始 bundle 列表（2 项）→ safe-bundles.json   ← 那时还没装插件
+ *   13:33:07  已恢复原始 bundles（6 → 2 项）                      ← 刚启用的 3 个被抹
+ *
+ * 标记把两件事分开了：**安全模式剥离过的**才需要回滚，**用户自己改的**（插件市场、
+ * 官方插件页、手改 package.json）永远以当前为准。
  *
  * ── 为什么不只靠 --patch ────────────────────────────────────────────────────
  * 补丁层能 disable 条目，但 bundles 里的第三方包**各自贡献自己的补丁**，
@@ -63,35 +76,50 @@ interface Backup {
   profile: string;
   bundles: string[];
   at: number;
+  /**
+   * 这份 bundles 是不是「安全模式剥离前」存下来的。
+   *
+   * true  = 它是被安全模式换掉的那份，正常启动要拿它还原
+   * false/缺省 = 它只是当前这份的镜像，正常启动不该拿它覆盖任何东西
+   *
+   * 旧版本（v10.1.8 及以前）写出的文件没有这个字段，读出来就是 false —— 正好
+   * 是想要的语义：那些文件里的列表往往是「还没装插件时」的旧快照，拿它覆盖
+   * 只会误删用户后来启用的插件。缺字段当作 false，等于让老文件自动失效。
+   */
+  stripped?: boolean;
 }
 
-/**
- * 读取/建立原始 bundles 备份。
- *
- * 关键点：**只在备份不存在时写**。如果每次都写，第二次进安全模式就会把
- * 「只剩内置」的安全集合当成原始值存下来，之后正常启动也恢复不回去了 ——
- * 那是不可逆的数据损坏。
- */
-function ensureBackup(profileName: string, current: string[]): string[] {
-  const file = backupFile();
+/** 读备份文件。读不到/坏了/换了 profile 都返回 null。 */
+function readBackup(profileName: string): Backup | null {
   try {
-    const raw = fs.readFileSync(file, 'utf8');
-    const data = JSON.parse(raw) as Partial<Backup>;
-    if (Array.isArray(data.bundles) && data.profile === profileName) return data.bundles;
-    // 换了 profile：旧备份不适用，重新备份
+    const data = JSON.parse(fs.readFileSync(backupFile(), 'utf8')) as Partial<Backup>;
+    if (!Array.isArray(data.bundles) || data.profile !== profileName) return null;
+    return {
+      version: 1,
+      profile: profileName,
+      bundles: data.bundles,
+      at: typeof data.at === 'number' ? data.at : Date.now(),
+      stripped: data.stripped === true,
+    };
   } catch {
-    /* 没有或损坏，下面重建 */
+    return null;
   }
-  const data: Backup = { version: 1, profile: profileName, bundles: current, at: Date.now() };
+}
+
+/** 写备份文件。失败只记日志 —— 逃生舱失效不该反过来阻断启动。 */
+function writeBackup(data: Backup, what: string): void {
+  const file = backupFile();
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n', 'utf8');
-    log('已备份原始 bundle 列表（' + current.length + ' 项）→ ' + file);
+    log(`${what}（${data.bundles.length} 项${data.stripped ? '，安全模式剥离前' : ''}）→ ${file}`);
   } catch (err) {
-    log('备份 bundle 列表失败（安全模式仍会继续，但退出安全模式后可能需手动恢复）：' + String(err));
+    log('写入 bundle 备份失败（安全模式仍会继续，但退出安全模式后可能需手动恢复）：' + String(err));
   }
-  return current;
 }
+
+const sameBundles = (a: string[], b: string[]): boolean =>
+  a.length === b.length && a.every((v, i) => v === b[i]);
 
 export interface SafeModeResult {
   /** 实际是否进入了安全模式 */
@@ -107,6 +135,11 @@ export interface SafeModeResult {
  *
  * 必须在**启动 dsh 之前**调用。任何失败都不抛异常 —— 它只是让「逃生舱」失效，
  * 不该反过来阻断正常启动。
+ *
+ * 三种情形（`stripped` 标记决定走哪条，见文件头）：
+ *   安全启动                     → 收敛为内置集合，并把剥离前那份存成 stripped 备份
+ *   正常启动 + 备份 stripped      → 从备份还原，随后清掉标记
+ *   正常启动 + 备份未 stripped    → 什么都不动，当前这份就是用户的选择
  */
 export function prepareBundles(profileName = 'web'): SafeModeResult {
   const file = profileManifest(profileName);
@@ -126,11 +159,17 @@ export function prepareBundles(profileName = 'web'): SafeModeResult {
   }
 
   const want = safeModeRequested();
-  const backup = ensureBackup(profileName, current);
-  const target = want ? current.filter((b) => INBOX_BUNDLES.has(b)) : backup;
+  const backup = readBackup(profileName);
+  // 只有「安全模式剥离过」的备份才有资格覆盖 profile。镜像（未带标记）永远不覆盖：
+  // 它只是记录，拿它覆盖就是本文档开头那个「重启后插件全没了」。
+  const restoring = !want && backup?.stripped === true;
+  const target = want
+    ? current.filter((b) => INBOX_BUNDLES.has(b))
+    : restoring
+      ? (backup as Backup).bundles
+      : current;
 
-  const same =
-    target.length === current.length && target.every((b, i) => b === current[i]);
+  const same = sameBundles(target, current);
   if (!same) {
     profile.bundles = target;
     dsh.profile = profile;
@@ -145,8 +184,34 @@ export function prepareBundles(profileName = 'web'): SafeModeResult {
       );
     } catch (err) {
       log('写入 profile manifest 失败：' + String(err));
+      // 没写成就别碰备份：还原可以下次启动再来一次。
       return { safe: false, bundles: current, excluded: [] };
     }
+  }
+
+  // 备份维护放在写文件**之后**：
+  //   · 进安全模式 → 存下剥离前那份并打标记（已有标记就不覆盖，否则会把「只剩
+  //     内置」当成原始值存下来，之后再也回不去）
+  //   · 还原完成   → 清掉标记，免得它下次启动又把这份旧列表盖回来
+  //   · 正常启动   → 把镜像刷新成当前这份，文件始终是「用户上一次的选择」
+  const strippedNow = current.filter((b) => !INBOX_BUNDLES.has(b));
+  if (want) {
+    if (backup?.stripped !== true && strippedNow.length > 0) {
+      writeBackup(
+        { version: 1, profile: profileName, bundles: current, at: Date.now(), stripped: true },
+        '已备份安全模式剥离前的 bundle 列表',
+      );
+    }
+  } else if (restoring) {
+    writeBackup(
+      { version: 1, profile: profileName, bundles: target, at: Date.now(), stripped: false },
+      '已还原 bundle 列表并清除剥离标记',
+    );
+  } else if (!sameBundles(backup?.bundles ?? [], target)) {
+    writeBackup(
+      { version: 1, profile: profileName, bundles: target, at: Date.now(), stripped: false },
+      '已同步 bundle 列表备份',
+    );
   }
 
   const excluded = current.filter((b) => !target.includes(b));
