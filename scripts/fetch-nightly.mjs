@@ -205,9 +205,13 @@ try {
 } catch { /* 不存在就往下走 */ }
 fs.mkdirSync(scopeDir, { recursive: true });
 let materialized = 0;
-for (const base of ['packages', 'apps', 'vendor', 'native']) {
-  const baseDir = path.join(srcDir, base);
-  if (!fs.existsSync(baseDir)) continue;
+// 扫描源码树所有顶层目录（自动覆盖新增包，不再硬编码 packages/apps/vendor/native）。
+// dsh monorepo 结构会演进，硬编码目录列表每次新增包都要改这里 —— 实测
+// @deepseek-ai/node-addon-system 就是因为在新目录下没被物化而炸了依赖闭包。
+const skipTopDirs = new Set(['node_modules', '.git', '.github', 'dist', 'build', '.pnpm-store', '.changeset']);
+for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+  if (!entry.isDirectory() || skipTopDirs.has(entry.name) || entry.name.startsWith('.')) continue;
+  const baseDir = path.join(srcDir, entry.name);
   for (const p of findPackages(baseDir)) {
     const manifest = JSON.parse(fs.readFileSync(path.join(p, 'package.json'), 'utf8'));
     if (!manifest.name) continue;
@@ -216,7 +220,7 @@ for (const base of ['packages', 'apps', 'vendor', 'native']) {
     try { fs.rmSync(dest, { recursive: true, force: true }); } catch { /* 无则跳过 */ }
     fs.mkdirSync(dest, { recursive: true });
     fs.copyFileSync(path.join(p, 'package.json'), path.join(dest, 'package.json'));
-    for (const sub of ['lib', 'dist', 'locale', 'assets', 'skills', 'config', 'reference']) {
+    for (const sub of ['lib', 'dist', 'locale', 'assets', 'skills', 'config', 'reference', 'build', 'prebuilds', 'binding']) {
       const from = path.join(p, sub);
       if (fs.existsSync(from)) copyTree(from, path.join(dest, sub));
     }
