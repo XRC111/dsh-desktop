@@ -131,7 +131,10 @@ function writeMark(pkgFile, raw, version, hash) {
     out = out.replace(/("version"\s*:\s*")[^"]*(")/, `$1${version}$2`);
     if (out === before) throw new Error('没找到 version 字段，无法升版本');
   }
-  if (/\)"dshDesktopBuild"\s*:\s*"[^"]*"/.test(out)) {
+  // 注意这个正则：以前误写成 /\)"dshDesktopBuild".../ （开头多了一个转义右括号），
+  // 于是**永远匹配不到**已存在的戳 → 每次都走 else 分支追加 → package.json 里出现
+  // 两个同名键（JSON 合法、后者生效，但是脏数据，且让下次内容哈希不稳定）。
+  if (/"dshDesktopBuild"\s*:\s*"[^"]*"/.test(out)) {
     out = out.replace(/("dshDesktopBuild"\s*:\s*")[^"]*(")/, `$1${hash}$2`);
   } else {
     const i = out.lastIndexOf('}');

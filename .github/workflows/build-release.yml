@@ -161,6 +161,54 @@ jobs:
         shell: pwsh
         run: npm run gen:assets
 
+      # ── 4b) 打插件热更包（build/plugins-*.tar.gz + .meta.json）───────────────
+      # 这一步以前**只在开发者本机手工跑**，CI 里完全没有 —— 后果是 feed 的
+      # plugins 段永远是空的（release-v2.ps1 只读 build/plugins-*.meta.json，
+      # 读不到就打 Info「插件 X 无 meta」然后静默跳过），于是「插件热更」这条
+      # 通道在 CI 发版下形同虚设：插件改动到不了已装用户。
+      #
+      # auto 模式会按内容哈希自动升 patch 版本号并写回 package.json 的
+      # dshDesktopBuild —— 所以这里改动了工作区文件，但发版产物是自洽的。
+      - name: 打插件热更包
+        shell: pwsh
+        run: |
+          node scripts/pack-all-plugins.mjs
+          Write-Host ''
+          Write-Host '插件包产物：'
+          $metas = @(Get-ChildItem build/plugins-*.meta.json -ErrorAction SilentlyContinue)
+          if ($metas.Count -eq 0) { throw '没有产出任何插件 meta，feed 的 plugins 段会是空的' }
+          foreach ($m in $metas) {
+            $j = Get-Content $m.FullName -Raw | ConvertFrom-Json
+            Write-Host ("  {0}  ({1:N1} KB)" -f $j.version, ($j.size / 1KB))
+          }
+
+      # ── 4c) 外壳自身的回归测试 ───────────────────────────────────────────────
+      # 这些 verify-*.mjs 读的是 out/ 产物，所以要先 build。
+      # 以前 CI 一个都没跑，回归只能靠人记得在本机跑 —— 本仓库踩过的几个 bug
+      # （恢复页白板、热更被拦、插件被降级）都是这类「静默失效」，正是它们该拦的。
+      #
+      # 刻意**不含** verify-hot-base：它读 dist/update/latest.json（本地发版产物、
+      # 被 gitignore），CI 上根本没有那个文件，且它自初始版本起就依赖本机状态，
+      # 不是可离线判定的回归。要纳入得先把它改成读固定 fixture。
+      - name: 构建外壳并跑回归测试
+        shell: pwsh
+        run: |
+          npm run build
+          $scripts = @(
+            'verify-safe-mode',
+            'verify-view-layout',
+            'verify-updater-picks'
+          )
+          $failed = @()
+          foreach ($s in $scripts) {
+            $f = "scripts/$s.mjs"
+            if (-not (Test-Path $f)) { Write-Host "  . 跳过（不存在）：$f"; continue }
+            Write-Host "`n--- $s ---"
+            node $f
+            if ($LASTEXITCODE -ne 0) { $failed += $s }
+          }
+          if ($failed.Count) { throw "回归测试失败：$($failed -join '、')" }
+
       # ── 5) 构建六个通道 ─────────────────────────────────────────────────────
       #   -SkipGen -SkipWrangler：feed 生成与部署在后面的步骤单独做
       #   （这样能先确认六个包都构建成功，再决定要不要发布）
@@ -245,6 +293,53 @@ jobs:
             -SetupUrlW7     "$base/DSH-Desktop-Setup-${{ steps.v.outputs.w7 }}.exe" `
             -SetupUrlW7Beta "$base/DSH-Desktop-Setup-${{ steps.v.outputs.w7beta }}.exe" `
             -SetupUrlW7Dev  "$base/DSH-Desktop-Setup-${{ steps.v.outputs.w7dev }}.exe"
+
+      # ── 7b) 校验 feed 真的挂上了热更包 / 插件（部署前最后一道闸）──────────────
+      # 这一步是给「静默为空」兜底的。上面那几个通道缺失时 release-v2.ps1 只打
+      # Info/Warn 不中断，于是 feed 少一块也照样部署 —— 实测踩过两次：
+      #   · hot 块缺失 → 热更新永远不触发
+      #   · plugins 段缺失 → 插件改动到不了已装用户
+      # 这里把「应该有的块」变成硬断言，宁可发不出去也不要发一份残缺 feed。
+      - name: 校验 feed 内容
+        shell: pwsh
+        run: |
+          $stable = '${{ steps.v.outputs.stable }}'
+          $beta   = '${{ steps.v.outputs.beta }}'
+          $dev    = '${{ steps.v.outputs.dev }}'
+          $problems = @()
+
+          function Check-Feed([string]$file, [string]$channel, [string]$expectVersion) {
+            if (-not (Test-Path $file)) { $script:problems += "$file 不存在"; return }
+            $j = Get-Content $file -Raw | ConvertFrom-Json
+            $tag = "[$channel] $file"
+            if ($j.version -ne $expectVersion) { $script:problems += "$tag version=$($j.version)，期望 $expectVersion" }
+
+            $hotCount = @($j.hot | Where-Object { $_ }).Count
+            if ($hotCount -eq 0) { $script:problems += "$tag 没有 hot 块（热更新不可用）" }
+
+            $pluginCount = @($j.plugins | Where-Object { $_ }).Count
+            if ($pluginCount -eq 0) { $script:problems += "$tag 没有 plugins 段（插件热更不可用）" }
+
+            # 外链模式下安装包必须带 sha256，否则客户端只能按 size 兜底
+            if ($j.files) {
+              foreach ($f in @($j.files)) {
+                if ($f.url -and -not $f.sha256) { $script:problems += "$tag 安装包外链缺 sha256：$($f.url)" }
+              }
+            }
+            Write-Host ("  {0}  version={1}  hot={2}  plugins={3}" -f $tag, $j.version, $hotCount, $pluginCount)
+          }
+
+          Write-Host '=== feed 内容校验 ==='
+          Check-Feed 'dist/update/latest.json'      'stable' $stable
+          Check-Feed 'dist/update/latest-beta.json' 'beta'   $beta
+          Check-Feed 'dist/update/latest-dev.json'  'dev'    $dev
+
+          if ($problems.Count) {
+            Write-Host ''
+            foreach ($p in $problems) { Write-Host "  ✗ $p" }
+            throw "feed 校验失败（$($problems.Count) 项）—— 拒绝部署一份残缺的 feed"
+          }
+          Write-Host '  全部通过'
 
       # ── 8) 部署 feed（可选：缺 secrets 时跳过而不是失败）────────────────────
       - name: 部署 feed 到 Cloudflare Pages

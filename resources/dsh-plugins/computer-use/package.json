@@ -1,6 +1,6 @@
 {
   "name": "@dsh-desktop/computer-use",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Computer use for DSH Desktop: screenshot, window control, and synthetic input on Windows",
   "type": "module",
   "main": "./lib/index.js",
@@ -22,5 +22,5 @@
   },
   "license": "MIT",
   "private": true,
-  "dshDesktopBuild": "e02f6191de7638c1"
+  "dshDesktopBuild": "df0aa72f4aba4454"
 }
