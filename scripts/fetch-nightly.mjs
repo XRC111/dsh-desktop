@@ -23,7 +23,7 @@
 //   node scripts/fetch-nightly.mjs --keep-src            # 保留源码树（调试）
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawnSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -280,7 +280,25 @@ log('  自检通过：node_modules 无符号链接');
 // 依赖闭包自检：从入口出发，沿 dependencies 走一遍，确认每个包都真的在树里。
 // 这是「符号链接被丢掉」那类事故的**通用兜底** —— 缺任何一个都会在用户机器上
 // 变成 ERR_MODULE_NOT_FOUND（实测 semver 就是这么炸的），在这里提前抓出来。
-const missingDeps = verifyDependencyClosure(nmDir, ['@deepseek-ai/dsh', '@deepseek-ai/dsh-app-boot']);
+//
+// 修复策略：缺包不直接 die，先尝试从 npm 装到目标树里（pnpm 链接物化在 Windows
+// 上可能丢原生 addon 如 @deepseek-ai/node-addon-system，直接 npm install 最稳）。
+// 装完再检一次，还缺才 die。
+let missingDeps = verifyDependencyClosure(nmDir, ['@deepseek-ai/dsh', '@deepseek-ai/dsh-app-boot']);
+if (missingDeps.length) {
+  log('  依赖闭包缺 ' + missingDeps.length + ' 个，尝试从 npm 补齐：' + missingDeps.join(', '));
+  try {
+    execSync(
+      'npm install --no-save --no-audit --no-fund --registry=https://registry.npmjs.org ' +
+        missingDeps.map((d) => JSON.stringify(d)).join(' '),
+      { cwd: targetDir, stdio: 'inherit', timeout: 120000 },
+    );
+    log('  npm install 完成，重新校验闭包');
+  } catch (e) {
+    log('  npm install 失败（' + (e.message || e) + '），进入最终校验');
+  }
+  missingDeps = verifyDependencyClosure(nmDir, ['@deepseek-ai/dsh', '@deepseek-ai/dsh-app-boot']);
+}
 if (missingDeps.length) {
   die('运行时依赖闭包不完整（共 ' + missingDeps.length + ' 个缺失）：\n  ' + missingDeps.slice(0, 20).join('\n  '));
 }
