@@ -843,6 +843,9 @@ if ($SkipGen) {
 # ---------------------------------------------------------------------------
 Step '6/7 暂存 + 部署到 Cloudflare Pages（六份 feed 一次传齐）'
 # ---------------------------------------------------------------------------
+if ($SkipGen) {
+    Info '跳过（-SkipGen：未生成 feed，无需暂存/部署）'
+} else {
 # feed 列表必须与本次实际生成的对齐：跳过 nightly 时并不产出 latest-nightly.json，
 # 若仍列进来 step 6 会 throw 缺文件（本地全通道发版实测踩到）。所以按 SkipNightly 过滤。
 # 七份全列：本地缺的那份由 deploy-pages 从**线上**补齐。
@@ -883,10 +886,14 @@ if ($SkipWrangler) {
     } finally { Pop-Location }
     Ok '六份 feed 已部署'
 }
+}  # end of SkipGen else
 
 # ---------------------------------------------------------------------------
 Step '7/7 线上核验 + 现场归位'
 # ---------------------------------------------------------------------------
+if ($SkipGen) {
+    Info '跳过 feed 线上核验（-SkipGen）'
+} else {
 $cb = Get-Date -Format yyyyMMddHHmmss
 foreach ($f in $allFeeds) {
     $raw = curl.exe -s ($BaseUrl + '/' + $f + '?cb=' + $cb)
@@ -894,6 +901,7 @@ foreach ($f in $allFeeds) {
     $j = $raw | ConvertFrom-Json
     Write-Host ('  {0,-22} version={1,-8} channel={2}' -f $f, $j.version, $j.channel) -ForegroundColor White
 }
+}  # end of SkipGen else
 Restore-WorkingState
 Ok '现场已归位：version=10.1.0 / dshVersion=0.1.5-rc.3 / channel=stable / 运行时目录还原'
 Ok '全部完成'
