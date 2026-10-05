@@ -701,7 +701,13 @@ export class Updater {
       const rt = this.pickRuntime(feed);
       const plugins = this.pickPlugins(feed);
       const hasPlugins = plugins.length > 0;
-      const available = shellOutdated || !!rt || hasPlugins;
+      // `hot` 必须计入：热更包是一条**独立的可用通道**，与云端 version 高低无关。
+      // 漏掉它的后果实测过：当前安装版高于 feed 版本（从 beta/dev 切回 stable、
+      // 或停在比云端更新的自建版）时 shellOutdated=false、dev feed 又没有 runtime
+      // 块、也没有新插件 → available=false → 直接走下面的「已是最新」分支返回，
+      // 而日志里明明已经打出「可用热更新」（pickHot 挑到了包）。
+      // 表现就是「热更包发了，但客户端永远不下载」。
+      const available = shellOutdated || !!hot || !!rt || hasPlugins;
 
       log(
         `更新检查：当前 ${current} / 云端 ${latest} → ${shellOutdated ? '有更新' : '已是最新'}` +
@@ -980,11 +986,23 @@ export class Updater {
         const landed = path.join(profilesModulesDir(), ...name.split('/'), 'package.json');
         try {
           const pkg = JSON.parse(fs.readFileSync(landed, 'utf8'));
-          if (String(pkg.version) === String(expectedVersion)) {
-            log(`插件 ${name} 已落位且版本一致（${pkg.version}）`);
+          const have = String(pkg.version ?? '');
+          if (have === String(expectedVersion)) {
+            log(`插件 ${name} 已落位且版本一致（${have}）`);
             continue;
           }
-          log(`插件 ${name} profile 版本 ${pkg.version} → 需要 ${expectedVersion}`);
+          // 只判「相不相等」会让本地更新的一份被 feed 里的旧版**降级回去**：
+          // 内置源升到 1.0.2（plugin-installer 按版本高低落位，它赢）而 feed 还是
+          // 上次发版的 1.0.1 时，这里每次都判「需要 1.0.1」→ 装回旧版 → 下次启动
+          // 内置源又把 1.0.2 顶回来 → 检查再判不等 …… 无限拉锯，表现就是
+          // 「外壳一直弹 1.0.1 更新」。
+          // 插件热更的语义是「把用户推到更新的版本」，不是「让版本与 feed 全等」，
+          // 所以本地比 feed 新时保留本地，不再排队安装。
+          if (compareVersions(have, String(expectedVersion)) > 0) {
+            log(`插件 ${name} 本地 ${have} 比 feed 的 ${expectedVersion} 新，保留本地`);
+            continue;
+          }
+          log(`插件 ${name} profile 版本 ${have} → 需要 ${expectedVersion}`);
         } catch {
           log(`插件 ${name} 未落位到 profile，准备下载安装`);
         }
