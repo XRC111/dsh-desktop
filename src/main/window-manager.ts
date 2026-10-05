@@ -443,7 +443,16 @@ export class WindowManager {
     this.contentView = view;
     this.bindContextMenu(view); // 重建视图要重新挂右键菜单
     this.win.contentView.addChildView(view);
-    this.applyContentInset();
+    // 新建的 View 默认 bounds 是 {0,0,0,0}，不布局就是个零尺寸视图 ——
+    // 页面照样加载完成（日志一切正常），但一个像素都不画，表现是**纯白板**。
+    // 只有窗口 resize 会重排，所以「拖一下窗口大小内容才出现」正是这个症状。
+    // 本方法重建了 contentView，必须补一次布局；create()/setTitleBarEnabled()
+    // 两条建视图的路径也都紧随一次 layout。
+    this.layoutViews();
+    // 无边框安全边距的注入要等页面就绪：loadFile 之前 executeJavaScript 会因
+    // 还没有文档而失败（异常被吞掉，所以一直是静默不生效）。与 loadDshUi 一致，
+    // 挂到 did-finish-load 上。
+    view.webContents.once('did-finish-load', () => this.applyContentInset());
     void view.webContents.loadFile(path.join(rendererDir(), 'recovery.html'));
     log('已加载恢复工具页面（不依赖 Harness）');
   }
