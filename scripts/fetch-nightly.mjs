@@ -208,11 +208,14 @@ let materialized = 0;
 // 扫描源码树所有顶层目录（自动覆盖新增包，不再硬编码 packages/apps/vendor/native）。
 // dsh monorepo 结构会演进，硬编码目录列表每次新增包都要改这里 —— 实测
 // @deepseek-ai/node-addon-system 就是因为在新目录下没被物化而炸了依赖闭包。
-const skipTopDirs = new Set(['node_modules', '.git', '.github', 'dist', 'build', '.pnpm-store', '.changeset']);
+// 只跳过确定不含 workspace 包的目录。
+// 注意：dsh 源码树的 build/ dist/ 可能放编译产物包（如 node-addon-system），不能跳！
+const skipTopDirs = new Set(['node_modules', '.git', '.pnpm-store']);
 for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
-  if (!entry.isDirectory() || skipTopDirs.has(entry.name) || entry.name.startsWith('.')) continue;
+  if (!entry.isDirectory() || skipTopDirs.has(entry.name)) continue;
   const baseDir = path.join(srcDir, entry.name);
-  for (const p of findPackages(baseDir)) {
+  // depth=6：原生 addon 可能嵌套较深（native/addons/system/...）
+  for (const p of findPackages(baseDir, 0, 6)) {
     const manifest = JSON.parse(fs.readFileSync(path.join(p, 'package.json'), 'utf8'));
     if (!manifest.name) continue;
     const dest = path.join(targetDir, 'node_modules', ...manifest.name.split('/'));
@@ -368,10 +371,10 @@ function findSymlinks(dir, limit = 5) {
   return out;
 }
 
-/** 递归找含 package.json 的包目录（深度 3，覆盖 packages/x/y 与 vendor/x） */
-function findPackages(dir, depth = 0) {
+/** 递归找含 package.json 的包目录（默认深度 3，可覆盖；覆盖 packages/x/y 与 vendor/x） */
+function findPackages(dir, depth = 0, maxDepth = 3) {
   const out = [];
-  if (depth > 3) return out;
+  if (depth > maxDepth) return out;
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
   if (entries.some((e) => e.isFile() && e.name === 'package.json')) return [dir];

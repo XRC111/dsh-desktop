@@ -133,15 +133,16 @@ jobs:
 
       # ── 3) 三棵 dsh 运行时树（被 gitignore，CI 必须自己拉）────────────────────
       #   0.1.7-rc.2  → stable 线（resources/dsh-runtime）
-      #   0.2.0-rc.2  → beta / dev 线（build/rt-next、build/rt-alpha）
+      #   0.2.0-rc.2  → beta 线（build/rt-next）
+      #   0.2.1-alpha.1 → dev 线（build/rt-alpha）
       - name: 拉取 dsh 运行时树
         shell: pwsh
         run: |
           # 主线 stable 树：装到 resources/dsh-runtime
           node scripts/fetch-dsh.mjs --to resources/dsh-runtime --version 0.1.7-rc.2
-          # beta / dev 树：都是 0.2.0-rc.2
+          # beta / dev 树：beta=0.2.0-rc.2，dev=0.2.1-alpha.1
           node scripts/fetch-dsh.mjs --to build/rt-next  --version 0.2.0-rc.2
-          node scripts/fetch-dsh.mjs --to build/rt-alpha --version 0.2.0-rc.2
+          node scripts/fetch-dsh.mjs --to build/rt-alpha --version 0.2.1-alpha.1
           # 升级差分源（老 stable 用户热更用）：0.1.5-rc.3
           node scripts/fetch-dsh.mjs --to build/rt-015 --version 0.1.5-rc.3
 
