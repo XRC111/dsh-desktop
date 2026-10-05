@@ -158,6 +158,20 @@ function mtimeOf(dir: string): number {
   try { return fs.statSync(dir).mtimeMs; } catch { return 0; }
 }
 
+/** 比较 semver 版本号：a > b 返回 1，a < b 返回 -1，相等返回 0。非数字段按 0 处理。 */
+function compareVersions(a: string, b: string): number {
+  const pa = String(a).split('.').map((s) => parseInt(s, 10) || 0);
+  const pb = String(b).split('.').map((s) => parseInt(s, 10) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const da = pa[i] ?? 0;
+    const db = pb[i] ?? 0;
+    if (da > db) return 1;
+    if (da < db) return -1;
+  }
+  return 0;
+}
+
 function readPkgInfo(dir: string, fallbackName: string): PkgInfo | null {
   const pkgFile = path.join(dir, 'package.json');
   if (!fs.existsSync(pkgFile)) {
@@ -262,6 +276,34 @@ export function installPlugins(opts: { appVersion?: string } = {}): PluginInstal
     const ours = name.startsWith(PLUGIN_SCOPE + '/');
     const builtinNewer = mtimeOf(slot.builtin.srcDir) > mtimeOf(slot.hot.srcDir);
 
+    // 自研插件：先比版本号——内置版本严格更高时直接顶回，不管 mtime。
+    // （实测 computer-use 从 1.0.0 升到 1.0.2 修了全局猴子补丁，但用户目录残留的
+    //   旧副本 mtime 更新，纯 mtime 判断压不住，导致修复版永远不生效。）
+    // 版本号相同（自研插件常年不改版本号但内容每版变）才 fallback 到 mtime。
+    if (ours) {
+      const cmp = compareVersions(slot.builtin.pkg.version, slot.hot.pkg.version);
+      if (cmp > 0) {
+        plan.push(slot.builtin);
+        result.healed.push({
+          name,
+          builtin: slot.builtin.pkg.version,
+          hot: slot.hot.pkg.version,
+          from: slot.hot.srcDir,
+        });
+        continue;
+      }
+      if (cmp === 0 && builtinNewer) {
+        plan.push(slot.builtin);
+        result.healed.push({
+          name,
+          builtin: slot.builtin.pkg.version,
+          hot: slot.hot.pkg.version,
+          from: slot.hot.srcDir,
+        });
+        continue;
+      }
+    }
+
     // 第三方插件：**只有版本号不一致时才值得说**。
     // 同为 1.66.1 而内容不同是正常的——安装包里那份是随包分发的目录，
     // 用户目录那份来自 feed 的 plugins-*.tar.gz，两者打包方式本就不同。
@@ -271,19 +313,6 @@ export function installPlugins(opts: { appVersion?: string } = {}): PluginInstal
       continue;
     }
 
-    if (ours && builtinNewer) {
-      // 自研插件：内置那份是随**本次安装**一起发布的，用户目录那份更旧 → 顶回内置。
-      // 实测故障就是这么来的：残留的旧副本一直赢，安装包里新的设置页优化永远不生效，
-      // 而两边版本号还都是 1.0.0，表面上看起来「版本没变」。
-      plan.push(slot.builtin);
-      result.healed.push({
-        name,
-        builtin: slot.builtin.pkg.version,
-        hot: slot.hot.pkg.version,
-        from: slot.hot.srcDir,
-      });
-      continue;
-    }
     plan.push(slot.hot);
     result.shadowed.push({
       name,
