@@ -22,30 +22,35 @@ name: build-release
 on:
   workflow_dispatch:
     inputs:
+      # 六个版本号默认留空 = **自动推导**（从线上 feed 的当前版本 +1 patch）。
+      # 以前这里是写死的 10.1.3 / 10.2.2 / 10.3.1，而线上早已跑到 10.1.13 / 10.2.12
+      # / 10.3.11 —— 直接点「Run workflow」用默认值发版会让版本号**倒退**，而倒退的
+      # feed 会让所有客户端判定成「降级回滚」，比不发还糟。
+      # 留空即安全：想手动指定时再填。
       stable:
-        description: '主线 stable 版本号'
-        required: true
-        default: '10.1.3'
+        description: '主线 stable 版本号（留空 = 线上版本 +1 patch）'
+        required: false
+        default: ''
       beta:
-        description: '主线 beta 版本号'
-        required: true
-        default: '10.2.2'
+        description: '主线 beta 版本号（留空 = 线上版本 +1 patch）'
+        required: false
+        default: ''
       dev:
-        description: '主线 dev 版本号'
-        required: true
-        default: '10.3.1'
+        description: '主线 dev 版本号（留空 = 线上版本 +1 patch）'
+        required: false
+        default: ''
       w7:
-        description: 'w7 stable 版本号'
-        required: true
-        default: '7.1.4'
+        description: 'w7 stable 版本号（留空 = 线上版本 +1 patch）'
+        required: false
+        default: ''
       w7beta:
-        description: 'w7 beta 版本号'
-        required: true
-        default: '7.2.1'
+        description: 'w7 beta 版本号（留空 = 线上版本 +1 patch）'
+        required: false
+        default: ''
       w7dev:
-        description: 'w7 dev 版本号'
-        required: true
-        default: '7.3.1'
+        description: 'w7 dev 版本号（留空 = 线上版本 +1 patch）'
+        required: false
+        default: ''
       deploy_feed:
         description: '是否部署 feed（需要 Cloudflare secrets）'
         type: boolean
@@ -81,30 +86,92 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      # ── 0) 解析版本号（手动触发用 inputs，tag 触发从 tag 名推 stable）──────────
+      # ── 0) 解析版本号 ────────────────────────────────────────────────────────
+      # 空值 = 从线上 feed 取当前版本并 +1 patch。这样「点一下 Run workflow」就是
+      # 一次合法的发版，不必手填六个号，也不会踩到写死默认值导致的版本倒退。
+      # 取不到线上 feed（网络问题）时**直接失败**，不猜版本号 —— 猜错就是发一份
+      # 版本倒退的 feed，所有客户端会判定成「降级回滚」。
       - name: 解析版本号
         id: v
         shell: pwsh
         run: |
+          $base = 'https://dl.666-xrc.cc.cd'
+
+          function Next-Version([string]$given, [string]$feedFile, [string]$label) {
+            if ($given -and $given.Trim()) { return $given.Trim() }
+            try {
+              $j = Invoke-RestMethod "$base/$feedFile" -TimeoutSec 30
+              $cur = [string]$j.version
+              if (-not $cur) { throw "线上 $feedFile 没有 version 字段" }
+              if ($cur -notmatch '^(\d+)\.(\d+)\.(\d+)$') { throw "线上版本号格式异常：$cur" }
+              $next = "$($Matches[1]).$($Matches[2]).$([int]$Matches[3] + 1)"
+              Write-Host "  $label：线上 $cur → 自动 $next"
+              return $next
+            } catch {
+              throw "$label 版本号留空且无法从线上推导（$base/$feedFile）：$($_.Exception.Message)。请显式填写，或稍后重试。"
+            }
+          }
+
           if ('${{ github.event_name }}' -eq 'workflow_dispatch') {
-            $s = '${{ inputs.stable }}'
-            $b = '${{ inputs.beta }}'
-            $d = '${{ inputs.dev }}'
-            $w = '${{ inputs.w7 }}'
+            $s  = '${{ inputs.stable }}'
+            $b  = '${{ inputs.beta }}'
+            $d  = '${{ inputs.dev }}'
+            $w  = '${{ inputs.w7 }}'
             $wb = '${{ inputs.w7beta }}'
             $wd = '${{ inputs.w7dev }}'
             $feed = '${{ inputs.deploy_feed }}'
           } else {
-            # tag 触发：v10.1.4 → stable=10.1.4，其余通道沿用仓库里的默认值
+            # tag 触发：v10.1.14 → stable 用 tag 里的号，其余通道照常自动推导
             $tag = '${{ github.ref_name }}'
-            $s = $tag -replace '^v', ''
-            $b = '10.2.2'
-            $d = '10.3.1'
-            $w = '7.1.4'
-            $wb = '7.2.1'
-            $wd = '7.3.1'
+            $s  = $tag -replace '^v', ''
+            $b  = ''
+            $d  = ''
+            $w  = ''
+            $wb = ''
+            $wd = ''
             $feed = 'true'
           }
+
+          $s  = Next-Version $s  'latest.json'         'stable'
+          $b  = Next-Version $b  'latest-beta.json'    'beta'
+          $d  = Next-Version $d  'latest-dev.json'     'dev'
+          $w  = Next-Version $w  'latest-w7.json'      'w7'
+          $wb = Next-Version $wb 'latest-w7-beta.json' 'w7beta'
+          $wd = Next-Version $wd 'latest-w7-dev.json'  'w7dev'
+
+          # 防倒退：无论版本号是推导的还是手填的，都必须**严格大于**线上当前值。
+          # 手填旧号（例如照抄了过期的示例）会让 feed 版本倒退，而客户端把
+          # 「云端 < 当前」判定成降级回滚 —— 比发不出去严重得多，所以这里硬挡。
+          # 线上取不到时不挡（Next-Version 已经在推导路径上抛过了；手填路径
+          # 不该因为网络抖动而失败）。
+          function Assert-Forward([string]$next, [string]$feedFile, [string]$label) {
+            try {
+              $j = Invoke-RestMethod "$base/$feedFile" -TimeoutSec 30
+              $cur = [string]$j.version
+            } catch {
+              Write-Host "  . $label：线上版本读不到，跳过防倒退校验"
+              return
+            }
+            if (-not $cur) { return }
+            $a = $next.Split('.') | ForEach-Object { [int]$_ }
+            $b = $cur.Split('.')  | ForEach-Object { [int]$_ }
+            $cmp = 0
+            for ($i = 0; $i -lt 3; $i++) {
+              if ($a[$i] -ne $b[$i]) { $cmp = $a[$i] - $b[$i]; break }
+            }
+            if ($cmp -le 0) {
+              throw "$label 版本号 $next 未高于线上 $cur（$feedFile）—— 版本倒退会让客户端判定成降级回滚。请填更高的版本号。"
+            }
+            Write-Host "  $label：$cur → $next（前进 $cmp）"
+          }
+
+          Assert-Forward $s  'latest.json'         'stable'
+          Assert-Forward $b  'latest-beta.json'    'beta'
+          Assert-Forward $d  'latest-dev.json'     'dev'
+          Assert-Forward $w  'latest-w7.json'      'w7'
+          Assert-Forward $wb 'latest-w7-beta.json' 'w7beta'
+          Assert-Forward $wd 'latest-w7-dev.json'  'w7dev'
+
           "stable=$s" >> $env:GITHUB_OUTPUT
           "beta=$b" >> $env:GITHUB_OUTPUT
           "dev=$d" >> $env:GITHUB_OUTPUT
