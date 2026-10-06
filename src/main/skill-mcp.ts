@@ -328,23 +328,33 @@ export function buildMcpPatchYaml(servers: McpServer[]): string {
     return { id: s.id || 'mcp-' + s.serverName, name: '@deepseek-ai/dsh-mcp-client', config };
   });
 
-  const lines: string[] = ['insert:'];
+  // 补丁顶层是一个 YAML 列表：每个条目顶格以 `- ` 开头（与 desktop-patch.yml
+  // 里已有的 `- insert:` 块保持同一缩进风格）。
+  // 层级：
+  //   `- insert:`               —— 顶格（0 空格）
+  //   `    - id: xxx`           —— 4 空格（insert 的值是一个列表）
+  //   `      name: xxx`         —— 6 空格（与 id 同级，- 后对齐）
+  //   `      config:`           —— 6 空格
+  //   `        key: value`      —— 8 空格（config 的子键）
+  //   `          - item`        —— 10 空格（config 里的数组项）
+  //   `          nested: val`   —— 10 空格（config 里的嵌套对象键）
+  const lines: string[] = ['- insert:'];
   for (const e of entries) {
-    lines.push('  - id: ' + yamlScalar(e.id));
-    lines.push('    name: ' + yamlScalar(e.name));
-    lines.push('    config:');
+    lines.push('    - id: ' + yamlScalar(e.id));
+    lines.push('      name: ' + yamlScalar(e.name));
+    lines.push('      config:');
     const c = e.config as Record<string, unknown>;
     for (const [key, value] of Object.entries(c)) {
       if (Array.isArray(value)) {
-        lines.push('      ' + key + ':');
-        for (const item of value) lines.push('        - ' + yamlScalar(String(item)));
+        lines.push('        ' + key + ':');
+        for (const item of value) lines.push('          - ' + yamlScalar(String(item)));
       } else if (value !== null && typeof value === 'object') {
-        lines.push('      ' + key + ':');
+        lines.push('        ' + key + ':');
         for (const [k2, v2] of Object.entries(value as Record<string, unknown>)) {
-          lines.push('        ' + k2 + ': ' + yamlScalar(String(v2)));
+          lines.push('          ' + k2 + ': ' + yamlScalar(String(v2)));
         }
       } else {
-        lines.push('      ' + key + ': ' + yamlScalar(value as string | number | boolean));
+        lines.push('        ' + key + ': ' + yamlScalar(value as string | number | boolean));
       }
     }
   }
