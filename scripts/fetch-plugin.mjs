@@ -96,12 +96,36 @@ if (sp.version !== target) die('解压出的版本是 ' + sp.version + '，与�
 const deps = Object.keys(sp.dependencies || {});
 if (deps.length > 0) {
   log('装依赖：' + deps.join('、'));
-  // Windows 上 node 不能直接 spawn 'npm'（那是个 .cmd 脚本）；
-  // 用 npm.cmd 并**不要** shell:true —— 后者会触发 DEP0190 且参数不转义。
-  const npmCmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  // 不 spawn npm / npm.cmd，而是用**当前 Node 进程直接跑 npm 的 JS 入口**。
+  //
+  // 为什么：Node.js 18.20.2 / 20.12.2 / 22.0.0（CVE-2024-27980 修复）起，
+  // Windows 上不带 shell:true 直接 spawn .cmd/.bat 文件会被直接拒绝（EINVAL，
+  // spawnSync 返回 status=null、进程根本没启动）。GitHub Actions 的 setup-node
+  // 装的是带修复的版本，实测 dshmarket 拉依赖时 1ms 就「npm install 失败 exit=null」。
+  //
+  // 两个备选方案都不如这个干净：
+  //   · shell:true + npm.cmd —— 参数经 cmd.exe 解释，要自己处理引号/转义，容易注入
+  //   * 直接 node npm-cli.js  —— 完全绕过 .cmd 层，参数按 argv 原样传递，跨平台一致
+  // npm-cli.js 的位置随平台/安装方式不同：
+  //   Windows 官方安装包 / setup-node：<nodeDir>\node_modules\npm\bin\npm-cli.js
+  //   Linux/Mac 官方安装包 / fnm / nvm：<prefix>/lib/node_modules/npm/bin/npm-cli.js
+  //   （node 在 <prefix>/bin/node，所以从 bin/ 上一级找 lib/）
+  const nodeDir = path.dirname(process.execPath);
+  const npmCliCandidates =
+    process.platform === 'win32'
+      ? [path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')]
+      : [
+          path.join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+          path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+        ];
+  const npmCli = npmCliCandidates.find((p) => fs.existsSync(p));
+  if (!npmCli) {
+    die('找不到 npm-cli.js（候选：' + npmCliCandidates.join('、') + '），无法安装插件依赖');
+  }
   const r2 = spawnSync(
-    npmCmd,
+    process.execPath,
     [
+      npmCli,
       'install',
       '--omit=dev',
       '--no-audit',
