@@ -930,10 +930,21 @@ export class Updater {
     if (all.length === 0) return null;
 
     const installed = app.getVersion();
-    const usable = all.filter((h) => !h.baseVersion || compareVersions(installed, h.baseVersion) >= 0);
+    const currentShell = shellVersion();
+    // 两道过滤：
+    // 1. baseVersion 基线检查 —— 针对**安装包版本**（热更包是 out/ 完整副本，只关心基座 Electron 够不够新）
+    // 2. 版本去重 —— 针对**当前实际壳版本**（热壳优先）：热更包版本与当前壳版本相等时，
+    //    说明已经热更到这版了，不该再算「可用更新」。否则用户热更完一关检查更新，
+    //    还是会被「发现新版本」横幅拦住（实测：已热更到 1.2.0 仍反复提示 1.2.0 可更新）。
+    //    注意：只排「相等」，比它高的（升级）和比它低的（从 beta/dev 切回 stable 回滚）都保留。
+    const usable = all.filter(
+      (h) =>
+        (!h.baseVersion || compareVersions(installed, h.baseVersion) >= 0) &&
+        compareVersions(h.version, currentShell) !== 0,
+    );
     if (usable.length === 0) {
       const floors = all.map((h) => `${h.version}(需≥${h.baseVersion})`).join('、');
-      log(`热更新包都不适用当前安装版 ${installed}：${floors} → 改用完整安装包`);
+      log(`热更新包都不适用当前安装版 ${installed}（当前壳 ${currentShell}）：${floors} → 改用完整安装包`);
       return null;
     }
 
