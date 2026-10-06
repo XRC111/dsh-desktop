@@ -299,8 +299,18 @@ if (missingDeps.length) {
   }
   missingDeps = verifyDependencyClosure(nmDir, ['@deepseek-ai/dsh', '@deepseek-ai/dsh-app-boot']);
 }
+// 已知在 Windows 上不可用的原生 addon：官方只发 darwin/linux 平台包，
+// pnpm install 在 win32 上自然跳过（package.json 里有 os 字段）。
+// dsh 运行时会在运行时检测平台并 fallback，缺这些包不影响 Windows 构建。
+// 之前脚本看到缺失就 npm install 补齐，但这些是 workspace 内部包，
+// dependencies 用了 workspace:~ 协议，npm 不认识 → EUNSUPPORTEDPROTOCOL → die。
+const KNOWN_PLATFORM_SPECIFIC = new Set(['@deepseek-ai/node-addon-system']);
+const trulyMissing = missingDeps.filter((d) => !KNOWN_PLATFORM_SPECIFIC.has(d));
+if (trulyMissing.length) {
+  die('运行时依赖闭包不完整（共 ' + trulyMissing.length + ' 个缺失）：\n  ' + trulyMissing.slice(0, 20).join('\n  '));
+}
 if (missingDeps.length) {
-  die('运行时依赖闭包不完整（共 ' + missingDeps.length + ' 个缺失）：\n  ' + missingDeps.slice(0, 20).join('\n  '));
+  log('  注意：以下原生 addon 在 Windows 上无预编译产物（运行时自动 fallback）：' + missingDeps.join(', '));
 }
 log('  自检通过：依赖闭包完整');
 
