@@ -79,6 +79,23 @@ export const COMMON_METHODS = [
 ];
 
 /**
+ * 「经中转调用」的方法名。
+ *
+ * 谁**同时**连着两台设备，谁就提供它 —— 通常是 star 拓扑里的 hub（桌面）：
+ * 两台手机都连到桌面但彼此连不上，于是一台要去另一台的方法，就让桌面代转。
+ *
+ * 只做**一跳**：不转发 `relay.*` 本身（见 mesh-manager 的 relayCall），
+ * 否则 A→B→C→… 的链条会让延迟和故障排查都失控。
+ *
+ * ⚠️ 名字不能叫 RELAY_METHOD：llmrelay.js 已经导出了同名常量（值 'llm.relay'，
+ *    是**完全不同的东西** —— 远程凭据转发）。两者在同一文件里 import 时后者会
+ *    静默覆盖前者，于是 `conn.handle(RELAY_METHOD, ...)` 变成注册 'llm.relay'，
+ *    把流式转发的处理器顶掉，而真正要注册的 relay.call 从未出现。
+ *    实测踩过，所以这里用 TRANSIT_METHOD 明确区分。
+ */
+export const TRANSIT_METHOD = 'relay.call';
+
+/**
  * 生成一个短配对码（6 位数字）。
  *
  * 用 crypto 的随机源，不用 Math.random —— 这个码是这条链路唯一的门禁，

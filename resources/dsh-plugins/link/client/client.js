@@ -66,6 +66,22 @@ window.__ModuleLoader__.load({
       step1: '在桌面点「启动服务」，拿到配对码',
       step2: '在手机上说 link_connect，填地址、端口与配对码',
       step3: '连上后桌面就能用 phone_* 工具操作手机',
+      // ── 多设备（mesh）────────────────────────────────────────────────
+      devices: '多设备',
+      devicesHint: '本机的稳定身份，以及所有配对过的设备。多台同时在线时，phone_* 工具用 device 参数指定操作哪一台。',
+      selfId: '本机 ID',
+      pairedCount: '已配对',
+      onlineCount: '在线',
+      online: '在线',
+      offline: '离线',
+      topology: '连接拓扑',
+      topoStar: '星型',
+      topoMesh: '全互联',
+      topoStarHint: '本机作 hub 接收各设备接入；设备之间不直连。没有 overlay 虚拟网卡时这是唯一可行的方式。',
+      topoMeshHint: '每台设备都会主动连已知设备，任意两台可直接互连（需要 overlay 虚拟网卡，如 Tailscale / EasyTier）。',
+      switchToMesh: '改为全互联',
+      switchToStar: '改为星型',
+      topologySaved: '拓扑已切换，重启后仍生效。',
     };
     var EN = {
       nav: 'Remote link',
@@ -94,6 +110,22 @@ window.__ModuleLoader__.load({
       step1: 'Press "Start service" here to get a pairing code',
       step2: 'On the phone run link_connect with the address, port and code',
       step3: 'The desktop can then drive the phone via phone_* tools',
+      // ── Multi-device (mesh) ──────────────────────────────────────────
+      devices: 'Devices',
+      devicesHint: 'This machine\'s stable identity and every device it has paired with. When several are online, pass device to phone_* to pick one.',
+      selfId: 'Local ID',
+      pairedCount: 'Paired',
+      onlineCount: 'Online',
+      online: 'online',
+      offline: 'offline',
+      topology: 'Topology',
+      topoStar: 'Star',
+      topoMesh: 'Full mesh',
+      topoStarHint: 'This machine acts as the hub; devices dial in and cannot reach each other directly. The only workable mode without an overlay network.',
+      topoMeshHint: 'Every device dials the others, so any two can connect directly (needs an overlay network such as Tailscale or EasyTier).',
+      switchToMesh: 'Switch to full mesh',
+      switchToStar: 'Switch to star',
+      topologySaved: 'Topology switched; it persists across restarts.',
     };
 
     exports.name = 'dsh-desktop-link';
@@ -356,6 +388,92 @@ window.__ModuleLoader__.load({
           : h('p', { style: hintStyle }, t('none')),
         h('p', { style: hintStyle }, t('encryptedHint')),
       ));
+
+      // ── 多设备（mesh）────────────────────────────────────────────────────
+      //
+      // 只在后端给出 mesh 段时显示：插件版本较旧或身份初始化失败时没有这一段，
+      // 显示一排空值只会让人以为坏了。
+      var mesh = snap.mesh;
+      if (mesh) {
+        var devNodes = [];
+
+        // 拓扑：一个开关 + 一句「这个模式意味着什么」。
+        var isMesh = mesh.topology === 'mesh';
+        devNodes.push(h('div', { key: 'topo', style: { marginBottom: '10px' } }, [
+          h('div', { key: 'r', style: rowStyle }, [
+            h('span', { key: 'l', style: labelStyle }, t('topology')),
+            h('span', { key: 'v' }, isMesh ? t('topoMesh') : t('topoStar')),
+            h('span', { key: 'sp', style: { flex: 1 } }),
+            h(Btn, {
+              key: 'b',
+              variant: 'outline',
+              disabled: st.busy === 'topo',
+              onClick: function () {
+                setSt(function (s) { return Object.assign({}, s, { busy: 'topo', error: '' }); });
+                fetch(API + '/topology', {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ topology: isMesh ? 'star' : 'mesh' }),
+                }).then(function (res) {
+                  return res.json().catch(function () { return null; });
+                }).then(function (body) {
+                  if (!body || body.ok !== true) {
+                    throw new Error((body && body.error) || 'HTTP');
+                  }
+                  setSt(function (s) { return Object.assign({}, s, { busy: '' }); });
+                  load();
+                }).catch(function (err) {
+                  setSt(function (s) {
+                    return Object.assign({}, s, { busy: '', error: t('failed') + '：' + String(err && err.message || err) });
+                  });
+                });
+              },
+            }, isMesh ? t('switchToStar') : t('switchToMesh')),
+          ]),
+          h('p', { key: 'h', style: hintStyle }, isMesh ? t('topoMeshHint') : t('topoStarHint')),
+        ]));
+
+        // 本机身份
+        devNodes.push(h(Row, { key: 'self', label: t('selfId'), mono: true }, mesh.deviceId || '—'));
+        devNodes.push(h(Row, { key: 'cnt', label: t('pairedCount') },
+          String(mesh.paired || 0) + ' · ' + t('onlineCount') + ' ' + String((mesh.online || []).length)));
+
+        // 设备清单：在线的排前面（用户最关心「现在能操作谁」）。
+        var list = (snap.devices && snap.devices.length)
+          ? snap.devices
+          : (mesh.online || []).map(function (o) {
+            return { deviceId: o.deviceId, name: o.name, kind: o.kind, online: true };
+          });
+        if (list.length) {
+          var sorted = list.slice().sort(function (a, b) {
+            if (!!a.online !== !!b.online) return a.online ? -1 : 1;
+            return String(a.name || '').localeCompare(String(b.name || ''));
+          });
+          devNodes.push(h('div', { key: 'list', style: { marginTop: '8px' } },
+            sorted.map(function (d, i) {
+              return h('div', { key: String(d.deviceId) + i, style: { margin: '6px 0' } }, [
+                h('div', { key: 'v', style: { display: 'flex', alignItems: 'baseline', gap: '8px' } }, [
+                  h('span', { key: 'n' }, d.name || d.deviceId),
+                  h('span', { key: 's', style: { fontSize: '11px', opacity: 0.75 } },
+                    d.online ? '● ' + t('online') : '○ ' + t('offline')),
+                  h('span', { key: 'sp', style: { flex: 1 } }),
+                  h(CopyButton, { key: 'c', text: String(d.deviceId), t: t }),
+                ]),
+                h('div', { key: 'id', style: { fontSize: '11.5px', opacity: 0.6, marginLeft: '2px', fontFamily: 'ui-monospace, monospace' } },
+                  String(d.deviceId) + (d.kind ? ' · ' + d.kind : '')),
+              ]);
+            })
+          ));
+        } else {
+          devNodes.push(h('p', { key: 'empty', style: hintStyle }, t('none')));
+        }
+
+        nodes.push(h('div', { key: 'devices', style: cardStyle },
+          h('div', { style: titleStyle }, t('devices')),
+          h('p', { style: hintStyle }, t('devicesHint')),
+          devNodes,
+        ));
+      }
 
       // ── 步骤 ────────────────────────────────────────────────────────────
       nodes.push(h('div', { key: 'steps', style: cardStyle },

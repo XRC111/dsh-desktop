@@ -90,6 +90,9 @@ export function registerRoutes(ctx, spec) {
         ['/connect', 'POST', spec.connect],
         // 远程凭据转发的开关（仅手机侧提供）。
         ['/llm-relay', 'POST', spec.llmRelay],
+        // mesh：已配对设备清单与拓扑切换（仅手机侧提供）。
+        ['/devices', 'GET', spec.devices],
+        ['/topology', 'POST', spec.topology],
     ];
     for (const [suffix, method, fn] of routes) {
         if (typeof fn !== 'function') continue;
