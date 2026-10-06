@@ -1,0 +1,144 @@
+# 编译内嵌 EasyTier 的 Windows 动态库（libeasytier_ffi.dll）。
+#
+# ── 这条流水线为什么存在 ───────────────────────────────────────────────────
+# 桌面端要内嵌组网引擎，让手机与桌面在异地网络下直连。与手机侧对称：
+# 官方没有预编译的 Windows FFI 库，得自己编。
+#
+# 手机侧走 libeasytier_android_jni.so（dsh-mobile 的 easytier-jni 流水线），
+# 这条只出 libeasytier_ffi.dll —— 桌面端用 koffi 直接调 C ABI，
+# 不需要 JNI 那层。
+#
+# ── 为什么是 windows 而不是交叉编译 ─────────────────────────────────────────
+# ① easytier-ffi 的 build-dependencies 里有 thunk-rs features=["win7"]，
+#    build.rs 里就是为 Windows 做 thunk 设置的，官方明确支持；
+# ② dsh-desktop 主线要打 w7 线（社区 fork 的 Electron + 指纹补丁），
+#    与 EasyTier 的 win7 thunk 正好对上；
+# ③ 交叉编译 Rust 到 Windows 还要额外的 linker 与 MSVC 库，
+#    在 windows runner 上直接编反而更简单可靠。
+#
+# ── 依赖 koffi ──────────────────────────────────────────────────────────────
+# 桌面运行时树里已有 @koromix/koffi 3.3.1（多个间接依赖拉进来的）。
+# 它的 win32-x64 预编译件在 resources/dsh-runtime/node_modules/@koromix/
+# koffi-win32-x64/win32_x64/koffi.node —— 调 .dll 不需要写 N-API 胶水。
+# 间接依赖不够稳：将来上游不再拉它就静默断掉。真要用建议显式声明。
+#
+# ── 产物 ───────────────────────────────────────────────────────────────────
+# libeasytier_ffi.dll 作为 Actions artifact 归档，人工确认后放进
+# resources/dsh-runtime/。刻意不自动入库：二进制会让仓库膨胀。
+#
+# ── 触发 ────────────────────────────────────────────────────────────────────
+# 手动；改 EasyTier 版本时手动跑。刻意不设定时。
+name: easytier-ffi-win
+
+on:
+  workflow_dispatch:
+    inputs:
+      easytier_ref:
+        description: 'EasyTier 版本或提交（留空 = 用下方 pin）'
+        required: false
+        default: ''
+
+concurrency:
+  group: easytier-ffi-win
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+env:
+  # 与 dsh-mobile 的 easytier-jni 保持同一个版本，两端行为才一致。
+  EASYTIER_REF: ${{ inputs.easytier_ref || 'v2.6.4' }}
+
+jobs:
+  build-dll:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: 拉本仓库
+        uses: actions/checkout@v4
+
+      - name: 装 Rust
+        shell: pwsh
+        run: |
+          # MSVC 工具链：编译 cdylib 需要 link.exe。windows runner 自带
+          # Visual Studio Build Tools，通过 vcvars 才能找到。
+          choco install --no-progress -y rustup.install
+          rustup default stable-x86_64-pc-windows-msvc
+          rustup toolchain install 1.95 --profile minimal
+          rustup default 1.95-x86_64-pc-windows-msvc
+          rustc --version
+
+      - name: 拉 EasyTier 源码
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          $ref = $env:EASYTIER_REF
+          git clone --depth 1 --branch $ref `
+            https://github.com/EasyTier/EasyTier.git easytier-src
+          # 刻意**不用** sparse 检出：cargo 解析 workspace 会顺着 members 与
+          # path 依赖去找一串目录（easytier-rpc-build、easytier-gui/src-tauri…），
+          # 漏一个就是一条「failed to read <path>/Cargo.toml: No such file」。
+          # 手机侧已经为这个踩了两次，桌面侧不重复踩。
+          git -C easytier-src rev-parse HEAD | Tee-Object -FilePath easytier-src\easytier-commit.txt
+
+      - name: 预检 workspace 能解析
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location easytier-src
+          cargo metadata --format-version 1 --no-deps | Out-Null
+          Pop-Location
+          Write-Host '✓ workspace manifest 可解析'
+
+      - name: 编译 easytier-ffi（cdylib）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location easytier-src\easytier-contrib\easytier-ffi
+          cargo build --release
+          Pop-Location
+          $dll = 'easytier-src\target\release\easytier_ffi.dll'
+          if (-not (Test-Path $dll)) { throw "缺少产物: $dll" }
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item $dll out\
+          Copy-Item easytier-src\easytier-commit.txt out\
+          @{
+            easytier_ref = $env:EASYTIER_REF
+            rust_target = 'x86_64-pc-windows-msvc'
+            abi = 'C ABI（koffi 直接调）'
+          } | ConvertTo-Json | Set-Content out\BUILD-INFO.txt -Encoding UTF8
+          Get-ChildItem out | Format-Table Name, Length
+
+      - name: 校验导出符号
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 缺符号时 koffi 在**运行时**才会报 load 失败，那时用户已经装上应用了。
+          # 在 CI 里用 dumpbin 拦住。
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $dll = (Resolve-Path 'out\easytier_ffi.dll').Path
+          $out = cmd /c "`"$vcvars`" >nul 2>&1 && dumpbin /exports `"$dll`""
+          $out | Select-String -Pattern 'parse_config|run_network_instance|collect_network_infos|free_string|get_error_msg'
+          if ($LASTEXITCODE -ne 0) { throw "dumpbin 失败" }
+          $need = @('parse_config','run_network_instance','collect_network_infos')
+          foreach ($n in $need) {
+            if ($out -notmatch $n) { throw "缺少导出符号: $n" }
+          }
+          Write-Host "✓ 关键导出符号齐全"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: easytier-ffi-win-${{ inputs.easytier_ref || 'v2.6.4' }}
+          path: out/
+          retention-days: 90
