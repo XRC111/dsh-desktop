@@ -122,6 +122,13 @@ if (deps.length > 0) {
   if (!npmCli) {
     die('找不到 npm-cli.js（候选：' + npmCliCandidates.join('、') + '），无法安装插件依赖');
   }
+  // 用独立的临时 npm 缓存目录：CI runner 的共享缓存（C:\npm\cache）可能损坏，
+  // 导致 npm arborist 在依赖解析时崩溃：
+  //   npm error Cannot read properties of null (reading 'edgesOut')
+  // 每次 fresh staging + fresh cache，完全排除缓存污染。
+  const tmpCache = path.join(root, 'build', '.npmcache-' + name);
+  fs.rmSync(tmpCache, { recursive: true, force: true });
+  fs.mkdirSync(tmpCache, { recursive: true });
   const r2 = spawnSync(
     process.execPath,
     [
@@ -136,10 +143,14 @@ if (deps.length > 0) {
       // 但**不含** tsconfig.json 之类的构建配置 —— 不忽略脚本就会在
       // 「npm run build → tsc -p tsconfig.json」上直接失败（实测 exit=1）。
       '--ignore-scripts',
+      // 临时目录不需要 lockfile，也避免 npm 尝试写 package-lock.json
+      '--package-lock=false',
+      '--cache=' + tmpCache,
       '--registry=' + registry,
     ],
     { cwd: staging, stdio: 'inherit', env: { ...process.env, NODE_OPTIONS: '' } },
   );
+  fs.rmSync(tmpCache, { recursive: true, force: true });
   if (r2.status !== 0) die('npm install 失败（exit=' + r2.status + '），原目录未改动');
 }
 
