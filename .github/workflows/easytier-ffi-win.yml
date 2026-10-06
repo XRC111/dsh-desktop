@@ -73,6 +73,24 @@ jobs:
           rustup default 1.95-x86_64-pc-windows-msvc
           rustc --version
 
+      # ⚠️ protoc 必须装 —— EasyTier 的依赖 prost-wkt-types 在 build.rs 里
+      #    调 protoc 生成代码，缺了会 panic：
+      #      Could not find `protoc` ... try setting the `PROTOC` environment variable
+      #    windows runner **也不自带** protoc（手机侧已实测撞到）。
+      - name: 装 protoc
+        shell: pwsh
+        run: |
+          choco install --no-progress -y protoc
+          # choco 的 shim 目录不一定在本次会话的 PATH 里，显式补进 GITHUB_PATH。
+          $protocDir = (Get-Command protoc -ErrorAction SilentlyContinue).Source
+          if (-not $protocDir) {
+            $protocDir = Get-ChildItem 'C:\ProgramData\chocolatey\bin\protoc.exe' -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $protocDir) { throw 'protoc 安装后仍找不到' }
+          Split-Path $protocDir -Parent | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          Write-Host "protoc: $protocDir"
+
       - name: 拉 EasyTier 源码
         shell: pwsh
         run: |
