@@ -92,66 +92,86 @@ if (!fs.existsSync(pkgPath)) die('解压后没有 package.json');
 const sp = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
 if (sp.version !== target) die('解压出的版本是 ' + sp.version + '，与期望的 ' + target + ' 不符');
 
-// ── 3) 装运行时依赖（插件把自己的依赖放在自己的 node_modules 里随包走）────
+// ── 3) 装运行时依赖 ────────────────────────────────────────────────────────
+//
+// 为什么不用 npm CLI：
+//   1. CVE-2024-27980 修复后 Node 22 禁止不带 shell:true spawn npm.cmd（EINVAL）
+//   2. 绕开 .cmd 改 node npm-cli.js 后，npm v10 在 CI Windows runner 上又报
+//      `Cannot read properties of null (reading 'edgesOut')` —— arborist 内部崩溃，
+//      换独立缓存目录也没用，是 npm 在全新临时目录 + --no-save 下的已知 bug。
+//
+// 插件依赖通常极少（dshmarket 只有 js-yaml + undici，都是纯 JS 包），
+// 直接写个迷你安装器：查 registry → 下 tarball → tar 解压 → 递归装传递依赖。
+// 完全不依赖 npm CLI，零版本兼容问题。
+
+/** 解析 semver range 为具体版本号（只支持 ^ ~ >= x 等常见 range，足够插件用） */
+function pickVersion(versions, range) {
+  const all = Object.keys(versions).sort((a, b) => {
+    const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+    for (let i = 0; i < 3; i++) { if ((pa[i]||0) !== (pb[i]||0)) return (pb[i]||0) - (pa[i]||0); }
+    return 0;
+  });
+  if (!range || range === 'latest' || range === '*') return all[0];
+  const m = range.match(/^[\^~]?(\d+)\.(\d+)\.(\d+)/);
+  if (!m) return all[0];
+  const [, maj, min] = m.map(Number);
+  const caret = range.startsWith('^');
+  const tilde = range.startsWith('~');
+  // ^：同 major；~：同 major.minor；裸：精确
+  return all.find((v) => {
+    const [vmaj, vmin] = v.split('.').map(Number);
+    if (caret) return vmaj === maj;
+    if (tilde) return vmaj === maj && vmin === min;
+    return v === range.replace(/^[\^~]/, '');
+  }) || all[0];
+}
+
+const installed = new Map(); // name -> version（去重）
+async function installPkg(pkgName, range, depth = 0) {
+  if (depth > 4) return;
+  const key = pkgName + '@' + range;
+  if (installed.has(key)) return;
+  installed.set(key, true);
+
+  const metaRes = await fetch(registry + '/' + pkgName.replace('/', '%2f'), { headers: { accept: 'application/json' } });
+  if (!metaRes.ok) die('查不到包 ' + pkgName + '（HTTP ' + metaRes.status + '）');
+  const meta = await metaRes.json();
+  const ver = pickVersion(meta.versions, range);
+  const pkg = meta.versions[ver];
+  if (!pkg) die('包 ' + pkgName + '@' + ver + ' 不存在');
+
+  // 下载 tarball
+  const tgzRes = await fetch(pkg.dist.tarball);
+  if (!tgzRes.ok) die('下载 ' + pkgName + '@' + ver + ' tarball 失败：HTTP ' + tgzRes.status);
+  const tgzBuf = Buffer.from(await tgzRes.arrayBuffer());
+
+  // 解压到 node_modules/<pkgName>/（npm tarball 包一层 package/ 前缀）
+  const dest = path.join(staging, 'node_modules', ...pkgName.split('/'));
+  fs.rmSync(dest, { recursive: true, force: true });
+  fs.mkdirSync(dest, { recursive: true });
+  const tmpTgz = path.join(root, 'build', '.' + pkgName.replace('/', '_') + '-' + ver + '.tgz');
+  fs.writeFileSync(tmpTgz, tgzBuf);
+  const tarExe = process.platform === 'win32'
+    ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
+    : 'tar';
+  const r = spawnSync(tarExe, ['-xzf', tmpTgz, '-C', dest, '--strip-components=1'], { stdio: 'inherit' });
+  fs.rmSync(tmpTgz, { force: true });
+  if (r.status !== 0) die('解压 ' + pkgName + '@' + ver + ' 失败');
+
+  // 递归装生产依赖
+  const subdeps = pkg.dependencies || {};
+  for (const [dn, dr] of Object.entries(subdeps)) {
+    await installPkg(dn, dr, depth + 1);
+  }
+  log('  ✓ ' + pkgName + '@' + ver + (depth > 0 ? '（传递依赖）' : ''));
+}
+
 const deps = Object.keys(sp.dependencies || {});
 if (deps.length > 0) {
-  log('装依赖：' + deps.join('、'));
-  // 不 spawn npm / npm.cmd，而是用**当前 Node 进程直接跑 npm 的 JS 入口**。
-  //
-  // 为什么：Node.js 18.20.2 / 20.12.2 / 22.0.0（CVE-2024-27980 修复）起，
-  // Windows 上不带 shell:true 直接 spawn .cmd/.bat 文件会被直接拒绝（EINVAL，
-  // spawnSync 返回 status=null、进程根本没启动）。GitHub Actions 的 setup-node
-  // 装的是带修复的版本，实测 dshmarket 拉依赖时 1ms 就「npm install 失败 exit=null」。
-  //
-  // 两个备选方案都不如这个干净：
-  //   · shell:true + npm.cmd —— 参数经 cmd.exe 解释，要自己处理引号/转义，容易注入
-  //   * 直接 node npm-cli.js  —— 完全绕过 .cmd 层，参数按 argv 原样传递，跨平台一致
-  // npm-cli.js 的位置随平台/安装方式不同：
-  //   Windows 官方安装包 / setup-node：<nodeDir>\node_modules\npm\bin\npm-cli.js
-  //   Linux/Mac 官方安装包 / fnm / nvm：<prefix>/lib/node_modules/npm/bin/npm-cli.js
-  //   （node 在 <prefix>/bin/node，所以从 bin/ 上一级找 lib/）
-  const nodeDir = path.dirname(process.execPath);
-  const npmCliCandidates =
-    process.platform === 'win32'
-      ? [path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js')]
-      : [
-          path.join(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-          path.join(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-        ];
-  const npmCli = npmCliCandidates.find((p) => fs.existsSync(p));
-  if (!npmCli) {
-    die('找不到 npm-cli.js（候选：' + npmCliCandidates.join('、') + '），无法安装插件依赖');
+  log('装依赖：' + deps.join('、') + '（迷你安装器，不经过 npm CLI）');
+  for (const [dn, dr] of Object.entries(sp.dependencies || {})) {
+    await installPkg(dn, dr);
   }
-  // 用独立的临时 npm 缓存目录：CI runner 的共享缓存（C:\npm\cache）可能损坏，
-  // 导致 npm arborist 在依赖解析时崩溃：
-  //   npm error Cannot read properties of null (reading 'edgesOut')
-  // 每次 fresh staging + fresh cache，完全排除缓存污染。
-  const tmpCache = path.join(root, 'build', '.npmcache-' + name);
-  fs.rmSync(tmpCache, { recursive: true, force: true });
-  fs.mkdirSync(tmpCache, { recursive: true });
-  const r2 = spawnSync(
-    process.execPath,
-    [
-      npmCli,
-      'install',
-      '--omit=dev',
-      '--no-audit',
-      '--no-fund',
-      '--no-save',
-      // 必须 --ignore-scripts：npm 包的 prepare/prepublish 是给源码仓库用的，
-      // 发布出来的 tarball 已经带编译产物（client/client.js、lib/*.js），
-      // 但**不含** tsconfig.json 之类的构建配置 —— 不忽略脚本就会在
-      // 「npm run build → tsc -p tsconfig.json」上直接失败（实测 exit=1）。
-      '--ignore-scripts',
-      // 临时目录不需要 lockfile，也避免 npm 尝试写 package-lock.json
-      '--package-lock=false',
-      '--cache=' + tmpCache,
-      '--registry=' + registry,
-    ],
-    { cwd: staging, stdio: 'inherit', env: { ...process.env, NODE_OPTIONS: '' } },
-  );
-  fs.rmSync(tmpCache, { recursive: true, force: true });
-  if (r2.status !== 0) die('npm install 失败（exit=' + r2.status + '），原目录未改动');
 }
 
 // ── 4) 校验：入口与依赖都得在 ──────────────────────────────────────────────
