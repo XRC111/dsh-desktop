@@ -28,7 +28,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { TOPOLOGY } from './mesh-identity.js';
 import { startLinkServer, connectToHost } from './endpoint.js';
-import { makePairingCode, TRANSIT_METHOD } from './protocol.js';
+import { makePairingCode, TRANSIT_METHOD, TRANSIT_STREAM_METHOD } from './protocol.js';
 
 /**
  * 决定「谁拨号」的仲裁：只有 deviceId 字典序小的那个主动拨大的。
@@ -269,21 +269,39 @@ export class LinkManager {
     attachRelay(conn) {
         if (conn && typeof conn.handle === 'function') {
             conn.handle(TRANSIT_METHOD, (args) => this.relayCall(args));
+            // 流式中转：只注册**有** handleStream 的连接。早期的连接对象没有这个
+            // 方法，硬调会变成 "conn.handleStream is not a function"，
+            // 而那会让整条 attachRelay 抛出去、把非流式中转也一起搭进去。
+            if (typeof conn.handleStream === 'function') {
+                conn.handleStream(
+                    TRANSIT_STREAM_METHOD,
+                    (args, emit, meta) => this.relayStreamCall(args, emit, meta),
+                );
+            }
         }
         return conn;
     }
 
     /**
-     * 本端对外宣告的能力，**保证含 relay.call**。
+     * 本端对外宣告的能力，**保证含 relay.call 与 relay.stream**。
      *
      * 中转是管理器自带的能力，所以宣告也由它保证 —— 调用方传进来的 capabilities
      * 只补业务方法，不必（也不该）操心这个。
+     *
+     * ⚠️ 两个中转方法都必须宣告：调用方是按 peerMethods 找中转方的
+     *    （见手机侧 invokeWithRelay / relayViaAnyPeer）。只宣告 relay.call
+     *    而漏了 relay.stream，就会「非流式中转可用、流式中转找不到中转方」——
+     *    而模型转发正是流式的，表现又是那种「别的都能用就它不行」的怪现象。
      *
      * @returns {string[]} 能力清单。
      */
     advertisedMethods() {
         const base = this.capabilities ?? [];
-        return base.includes(TRANSIT_METHOD) ? [...base] : [...base, TRANSIT_METHOD];
+        const out = [...base];
+        for (const m of [TRANSIT_METHOD, TRANSIT_STREAM_METHOD]) {
+            if (!out.includes(m)) out.push(m);
+        }
+        return out;
     }
 
     // ── 监听 / 拨号 ─────────────────────────────────────────────────────────
@@ -558,22 +576,16 @@ export class LinkManager {
     }
 
     /**
-     * 中转：把一次方法调用转发到「我连着、但调用方连不上」的那台设备。
+     * 中转前的安全校验（四道），call 与 stream 共用。
      *
-     * 这是 star 拓扑里两台设备互通的唯一途径 —— 它们都连着本机（hub），
-     * 但彼此没有直连路径。
+     * ⚠️ 刻意抽成独立方法：校验一旦写两遍，迟早只改一处 —— 而少一条校验的
+     *    后果是安全边界出现缺口，且**测不出来**（正常调用路径根本不触发那些
+     *    分支）。这四条原先在 relayCall 里写死，relayStream 只能照抄。
      *
-     * 安全边界（缺一不可）：
-     *   · **不转发 relay.\*** —— 只做一跳。允许链式转发的话，A→B→C 的延迟和
-     *     排障都会失控，而且会被当成放大器；
-     *   · **只转发目标宣告过的方法** —— 拿 peerMethods 比对。否则等于给调用方
-     *     一个「任意方法调用」的口子，绕过目标自己的能力声明；
-     *   · **只在目标在线时转发** —— 离线直接报错，不能把请求吞掉。
-     *
-     * @param {object} args - { to, method, args }。
-     * @returns {Promise<any>} 目标方法的返回值。
+     * @param {object} args - { to, method }。
+     * @returns {{conn: object, method: string, to: string}} 目标连接与方法名。
      */
-    async relayCall({ to, method, args } = {}) {
+    #checkRelay({ to, method } = {}) {
         const targetId = String(to ?? '');
         const name = String(method ?? '');
         if (!targetId) throw new Error('relay.call 需要 to（目标 deviceId）');
@@ -590,9 +602,77 @@ export class LinkManager {
         if (!(conn.peerMethods ?? []).includes(name)) {
             throw new Error('目标设备未提供方法 ' + name + '（只有：' + (conn.peerMethods ?? []).join(', ') + '）');
         }
+        return { conn, method: name, to: targetId };
+    }
+
+    /**
+     * 中转：把一次方法调用转发到「我连着、但调用方连不上」的那台设备。
+     *
+     * 这是 star 拓扑里两台设备互通的唯一途径 —— 它们都连着本机（hub），
+     * 但彼此没有直连路径。
+     *
+     * 安全边界见 [#checkRelay]：只做一跳 / 只转发对方宣告过的方法 / 不能自转 /
+     * 目标必须在线。
+     *
+     * @param {object} args - { to, method, args }。
+     * @returns {Promise<any>} 目标方法的返回值。
+     */
+    async relayCall({ to, method, args } = {}) {
+        const { conn, method: name, to: targetId } = this.#checkRelay({ to, method });
         this.log('link: 中转 ' + name + ' → ' + targetId);
         // 转发多一跳，超时放宽到 60s：截图/读会话这类本来就慢，再加一跳容易撞默认 30s。
         return conn.call(name, args ?? {}, { timeoutMs: 60_000 });
+    }
+
+    /**
+     * 中转的**流式**版本：把 call-stream 转发到目标，把对方推来的块原样回吐。
+     *
+     * ── 为什么必须有它 ────────────────────────────────────────────────────────
+     * 之前只有 relayCall（走 `call`），于是**所有非流式方法**能中转（截图、
+     * 点击、读会话），**流式的不能** —— 而模型转发 `llm.relay` 恰好是流式的。
+     * 表现是「手机 A 让手机 B 调模型」永远失败，而同一对设备之间截图却正常，
+     * 看起来像随机故障。
+     *
+     * 两条路都只是把块透传，本机不解析、不缓存、不改写，所以语义上与直连
+     * 等价 —— 也就不需要额外的「流中继协议」。
+     *
+     * @param {object} args - { to, method, args }。
+     * @param {(chunk: any) => void} emit - 把目标推来的块回吐给调用方。
+     * @param {{signal?: AbortSignal}} meta - 中止信号。
+     * @returns {Promise<any>} 目标方法在流结束时的返回值。
+     */
+    async relayStreamCall({ to, method, args } = {}, emit, meta) {
+        let targetId = String(to ?? '');
+        let name = String(method ?? '');
+        // 请求方不知道、也不想指定目标（常见：手机 A 说「用别人的模型」，
+        // 但它并不清楚 hub 连着哪台设备有凭据）。__relayPreferRelay 表示
+        // 「你替我挑一个连着的、宣告了该能力的设备」。
+        //
+        // 为什么显式要这个标志而不是让中转方猜：猜错的表现是请求被转给一台
+        // 没有 llm 服务的设备，而错误信息会指向**目标**而不是「目标没选对」，
+        // 极难排查。
+        if (targetId === '' && args && args.__relayPreferRelay === true) {
+            const candidate = this.onlinePeers().find(
+                (p) => p.deviceId !== this.deviceId
+                    && (p.capabilities ?? []).includes('llm.relay'),
+            );
+            if (!candidate) {
+                throw new Error(
+                    '中转请求没有指定目标，且本机连着的设备里没有一台宣告 llm.relay'
+                    + '（若目标本应是某一台确定的设备，请在调用方显式指定 to）。',
+                );
+            }
+            targetId = candidate.deviceId;
+            name = 'llm.relay';
+            // 标志只对中转方有意义，不能带到目标那边去。
+            const { __relayPreferRelay, ...rest } = args;
+            args = rest;
+        }
+        const { conn, method: checked, to: resolvedTo } = this.#checkRelay({ to: targetId, method: name });
+        this.log('link: 流式中转 ' + checked + ' → ' + resolvedTo);
+        // 超时比 call 更宽：模型回复可能几十秒起步，直连时用户已经适应了那个
+        // 等待时间；经中转再加一跳不该让它提前失败。
+        return conn.callStream(checked, args ?? {}, emit, { timeoutMs: 180_000, signal: meta?.signal });
     }
 
     /** 生成一个长期令牌。 @returns {string} 令牌。 */

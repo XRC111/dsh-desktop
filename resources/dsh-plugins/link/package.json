@@ -1,6 +1,6 @@
 {
   "name": "@dsh-desktop/link",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "DSH 远程联动（桌面侧）：局域网服务、双向设备操作、凭据转发；含设置页面板。",
   "type": "module",
   "main": "./lib/index.js",
@@ -23,6 +23,5 @@
         "@deepseek-ai/dsh-client-ui-settings"
       ]
     }
-  },
-  "dshDesktopBuild": "a349d534325e211d"
+  }
 }

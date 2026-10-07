@@ -82,3 +82,54 @@ export const REMOTE_PROVIDER_LABEL = '经另一台设备调用';
 
 /** 单次请求的分块转发用的分片 ID 前缀（诊断用）。 */
 export const RELAY_TRACE_PREFIX = 'llm-relay';
+
+/**
+ * 把请求转发到对端，并把对端产生的 chunk 逐块交回本地消费方。
+ *
+ * waterfall 的监听器必须返回 AsyncIterable<StreamChunk>，所以这里把
+ * 回调式的 call-stream 包成一个异步生成器。
+ *
+ * ⚠️ 队列不能丢：对端是「边算边发」，本地在 await 生成器时才拉取。若只留最后一个
+ *    值，用户看到的就是「等半天整段蹦出来」—— 那正是要避免的。
+ *
+ * ── 为什么是共享的（两端都用同一份）────────────────────────────────────────
+ * 这个函数只用到 conn 的 `callStream` / `closed`，**与设备角色无关**：
+ * 手机→电脑、电脑→手机、电脑→电脑、手机→手机（经中转）都是同一套机制。
+ * 它曾只写在手机侧，桌面侧要反向转发时就得复制一份 —— 而复制出来的两份迟早
+ * 会走样（比如一边改了取消语义、另一边没有）。
+ *
+ * @param {object} conn - 已配对的连接。
+ * @param {object} options - 原始 GenerateOptions（原样转发，不裁剪字段）。
+ * @param {string} [label] - 诊断标签，用于日志里区分是谁发起的转发。
+ * @returns {AsyncGenerator<object>} 对端的 chunk。
+ */
+export async function* relayStream(conn, options, label = 'peer') {
+    /** @type {object[]} 等待消费的 chunk。 */
+    const queue = [];
+    let done = false;
+    let failure = null;
+    let wake = null;
+    const push = (chunk) => { queue.push(chunk); wake?.(); wake = null; };
+    const finish = (error) => { if (error) failure = error; done = true; wake?.(); wake = null; };
+
+    // 对端结束或失败时，结束整个生成器。
+    const settled = conn.callStream(RELAY_METHOD, options, push).then(
+        () => finish(null),
+        (error) => finish(error),
+    );
+
+    try {
+        for (;;) {
+            while (queue.length > 0) yield queue.shift();
+            if (done) break;
+            await new Promise((resolve) => { wake = resolve; });
+        }
+        while (queue.length > 0) yield queue.shift();
+        if (failure) throw failure;
+    } finally {
+        // 本地消费方提前退出（用户取消 / 会话中断）时结束这次转发。
+        // settled 只是用来兜住「对端还没结束就走了」的 rejection，
+        // 不 await —— await 它会把取消也变成等待。
+        settled.catch(() => {});
+    }
+}

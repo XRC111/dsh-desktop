@@ -96,6 +96,22 @@ export const COMMON_METHODS = [
 export const TRANSIT_METHOD = 'relay.call';
 
 /**
+ * 中转的**流式**方法名（call-stream 版本）。
+ *
+ * 为什么需要单独一个方法名，而不是给 relay.call 加个 stream 标志：
+ * `conn.call` 与 `conn.callStream` 在协议层是**两种不同的帧**（后者带分片 id、
+ * 逐块回吐）。对端要用不同方式解码，方法名不同才不会在解码时错位。
+ *
+ * 同样受「只做一跳」约束：不转发 `relay.*`，`relay.stream` 也在内
+ * （见 mesh-manager 的 #checkRelay —— 那里按前缀拦，两个方法共用同一处校验）。
+ *
+ * ⚠️ 前缀刻意是 `relay.` 而不是 `transit.`，这样 #checkRelay 里那一行
+ *    `name.startsWith('relay.')` 就自动把它一起挡住了。
+ *    若改成别的前缀，必须同步改那一行，否则就成了绕过一跳限制的口子。
+ */
+export const TRANSIT_STREAM_METHOD = 'relay.stream';
+
+/**
  * 生成一个短配对码（6 位数字）。
  *
  * 用 crypto 的随机源，不用 Math.random —— 这个码是这条链路唯一的门禁，

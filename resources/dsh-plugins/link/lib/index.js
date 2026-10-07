@@ -29,11 +29,11 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { defineTool } from '@deepseek-ai/dsh-tools';
-import { startLinkServer } from './link-protocol/endpoint.js';
-import { DESKTOP_METHODS, COMMON_METHODS, DEFAULT_PORT, makePairingCode, makeToken, fileChunks, TRANSIT_METHOD } from './link-protocol/protocol.js';
+import { startLinkServer, connectToHost } from './link-protocol/endpoint.js';
+import { DESKTOP_METHODS, COMMON_METHODS, DEFAULT_PORT, makePairingCode, makeToken, fileChunks, TRANSIT_METHOD, TRANSIT_STREAM_METHOD } from './link-protocol/protocol.js';
 import { seal, open } from './link-protocol/secret.js';
 import { registerRoutes } from './link-protocol/routes.js';
-import { RELAY_METHOD, REMOTE_PROVIDER, REMOTE_PROVIDER_LABEL, RELAY_ADVERTISED } from './link-protocol/llmrelay.js';
+import { RELAY_METHOD, REMOTE_PROVIDER, REMOTE_PROVIDER_LABEL, RELAY_ADVERTISED, RELAY_POLICY, relayStream } from './link-protocol/llmrelay.js';
 import { executeLocally } from './link-protocol/relayexec.js';
 import { describeAddresses } from './link-protocol/netinfo.js';
 import { loadOrCreateIdentity, TOPOLOGY } from './link-protocol/mesh-identity.js';
@@ -54,6 +54,21 @@ const CODE_TTL_MS = 5 * 60 * 1000;
  * 两台手机彼此连不上，经桌面代转是它们互通的唯一途径。
  */
 const DESKTOP_CAPS = [...DESKTOP_METHODS, ...COMMON_METHODS, TRANSIT_METHOD];
+
+/**
+ * 本端**此刻**对外宣告的能力。
+ *
+ * 抽成函数是因为 `llm.relay` 是**条件**宣告 —— 只有本机真的挂了 llm 服务才
+ * 宣告，对端据此决定要不要开转发。
+ *
+ * ⚠️ 以前这个表达式在**两处**各写一遍（startLinkServer 的 methods 与现在
+ *    link_connect 的 methods），一处改了另一处漏改就会出现
+ *    「别人连我时能看到 llm.relay、我连别人时对方却看不到」的诡异不一致。
+ *    与手机侧的 MOBILE_CAPS 同一原则：单一来源。
+ */
+function advertisedMethods() {
+    return [...DESKTOP_CAPS, ...(ctx.get('llm') ? [RELAY_ADVERTISED] : [])];
+}
 
 /**
  * 文本输出的样板。
@@ -283,18 +298,129 @@ function apply(ctx, config = {}) {
         return win32.mod;
     }
 
+    // ── 远程凭据转发 · 本端作为「客户端」的一侧 ──────────────────────────────
+    //
+    // 这一块原先**不存在**：桌面只会替别人执行（registerHostMethods 里的
+    // llm.relay handler），自己缺凭据时只能干等。现在补上反向：拦截
+    // llm/stream，需要时把请求转给**任意一台已宣告 llm.relay 的对端**。
+    //
+    // 与手机侧同一个机制、同一份 relayStream（见 link-protocol/llmrelay.js）。
+    // 之所以之前不能直接复用：方向是写死的 —— 手机是 client、电脑是 hub。
+    // 现在电脑也能当 client，于是「谁发起」不再等于「谁的角色」。
+    let relayEnabled = false;
+    let relayPolicy = RELAY_POLICY.localFirst;
+    /** 显式指定转发目标；空 = 由 resolveRelayTarget 挑。 */
+    let relayTarget = '';
+
+    ctx.effect(() => {
+        if (!ctx.get('llm')) return;
+        // 让「经另一台设备调用」出现在本机的模型选择器里。
+        ctx.llm.registerConfigurableProviders([{
+            provider: REMOTE_PROVIDER,
+            displayName: REMOTE_PROVIDER_LABEL,
+            settingsNs: ctx.fiber?.entry?.options?.id ?? 'dsh-desktop-link',
+            settingsPath: [],
+        }]);
+        const forward = (options, next) => {
+            if (!relayEnabled || !options || options.provider === REMOTE_PROVIDER) return next();
+            return relayViaAnyPeer(options);
+        };
+        ctx.on('llm/stream', forward);
+        return () => ctx.off('llm/stream', forward);
+    }, 'dsh-link: llm relay (client)');
+
+    /**
+     * 把请求转给**任意一台**宣告了模型转发能力的设备。
+     *
+     * 与手机侧 relayViaAnyPeer 同构：先直连，再经中转。两台电脑只与同一个 hub
+     * 相连时（star 里就是这样），彼此没有直连路径，只能经 hub 代转 ——
+     * 那条路要靠流式中转 `relay.stream`，用 `relay.call` 转不了流式请求。
+     *
+     * @param {object} options - 原始 GenerateOptions。
+     * @returns {AsyncGenerator<object>} 远端的 chunk。
+     */
+    async function* relayViaAnyPeer(options) {
+        if (!mesh) {
+            const e = new Error('mesh 未启用（身份初始化失败），无法转发模型调用。');
+            e.code = 'NO_REMOTE_LINK';
+            throw e;
+        }
+        const online = mesh.onlinePeers();
+        const withRelay = online.filter((p) => (p.capabilities ?? []).includes(RELAY_ADVERTISED));
+        const tried = [];
+
+        // 1) 直连：优先显式指定的那台，否则在候选里挑。
+        let direct = null;
+        if (relayTarget) {
+            const hit = withRelay.find((p) => p.deviceId === relayTarget);
+            if (!hit) log('relay target ' + relayTarget + ' 不在线或未宣告模型能力');
+            else direct = pickConn(hit);
+        }
+        if (!direct) {
+            if (withRelay.length > 1 && relayTarget === '') {
+                // 多台在线却没指定：任选其一会让「我用了谁的凭据」不可知，
+                // 而模型来源直接关系到计费与隐私。所以要求显式指定。
+                throw new Error(
+                    '有多台设备可转发（' + withRelay.map((p) => p.name || p.deviceId).join('、') +
+                    '），请用 link_llm_relay 的 device 参数指定用哪一台。',
+                );
+            }
+            if (withRelay.length >= 1) direct = pickConn(withRelay[0]);
+        }
+        if (direct) {
+            try {
+                return yield* relayStream(direct, options, 'desktop→peer');
+            } catch (error) {
+                tried.push('直连失败（' + (error?.message ?? error) + '）');
+            }
+        } else if (withRelay.length > 0) {
+            tried.push('目标设备连接已断');
+        }
+
+        // 2) 经中转
+        const via = online.find((p) => (p.capabilities ?? []).includes(TRANSIT_STREAM_METHOD)
+            && !withRelay.some((w) => w.deviceId === p.deviceId));
+        if (via) {
+            const conn = pickConn(via);
+            if (conn) {
+                return yield* relayStream(
+                    conn,
+                    { ...options, __relayPreferRelay: true },
+                    'desktop→via→peer',
+                );
+            }
+        }
+
+        const e = new Error(
+            online.length === 0
+                ? '没有已连接的对端，无法转发模型调用。请先在「设置 → 远程联动」里连接另一台设备。'
+                : '无法转发模型调用：' + (tried.length
+                    ? tried.join('；')
+                    : '已连接的设备都没有宣告模型转发能力（需要对方的 dsh 上有 llm 服务）。'),
+        );
+        e.code = 'NO_REMOTE_LINK';
+        throw e;
+    }
+
+    /** 取某台在线设备的连接，断了就返回 null。 */
+    function pickConn(peer) {
+        const conn = mesh ? mesh.connectionTo(peer.deviceId) : null;
+        return conn && !conn.closed ? conn : null;
+    }
+
     /**
      * 注册对端可调用的方法。
      *
-     * `llm.relay` 是「远程凭据转发」的入口：手机把**请求内容**发过来，
+     * `llm.relay` 是「远程凭据转发」的入口：对端把**请求内容**发过来，
      * 本机用自己的凭据执行。注意它**只在本机 llm 服务可用时**才有意义，
      * 所以下面用 ctx.get('llm') 判一下，缺了就回一句人话而不是抛栈。
+     *
+     * ⚠️ 这里**不**注册 TRANSIT_METHOD：LinkManager.attachRelay 已经注册了
+     *    relay.call 与 relay.stream（listen / dial 两条路径都走它）。插件再注册
+     *    一次会造成重复，第二次覆盖第一次 —— 谁生效取决于注册顺序，是典型的
+     *    「改了没效果」来源。此前这里就重复注册过 TRANSIT_METHOD。
      */
     function registerHostMethods(conn) {
-        // 中转：桌面同时连着多台手机，是 star 拓扑里唯一能把它们连起来的一方。
-        // 两台手机之间没有直连路径，只有经这里代转 —— 这是文档承诺过、
-        // 之前一直没实现的能力。
-        conn.handle(TRANSIT_METHOD, (args) => mesh.relayCall(args));
         conn.handleStream(RELAY_METHOD, async (args, emit, meta) => {
             const llm = ctx.get('llm');
             if (!llm) {
@@ -542,12 +668,11 @@ function apply(ctx, config = {}) {
                 deviceId: identity?.deviceId,
                 kind: 'desktop',
             },
-            // 宣告 llm.relay：让手机知道这台机器能代为执行模型调用。
-            // 但**只有本机真的挂了 llm 服务**才宣告 —— 手机据此决定要不要开转发。
-            methods: [
-                ...DESKTOP_CAPS,
-                ...(ctx.get('llm') ? [RELAY_ADVERTISED] : []),
-            ],
+            // 宣告 llm.relay：让对端知道这台机器能代为执行模型调用。
+            // 但**只有本机真的挂了 llm 服务**才宣告 —— 对端据此决定要不要开转发。
+            // 走 advertisedMethods() 而不是在这里再写一遍表达式：两处各写一份时，
+            // 一处改了另一处漏改就会「别人连我时可用、我连别人时不可用」。
+            methods: advertisedMethods(),
             log,
             onConnection(conn) {
                 state.conn = conn;
@@ -888,6 +1013,103 @@ function apply(ctx, config = {}) {
                         note: mesh.topology === TOPOLOGY.mesh
                             ? '每台设备都会主动连已知设备；两端按 deviceId 字典序仲裁，不会重复建连。'
                             : '星型：本机监听，各手机拨入。手机之间不直连。',
+                    };
+                },
+            },
+            {
+                name: 'link_llm_relay',
+                description: '查看或设置「远程模型转发」：本机缺凭据时把请求发给另一台已连接的设备执行（凭据不离开对方机器，只传请求内容）。默认关闭。',
+                parameters: {
+                    enabled: { type: 'boolean', description: '是否开启转发。省略则只查询。' },
+                    device: { type: 'string', description: '指定转发目标（设备名或 deviceId）。多台在线时必填，否则不确定会用谁的凭据。' },
+                },
+                async execute(args) {
+                    if (typeof args.enabled === 'boolean') relayEnabled = args.enabled;
+                    if (typeof args.device === 'string') relayTarget = args.device.trim();
+                    const online = mesh ? mesh.onlinePeers() : [];
+                    const offerable = online
+                        .filter((p) => (p.capabilities ?? []).includes(RELAY_ADVERTISED))
+                        .map((p) => ({ device: p.name || p.deviceId, deviceId: p.deviceId, kind: p.kind }));
+                    return {
+                        enabled: relayEnabled,
+                        policy: relayPolicy,
+                        target: relayTarget || null,
+                        // 把候选列出来：多台在线又没指定时，调用方能直接看到该选谁，
+                        // 而不是只看到一句「请指定」。
+                        offerable,
+                        note: relayEnabled
+                            ? '本机没有可用凭据的请求会转发给上述设备。转发的是**请求内容**（含对话历史），凭据不离开对方机器。'
+                            : '转发默认关闭。开启后，本机缺凭据的请求会把对话内容发到另一台设备执行。',
+                    };
+                },
+            },
+            {
+                name: 'link_connect',
+                description: '主动连接并配对另一台设备（通常是另一台电脑）。首次需要对方用 link_host_code 生成 6 位配对码。',
+                parameters: {
+                    host: { type: 'string', description: '对方地址：局域网 IP、公网 IPv6，或组网工具给的虚拟 IP。' },
+                    port: { type: 'number', description: '对方联动端口，默认 45731。' },
+                    code: { type: 'string', description: '对方 link_host_code 生成的 6 位配对码。' },
+                },
+                async execute(args) {
+                    if (!mesh) throw new Error('mesh 未启用（身份初始化失败）');
+                    const host = String(args.host ?? '').trim();
+                    if (!host) throw new Error('缺少 host：对方地址');
+                    const port = Number(args.port ?? DEFAULT_PORT);
+                    const code = String(args.code ?? '').trim();
+
+                    // ⚠️ 这里**不能**用 mesh.dial()：它的第一个参数是 deviceId，且要求
+                    //    注册表里已经有那条记录（含 endpoint）。而「主动配对一台还没配过的
+                    //    电脑」正是先有地址、后有 deviceId —— 鸡生蛋问题。
+                    //    所以直接用 endpoint.connectToHost，连上后从握手拿 deviceId 再补注册表。
+                    //    这与手机侧 connect() 的做法一致（见 plugins/@dsh-android/link）。
+                    const known = peerRegistry.list().find(
+                        (r) => r.endpoint === host + ':' + port,
+                    );
+                    if (!code && !known?.token) {
+                        throw new Error(
+                            '第一次配对需要对方先跑 link_host_code 生成 6 位配对码，'
+                            + '再用 code 参数传进来。配对码是一次性的。',
+                        );
+                    }
+                    const conn = await connectToHost({
+                        host,
+                        port,
+                        code: code || undefined,
+                        token: code ? undefined : known?.token,
+                        device: {
+                            name: os.hostname(),
+                            platform: process.platform + '-' + process.arch,
+                            deviceId: identity?.deviceId,
+                            kind: 'desktop',
+                        },
+                        methods: advertisedMethods(),
+                        log,
+                    });
+                    const peerId = conn.peer?.deviceId;
+                    if (peerId) {
+                        // 令牌必须一并写进注册表：自动连接驱动下一轮重拨时要从
+                        // rec.token 取令牌，只存地址的话会以「没有令牌」失败。
+                        peerRegistry.upsert({
+                            deviceId: peerId,
+                            name: conn.peer?.name ?? peerId,
+                            kind: conn.peer?.kind ?? 'desktop',
+                            endpoint: host + ':' + port,
+                            capabilities: conn.peerMethods,
+                            ...(conn.issuedToken ? { token: conn.issuedToken } : {}),
+                        });
+                    }
+                    return {
+                        connected: !conn.closed,
+                        deviceId: peerId ?? null,
+                        name: conn.peer?.name ?? null,
+                        kind: conn.peer?.kind ?? null,
+                        encrypted: Boolean(conn.sessionKey),
+                        peerMethods: conn.peerMethods ?? [],
+                        note: peerId
+                            ? '配对成功，已登记为已知设备。本机在 mesh 拓扑下会自动重连；'
+                              + '另一台也会按 deviceId 字典序自动拨号，两边不会重复建连。'
+                            : '已连接，但对方没有提供 deviceId（旧版本），无法参与自动重连。',
                     };
                 },
             },
