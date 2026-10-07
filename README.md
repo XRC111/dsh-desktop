@@ -542,10 +542,12 @@ node_modules\electron\dist\electron.exe --expose-internals `
 
 | 模型 | 提供方 |
 |---|---|
-| DeepSeek | DeepSeek |
-| GLM | Z.ai（智谱） |
-| Hunyuan | 腾讯 |
-| Kimi | Moonshot AI（月之暗面） |
+| DeepSeek-v4-flash/v4.1-flash | DeepSeek |
+| GLM-5.3-flash/GLM-5.3| Z.ai（智谱） |
+| Hunyuan-4-preview | 腾讯 |
+| Kimi-K3 | Moonshot AI（月之暗面） |
+| Seed-2.1-lite/turbo/pro | 豆包（字节跳动） |
+| ChatGPT-6-luna | OpenAI |
 
 > 以上 AI 模型是开发工具，不是代码贡献者；项目的设计决策、实现取舍与最终质量由维护者负责。
 
