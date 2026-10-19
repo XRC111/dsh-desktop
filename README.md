@@ -9,7 +9,7 @@
 [![Release](https://img.shields.io/github/v/release/XRC111/dsh-desktop?label=Release&style=flat-square)](https://github.com/XRC111/dsh-desktop/releases/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11%20%7C%207-0078D4?style=flat-square)](#系统要求)
 [![Electron](https://img.shields.io/badge/Electron-44-47848F?style=flat-square)](#)
-[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](#license)
+[![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)](./LICENSE)
 
 </div>
 
@@ -340,7 +340,7 @@ Issue / PR 均欢迎。提交前请说明复现步骤与系统版本；涉及热
 
 ## License
 
-MIT
+MIT（见 [LICENSE](./LICENSE)）
 
 ## 致谢
 
