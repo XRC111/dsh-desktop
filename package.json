@@ -77,8 +77,8 @@
     ],
     "extraResources": [
       {
-        "from": "build/dsh-runtime.tar",
-        "to": "dsh-runtime.tar"
+        "from": "build/dsh-runtime.tar.gz",
+        "to": "dsh-runtime.tar.gz"
       },
       {
         "from": "build/dsh-runtime-manifest.json",

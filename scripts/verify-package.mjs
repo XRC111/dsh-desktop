@@ -134,7 +134,7 @@ if (fs.existsSync(runtimeRoot)) {
 }
 
 for (const [label, file] of [
-  ['运行时 tar（单文件承载 3.5 万文件）', 'dsh-runtime.tar'],
+  ['运行时 tar.gz（单文件承载 3.5 万文件）', 'dsh-runtime.tar.gz'],
   ['运行时文件清单', 'dsh-runtime-manifest.json'],
   ['多线程解压器', 'extract-runtime.cjs'],
   ['解压器入口（安装期由 NSIS 调用）', 'extract-runtime.cmd'],
@@ -145,7 +145,7 @@ for (const [label, file] of [
 }
 
 // tar 与清单必须同批次（防「换了运行时却只重打了其中一半」）
-const tarPath = path.join(resources, 'dsh-runtime.tar');
+const tarPath = path.join(resources, 'dsh-runtime.tar.gz');
 const manifestPath = path.join(resources, 'dsh-runtime-manifest.json');
 const extractorPath = path.join(resources, 'extract-runtime.cjs');
 if (fs.existsSync(tarPath) && fs.existsSync(manifestPath) && fs.existsSync(extractorPath)) {

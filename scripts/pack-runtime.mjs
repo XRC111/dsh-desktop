@@ -5,7 +5,12 @@
 //   结果整个 node_modules 一个文件都不会被复制（实测只复制出 package.json）。
 //   改用一个 tar 文件分发可以完全绕开该行为。
 //
-// 产物：build/dsh-runtime.tar（未压缩：体积大但解压快，交给 NSIS 再做整体压缩）
+// 产物：build/dsh-runtime.tar.gz（gzip 压缩：314MB → ~80-100MB）
+//
+// 为什么改 gzip：之前是未压缩 tar（314MB），交给 NSIS 做整体压缩。但 NSIS
+// 对 tar 里 3.5 万个小文件逐个压缩效率低，最终安装包 ~240MB。改成 gzip tar.gz
+// 后，文本/JS 文件 gzip 压缩率 3-4 倍，安装包直接砍半到 ~130-150MB。
+// 解压端 bsdtar 自动识别 gzip，多线程并行解压速度影响极小（CPU 解压 vs 磁盘写）。
 // 使用系统自带 tar.exe（Windows 10 1803+ 内置 bsdtar）。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -15,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const resourcesDir = path.join(root, 'resources');
 const runtimeDir = path.join(resourcesDir, 'dsh-runtime');
-const outFile = path.join(root, 'build', 'dsh-runtime.tar');
+const outFile = path.join(root, 'build', 'dsh-runtime.tar.gz');
 
 if (!fs.existsSync(runtimeDir)) {
   console.error('[pack-runtime] 未找到 resources/dsh-runtime，请先执行 npm run prepare:runtime');
@@ -39,7 +44,7 @@ if (links.length) {
   process.exit(1);
 }
 
-console.log('[pack-runtime] 正在打包 dsh-runtime.tar …');
+console.log('[pack-runtime] 正在打包 dsh-runtime.tar.gz（gzip 压缩，约 1-2 分钟）…');
 
 // 必须使用 Windows 自带的 bsdtar：Git Bash / MSYS 自带的 GNU tar 会把
 // "D:\..." 这类路径中的冒号当成远程主机名（报 "Cannot connect to D: resolve failed"）。
@@ -48,7 +53,7 @@ const tarExe =
     ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'tar.exe')
     : 'tar';
 
-const res = spawnSync(tarExe, ['-cf', outFile, '-C', resourcesDir, 'dsh-runtime'], {
+const res = spawnSync(tarExe, ['-czf', outFile, '-C', resourcesDir, 'dsh-runtime'], {
   stdio: 'inherit',
   shell: false,
 });
@@ -79,4 +84,4 @@ function findSymlinks(dir, limit = 8) {
 }
 
 const mb = (fs.statSync(outFile).size / 1024 / 1024).toFixed(1);
-console.log(`[pack-runtime] 完成：build/dsh-runtime.tar (${mb} MB)`);
+console.log(`[pack-runtime] 完成：build/dsh-runtime.tar.gz (${mb} MB)`);

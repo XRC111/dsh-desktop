@@ -230,7 +230,7 @@ try {
         if ($code -ne 0) { Fail '文件清单生成失败' }
     } else {
         Step 2 '跳过运行时打包（-SkipRuntime）'
-        foreach ($f in @('build\dsh-runtime.tar', 'build\dsh-runtime-manifest.json')) {
+        foreach ($f in @('build\dsh-runtime.tar.gz', 'build\dsh-runtime-manifest.json')) {
             if (-not (Test-Path (Join-Path $root $f))) { Fail "缺少 $f" '去掉 -SkipRuntime 重新跑，或先手动生成。' }
         }
     }
@@ -261,7 +261,7 @@ try {
     Step 4 '准备载荷（剥离运行时目录）'
     $code = Invoke-Step 'node' @('scripts\prepare-payload.mjs')
     if ($code -ne 0) { Fail '载荷准备失败' }
-    foreach ($f in @('dsh-runtime.tar', 'dsh-runtime-manifest.json', 'extract-runtime.cjs', 'extract-runtime.cmd')) {
+    foreach ($f in @('dsh-runtime.tar.gz', 'dsh-runtime-manifest.json', 'extract-runtime.cjs', 'extract-runtime.cmd')) {
         $p = Join-Path $resources $f
         if (-not (Test-Path $p)) { Fail "载荷缺少 $f" "预期位置：$p" }
     }

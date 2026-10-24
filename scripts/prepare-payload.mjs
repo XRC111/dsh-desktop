@@ -6,7 +6,7 @@
 //   实测一次安装要 110 秒，而且杀软实时扫描下还会静默丢文件（实测丢 25.6%）。
 //
 // 新做法：
-//   1) 运行时只以 build/dsh-runtime.tar（未压缩 tar）随包分发；
+//   1) 运行时只以 build/dsh-runtime.tar.gz（gzip 压缩 tar）随包分发；
 //   2) 安装包里不再出现 resources/dsh-runtime 目录（文件数 3.5 万 → 数百）；
 //   3) 安装期由 resources/extract-runtime.cmd 调用多线程解压器并行展开，
 //      装完即完整可用；首次启动的自检/修复也复用同一实现。
@@ -36,7 +36,7 @@ if (!fs.existsSync(winUnpacked)) {
 
 // ── 1) 构建期产物 ────────────────────────────────────────────────────────────
 for (const [label, file] of [
-  ['运行时 tar', path.join(root, 'build', 'dsh-runtime.tar')],
+  ['运行时 tar.gz', path.join(root, 'build', 'dsh-runtime.tar.gz')],
   ['运行时清单', path.join(root, 'build', 'dsh-runtime-manifest.json')],
 ]) {
   if (!fs.existsSync(file)) {
@@ -77,7 +77,7 @@ if (fs.existsSync(runtimeTree)) {
 
 // ── 3) 载荷齐备性校验 ────────────────────────────────────────────────────────
 const required = [
-  ['运行时 tar', 'dsh-runtime.tar'],
+  ['运行时 tar.gz', 'dsh-runtime.tar.gz'],
   ['运行时清单', 'dsh-runtime-manifest.json'],
   ['多线程解压器', 'extract-runtime.cjs'],
   ['解压器入口', 'extract-runtime.cmd'],
@@ -124,9 +124,9 @@ function countFiles(dir) {
 }
 
 const files = countFiles(winUnpacked);
-const mb = (fs.statSync(path.join(resources, 'dsh-runtime.tar')).size / 1024 / 1024).toFixed(1);
+const mb = (fs.statSync(path.join(resources, 'dsh-runtime.tar.gz')).size / 1024 / 1024).toFixed(1);
 
-console.log(`[prepare-payload] 载荷就绪：安装包内 ${files} 个文件（tar ${mb} MB 单文件承载运行时）`);
+console.log(`[prepare-payload] 载荷就绪：安装包内 ${files} 个文件（tar.gz ${mb} MB 单文件承载运行时）`);
 if (files > 20000) {
   console.warn(
     `[prepare-payload] 警告：文件数仍然高达 ${files}，运行时目录可能没清干净，安装会很慢。`,

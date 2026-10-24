@@ -29,9 +29,9 @@ if (!fs.existsSync(base)) {
 }
 
 const manifestFile = path.join(root, 'build', 'dsh-runtime-manifest.json');
-const tarFile = path.join(root, 'build', 'dsh-runtime.tar');
+const tarFile = path.join(root, 'build', 'dsh-runtime.tar.gz');
 if (!fs.existsSync(manifestFile) || !fs.existsSync(tarFile)) {
-  console.error('缺少 build/dsh-runtime-manifest.json 或 build/dsh-runtime.tar，请先构建');
+  console.error('缺少 build/dsh-runtime-manifest.json 或 build/dsh-runtime.tar.gz，请先构建');
   process.exit(1);
 }
 

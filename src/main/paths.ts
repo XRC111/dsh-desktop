@@ -106,9 +106,9 @@ export function runtimeManifestFile(): string {
   return path.join(process.resourcesPath, 'dsh-runtime-manifest.json');
 }
 
-/** 运行时 tar 包位置（自动修复与兜底分发的修复源） */
+/** 运行时 tar.gz 包位置（自动修复与兜底分发的修复源） */
 export function runtimeTarFile(): string {
-  return path.join(process.resourcesPath, 'dsh-runtime.tar');
+  return path.join(process.resourcesPath, 'dsh-runtime.tar.gz');
 }
 
 /**

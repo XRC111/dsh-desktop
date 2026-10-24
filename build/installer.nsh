@@ -70,12 +70,12 @@
   StrCpy $DshForceRun 0
 
   ; ── 多线程展开 Harness 运行时 ─────────────────────────────────────────────
-  ; 安装包里运行时只以单个 dsh-runtime.tar 分发（把包内文件数从 3.5 万降到数百），
+  ; 安装包里运行时只以单个 dsh-runtime.tar.gz 分发（把包内文件数从 3.5 万降到数百），
   ; 由 resources/extract-runtime.cmd（Electron 内置 Node 充当解释器）调用多线程解压器：
   ;   * NSIS 单线程逐个写 3.5 万个小文件：实测 110 秒；
-  ;   * 多线程解压器把文件清单按字节均分成几十批、N 个 tar 进程并行写，
+  ;   * 多线程解压器把文件清单均分成几十批、N 个 tar 进程并行写，
   ;     解压完逐文件校验、缺失自动重试（旧版静默丢文件的问题一并解决）：实测约 20 秒。
-  IfFileExists "$INSTDIR\resources\dsh-runtime.tar" 0 dsh_rt_done
+  IfFileExists "$INSTDIR\resources\dsh-runtime.tar.gz" 0 dsh_rt_done
   IfFileExists "$INSTDIR\resources\extract-runtime.cmd" 0 dsh_rt_done
 
   DetailPrint "正在多线程展开 Harness 运行时（3.5 万个文件）…"
