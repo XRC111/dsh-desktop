@@ -78,7 +78,10 @@ const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file
 
 const baseVersion = runtimeVersion(fromDir);
 const version = runtimeVersion(toDir);
-if (baseVersion === version) die(`两棵树版本相同（${version}），没有可打包的差分`);
+if (baseVersion === version) {
+  console.log(`两棵树版本相同（${version}），没有可打包的差分，跳过`);
+  process.exit(0);
+}
 
 console.log(`对比：${baseVersion} → ${version}`);
 const t0 = Date.now();
