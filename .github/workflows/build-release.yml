@@ -199,24 +199,25 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       # ── 3) 三棵 dsh 运行时树（被 gitignore，CI 必须自己拉）────────────────────
-      #   0.2.1-rc.3  → stable 线（resources/dsh-runtime）
-      #   0.2.1-rc.3  → beta 线（build/rt-next）
+      #   0.2.1-rc.4  → stable 线（resources/dsh-runtime）
+      #   0.2.1-rc.4  → beta 线（build/rt-next）
       #   0.2.1-alpha.5 → dev 线（build/rt-alpha）
       - name: 拉取 dsh 运行时树
         shell: pwsh
         run: |
           # 主线 stable 树：装到 resources/dsh-runtime
-          node scripts/fetch-dsh.mjs --to resources/dsh-runtime --version 0.2.1-rc.3
-          # beta / dev 树：beta=0.2.1-rc.3，dev=0.2.1-alpha.5
-          node scripts/fetch-dsh.mjs --to build/rt-next  --version 0.2.1-rc.3
+          node scripts/fetch-dsh.mjs --to resources/dsh-runtime --version 0.2.1-rc.4
+          # beta / dev 树：beta=0.2.1-rc.4，dev=0.2.1-alpha.5
+          node scripts/fetch-dsh.mjs --to build/rt-next  --version 0.2.1-rc.4
           node scripts/fetch-dsh.mjs --to build/rt-alpha --version 0.2.1-alpha.5
-          # 升级差分源（老 stable 用户热更用）：0.2.0-rc.2
-          node scripts/fetch-dsh.mjs --to build/rt-015 --version 0.2.0-rc.2
+          # 升级差分源：0.1.5-rc.3（更老的 stable 存量用户）与 0.2.0-rc.2（上一版 stable）
+          node scripts/fetch-dsh.mjs --to build/rt-015 --version 0.1.5-rc.3
+          node scripts/fetch-dsh.mjs --to build/rt-020 --version 0.2.0-rc.2
 
       - name: 校验运行时树
         shell: pwsh
         run: |
-          foreach ($t in @('resources/dsh-runtime','build/rt-next','build/rt-alpha','build/rt-015')) {
+          foreach ($t in @('resources/dsh-runtime','build/rt-next','build/rt-alpha','build/rt-015','build/rt-020')) {
             $f = Join-Path $t 'node_modules/@deepseek-ai/dsh/package.json'
             if (-not (Test-Path $f)) { throw "树缺失：$t" }
             $v = (Get-Content $f -Raw | ConvertFrom-Json).version

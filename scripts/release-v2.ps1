@@ -68,14 +68,14 @@ param(
     # nightly：从 harness master 源码编译（官方 npm 无 nightly 标签）。
     # 用独立 minor 10.4.x，避免与 stable(10.1)/beta(10.2)/dev(10.3) 撞号。
     [string]$NightlyVersion    = '10.4.0',
-    # dsh 版本矩阵（2026-10-18 用户拍板：stable 从 0.1.7 线升到 0.2.0-rc.2，
-    #   与官方 latest/next 对齐；2026-09-27 曾因破坏性变更锁 0.1.7，现重新评估后跟进）
-    #   stable -> 0.2.0-rc.2   （官方 latest / next 都指向它）
-    #   beta   -> 0.2.0-rc.2   （与 stable 同线）
+    # dsh 版本矩阵（2026-10-27 跟进上游 0.2.1-rc.4）
+    #   stable/beta 从 0.2.0-rc.2 升到 0.2.1-rc.4；上一版 stable 运行时是 0.2.0-rc.2，
+    #   stable -> 0.2.1-rc.4   （官方最新 rc，npm 2026-10-26 发布）
+    #   beta   -> 0.2.1-rc.4   （与 stable 同线）
     #   dev    -> 0.2.1-alpha.5（官方 alpha dist-tag，跟进上游最新 alpha）
     # ⚠️ 跟版必须**显式指定版本号**，不能从 latest/next 自动推导。
-    [string]$MainDshVersion    = '0.2.0-rc.2',     # 主线 stable 内嵌 dsh（resources\dsh-runtime）
-    [string]$NextTreeDshVersion = '0.2.0-rc.2',    # build\rt-next 期望版本（beta）
+    [string]$MainDshVersion    = '0.2.1-rc.4',     # 主线 stable 内嵌 dsh（resources\dsh-runtime）
+    [string]$NextTreeDshVersion = '0.2.1-rc.4',    # build\rt-next 期望版本（beta）
     [string]$DevDshVersion     = '0.2.1-alpha.5',  # build\rt-alpha 期望版本（dev）
     # 安装包外链（网盘直链）：填了就挂进对应 feed 的 files 块，客户端走外链下载安装包，
     # sha256/size 自动从 dist 同名安装包补齐（下载完照常哈希校验）。留空 = 空骨架
@@ -98,10 +98,14 @@ param(
     [string[]]$PluginsMeta   = @(),
     # 运行时**升级**差分源：把比当前 stable 更旧的运行时树，各打一个「→ 新 stable」的差分。
     # 客户端 pickRuntime 按 baseVersion === 当前运行时**精确命中**，所以老用户需要它才能热更。
-    # 元素形如 @{ From = 'build\rt-015'; Tag = '0.1.5-rc.3' }。
-    # 默认覆盖 0.1.5-rc.3（stable 长期停在这版，存量用户最多）。
+    # 元素形如 @{ From = 'build\rt-020'; Tag = '0.2.0-rc.2' }。
+    # Tag 必须与树里的实际版本一致（见 build-release.yml 的 fetch 步骤），
+    # 否则 meta 的 baseVersion 对不上，客户端永远不会命中这条差分。
+    #   rt-015 = 0.1.5-rc.3（更老的 stable 存量用户）
+    #   rt-020 = 0.2.0-rc.2（上一版 stable，2026-10-18 起）
     [array]$UpgradeDiffSources = @(
-        @{ From = 'build\rt-015'; Tag = '0.1.5-rc.3' }
+        @{ From = 'build\rt-015'; Tag = '0.1.5-rc.3' },
+        @{ From = 'build\rt-020'; Tag = '0.2.0-rc.2' }
     )
 )
 
