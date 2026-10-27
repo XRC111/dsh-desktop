@@ -33,10 +33,24 @@ import { startLinkServer, connectToHost } from './link-protocol/endpoint.js';
 import { DESKTOP_METHODS, COMMON_METHODS, DEFAULT_PORT, makePairingCode, makeToken, fileChunks, TRANSIT_METHOD, TRANSIT_STREAM_METHOD } from './link-protocol/protocol.js';
 import { seal, open } from './link-protocol/secret.js';
 import { registerRoutes } from './link-protocol/routes.js';
-import { RELAY_METHOD, REMOTE_PROVIDER, REMOTE_PROVIDER_LABEL, RELAY_ADVERTISED, RELAY_POLICY, relayStream } from './link-protocol/llmrelay.js';
+import { RELAY_METHOD, REMOTE_PROVIDER, REMOTE_PROVIDER_LABEL, RELAY_ADVERTISED, RELAY_POLICY, relayStream, LIST_METHOD, LIST_ADVERTISED, safeProviders, safeModels } from './link-protocol/llmrelay.js';
+import { createRemoteAdapter, setForwardStream, isRemoteProvider } from './link-protocol/remote-adapter.js';
 import { executeLocally } from './link-protocol/relayexec.js';
 import { describeAddresses } from './link-protocol/netinfo.js';
 import { loadOrCreateIdentity, TOPOLOGY } from './link-protocol/mesh-identity.js';
+import * as et from './easytier.js';
+
+/**
+ * 组网的默认网络名与密钥。
+ *
+ * ⚠️ 必须与手机侧（com.dshdesktop.android.easytier.OverlayConfig）**完全一致**，
+ *    否则隧道建不起来 —— 而症状只是「连不上」，完全指不到是这里对不上。
+ *
+ * 放在两边各一份字面量（而不是共享一个文件）是有意的：手机是 Kotlin、
+ * 桌面是 JS，跨语言共享常量得不偿失。改的时候两边都要改。
+ */
+const OVERLAY_NETWORK_NAME = 'dsh';
+const OVERLAY_NETWORK_SECRET = 'dsh-link-overlay';
 import { Registry } from './link-protocol/mesh-registry.js';
 import { LinkManager } from './link-protocol/mesh-manager.js';
 
@@ -65,10 +79,23 @@ const DESKTOP_CAPS = [...DESKTOP_METHODS, ...COMMON_METHODS, TRANSIT_METHOD];
  *    link_connect 的 methods），一处改了另一处漏改就会出现
  *    「别人连我时能看到 llm.relay、我连别人时对方却看不到」的诡异不一致。
  *    与手机侧的 MOBILE_CAPS 同一原则：单一来源。
+ *
+ * ⚠️⚠️ ctx 必须**由调用方传入**，不能在函数体里直接引用。
+ *    这个函数定义在模块顶层（definePlugin 之外），那里根本没有 ctx 标识符 ——
+ *    于是调用即抛 `ReferenceError: ctx is not defined`。
+ *    表现极具迷惑性：模块能加载、服务能启动、界面正常，只有真正去点
+ *    「启动服务」或 link_connect 时才炸，而报错只有一个光秃秃的
+ *    ReferenceError，完全指不到是这行的问题。
+ *
+ *    教训：把逻辑提到模块顶层以复用时，**依赖也要一起提**（改成参数），
+ *    不能只提逻辑。
+ *
+ * @param {object} ctx Cordis 上下文，用于探测本机是否挂了 llm 服务。
  */
-function advertisedMethods() {
-    return [...DESKTOP_CAPS, ...(ctx.get('llm') ? [RELAY_ADVERTISED] : [])];
+function advertisedMethods(ctx) {
+    return [...DESKTOP_CAPS, ...(ctx.get('llm') ? [RELAY_ADVERTISED, LIST_ADVERTISED] : [])];
 }
+
 
 /**
  * 文本输出的样板。
@@ -314,20 +341,46 @@ function apply(ctx, config = {}) {
 
     ctx.effect(() => {
         if (!ctx.get('llm')) return;
-        // 让「经另一台设备调用」出现在本机的模型选择器里。
-        ctx.llm.registerConfigurableProviders([{
-            provider: REMOTE_PROVIDER,
-            displayName: REMOTE_PROVIDER_LABEL,
-            settingsNs: ctx.fiber?.entry?.options?.id ?? 'dsh-desktop-link',
-            settingsPath: [],
-        }]);
+        // ── 注册「经另一台设备调用」为**真正的** provider ───────────────────
+        //
+        // ⚠️ 这里原来调的是 `registerConfigurableProviders`，注释写「让它出现在
+        //    模型选择器里」—— **那是错的断言**。已核对 dsh-llm 源码：
+        //      registerConfigurableProviders → 写 this.directory（去哪填凭据）
+        //      listProviders()             → 读 this.adapters（能执行的实现）
+        //    两者不是一回事，所以它**从来没有出现在任何下拉里**。
+        //
+        // 现在注册真 adapter（实现见 link-protocol/remote-adapter.js）。
+        const adapter = createRemoteAdapter({ peers: () => relayPeers() });
+        setForwardStream((opts) => relayViaAnyPeer(opts));
+        ctx.llm.registerAdapter([REMOTE_PROVIDER], adapter);
         const forward = (options, next) => {
-            if (!relayEnabled || !options || options.provider === REMOTE_PROVIDER) return next();
+            // ⚠️ 用 isRemoteProvider 而不是 `=== REMOTE_PROVIDER`：adapter 注册的
+            //    是带设备后缀的 `llm-remote:<deviceId>`，等号判断会漏 ——
+            //    于是用户显式选了「经另一台设备调用」时请求被**再转发一次**。
+            if (!relayEnabled || !options || isRemoteProvider(options.provider)) return next();
             return relayViaAnyPeer(options);
         };
         ctx.on('llm/stream', forward);
         return () => ctx.off('llm/stream', forward);
     }, 'dsh-link: llm relay (client)');
+
+    /**
+     * 当前在线、且宣告了模型转发能力的设备（adapter 的数据源）。
+     *
+     * 与手机侧同名函数同构 —— 复制而非共用是因为两端各自的 mesh 实例不同，
+     * 而这段逻辑很短；共用要额外导出，收益不抵那点间接层。
+     */
+    function relayPeers() {
+        if (!mesh) return [];
+        return mesh.onlinePeers()
+            .filter((p) => (p.capabilities ?? []).includes(RELAY_ADVERTISED))
+            .map((p) => ({
+                deviceId: p.deviceId,
+                name: p.name,
+                capabilities: p.capabilities,
+                conn: p.conn ?? mesh.connectionTo?.(p.deviceId),
+            }));
+    }
 
     /**
      * 把请求转给**任意一台**宣告了模型转发能力的设备。
@@ -429,6 +482,34 @@ function apply(ctx, config = {}) {
                 throw e;
             }
             return executeLocally({ llm }, emit, args, meta);
+        });
+        // 跨端取模型列表（手机侧连上后预取一次，缓存成本地快照）。
+        //
+        // ⚠️ provider 列表在这里**顺带**带上，不另设方法：它就是本机的
+        //    listProviders()，与 models 同源，分成两个方法只会多一次往返。
+        //
+        // 每个 provider 的 listModels 单独容错：某个 provider 没配好（缺 key、
+        // 登录态过期）不该让整个列表失败 —— 那会让「桌面的模型全都看不到」，
+        // 而实际只是少了一个。
+        conn.handle(LIST_METHOD, async ({ provider } = {}) => {
+            const llm = ctx.get('llm');
+            if (!llm) {
+                const e = new Error('本机没有 llm 服务，无法提供模型列表。');
+                e.code = 'NO_LOCAL_LLM';
+                throw e;
+            }
+            const providers = safeProviders(llm);
+            if (provider) {
+                return { providers, models: await safeModels(llm, provider) };
+            }
+            // 不指定 provider：把所有 provider 的模型一次性取回来（并发）。
+            // 手机侧只需要一个快照；分批取反而多次往返。
+            const models = {};
+            await Promise.all(providers.map(async (p) => {
+                const list = await safeModels(llm, p);
+                if (list.length) models[p] = list;
+            }));
+            return { providers, models };
         });
         conn.handle('computer.status', async () => {
             const w = await loadWin32();
@@ -670,9 +751,9 @@ function apply(ctx, config = {}) {
             },
             // 宣告 llm.relay：让对端知道这台机器能代为执行模型调用。
             // 但**只有本机真的挂了 llm 服务**才宣告 —— 对端据此决定要不要开转发。
-            // 走 advertisedMethods() 而不是在这里再写一遍表达式：两处各写一份时，
+            // 走 advertisedMethods(ctx) 而不是在这里再写一遍表达式：两处各写一份时，
             // 一处改了另一处漏改就会「别人连我时可用、我连别人时不可用」。
-            methods: advertisedMethods(),
+            methods: advertisedMethods(ctx),
             log,
             onConnection(conn) {
                 state.conn = conn;
@@ -714,6 +795,14 @@ function apply(ctx, config = {}) {
         return {
             running: Boolean(state.server),
             port: state.server?.port ?? null,
+            // 组网状态并进 status 而不单独查：界面本来就要刷新 status，
+            // 多一个端点就多一处可能不同步。
+            //
+            // available=false 表示「没随安装包带上那个动态库」。**这不等于
+            // 组网不可用** —— 手机连进来依然能通过 mesh 直连，只是异地时
+            // 需要用户自己装 EasyTier。所以界面必须把它显示成「可选」，
+            // 不能显示成「出错」。
+            easytier: easytierStatus(),
             code: state.code && Date.now() <= state.codeExpiresAt ? state.code : null,
             codeExpiresInSeconds: state.code ? Math.max(0, Math.round((state.codeExpiresAt - Date.now()) / 1000)) : 0,
             addresses: lanAddresses().list,
@@ -800,12 +889,103 @@ function apply(ctx, config = {}) {
         };
     }
 
+    /**
+ * 组网状态（供 /status 与诊断页用）。
+ *
+ * ⚠️ available=false 时**不要**当成错误：手机连进来照样能用 mesh 直连，
+ *    异地场景才需要组网。而它 unavailable 的常见原因是「那个动态库没随安装包
+ *    带上」或「系统缺 WinPcap」—— 都是可解释的正常状态，不是故障。
+ */
+function easytierStatus() {
+        try {
+            const s = et.status(pluginRoot());
+            return {
+                available: !!s.available,
+                running: !!s.running,
+                dll: s.dll,
+                peers: s.peers ?? [],
+                // 加载失败的具体原因（缺依赖 vs 符号对不上）—— 两者处置完全不同。
+                error: s.error ?? null,
+                // 缺依赖时的说明：让用户知道该去装什么，而不是看到一个英文报错。
+                hint: !s.available
+                    ? '未随安装包提供该动态库，或系统缺少它的依赖（WinPcap/Npcap）。' +
+                      '不影响直连；只有手机与本机不在同一网络时才需要它。'
+                    : null,
+            };
+        } catch (e) {
+            return { available: false, running: false, error: e.message, hint: null, peers: [] };
+        }
+    }
+
+    /** 插件根目录（用于定位 dll）。 */
+    function pluginRoot() {
+        try {
+            return path.dirname(path.dirname(new URL(import.meta.url).pathname));
+        } catch {
+            return undefined;
+        }
+    }
+
+    /**
+     * 启动组网。
+     *
+     * 校验放在这里而不是让 EasyTier 库报错：`network_name` 两端不一致、
+     * 虚拟 IP 填错，这两种情况库只会说「连接失败」，用户完全无从知道
+     * 自己是哪一端填错了。
+     */
+    function opEasyTierStart(body = {}) {
+        const networkName = String(body.networkName || OVERLAY_NETWORK_NAME).trim();
+        const networkSecret = String(body.networkSecret || OVERLAY_NETWORK_SECRET);
+        const peerUri = String(body.peerUri || '').trim();
+        const bindPort = Number(body.bindPort) || 45731;
+        const dstAddr = String(body.dstAddr || '').trim();
+
+        if (!networkName) throw new Error('请填网络名（与手机侧必须一致）。');
+        if (!dstAddr) {
+            throw new Error(
+                '请填手机的虚拟 IP 与端口（如 10.144.0.3:45731）。' +
+                '端口转发要指向它 —— 少了这一项就没有转发规则，组网起来了也连不上。',
+            );
+        }
+        // 粗校验形状即可：真正的解析由库的 parse_config 负责，
+        // 这里只挡「明显不是地址」这种低级失误，省得用户等一次失败才看到。
+        if (!/^\S+:\d+$/.test(dstAddr)) {
+            throw new Error(`「${dstAddr}」不像地址，应为 主机:端口（如 10.144.0.3:45731）。`);
+        }
+        if (peerUri && !/^(tcp|udp|ws|wss|quic):\/\//.test(peerUri)) {
+            throw new Error(`「${peerUri}」缺少协议前缀，应形如 tcp://1.2.3.4:11010。`);
+        }
+
+        const r = et.start({ networkName, networkSecret, peerUri, bindPort, dstAddr });
+        if (!r.ok) throw new Error(r.error);
+        return {
+            ...easytierStatus(),
+            // 回显实际生效的配置：网络名/IP 填错时，用户能靠它与手机侧对照。
+            config: {
+                networkName, bindPort, dstAddr,
+                peerUri: peerUri || null,
+                // 密钥不外传 —— 它是组网网络的通行口令。
+                networkSecret: '（已设置）',
+            },
+            note: '已启动。手机侧选「经内嵌组网」并填相同的网络名与本机地址即可。',
+        };
+    }
+
+    /** 停止组网。 */
+    function opEasyTierStop() {
+        et.stop();
+        return { ...easytierStatus(), note: '已停止。' };
+    }
+
     // GUI 用的 HTTP 路由（挂在已鉴权的 Connection 上，见 routes.js 的说明）。
     registerRoutes(ctx, {
         status: () => opStatus(),
         start: (body) => opStart(body ?? {}),
         stop: () => opStop(),
         code: () => opCode(),
+        easytierStatus: () => opEasyTierStatus(),
+        easytierStart: (body) => opEasyTierStart(body ?? {}),
+        easytierStop: () => opEasyTierStop(),
     });
 
     defineAndRegister();
@@ -836,6 +1016,51 @@ function apply(ctx, config = {}) {
                 description: '停止远程联动服务并断开已配对设备。',
                 parameters: {},
                 async execute() { return opStop(); },
+            },
+            // ── 异地组网 ────────────────────────────────────────────────────────
+            {
+                name: 'link_easytier_status',
+                description:
+                    '查看内嵌组网的状态：动态库是否可用、是否在跑、连上了哪些设备。\n' +
+                    '手机与本机不在同一网络时用它建 overlay 隧道，省得用户自己装 EasyTier 并手填端口转发。',
+                parameters: {},
+                async execute() { return easytierStatus(); },
+            },
+            {
+                name: 'link_easytier_start',
+                description:
+                    '启动内嵌组网，让异地也能连上。启动后把手机侧「连接方式」选成' +
+                    '「经内嵌组网」，填相同的网络名与本机地址即可。\n' +
+                    '不需要 VPN 权限、不需要前台服务、不影响本机其它 App 的网络。',
+                parameters: {
+                    networkName: {
+                        type: 'string',
+                        description: '网络名，两端必须一致（默认 dsh）。',
+                    },
+                    networkSecret: {
+                        type: 'string',
+                        description: '网络密钥，两端必须一致（默认 dsh-link-overlay）。',
+                    },
+                    peerUri: {
+                        type: 'string',
+                        description: '手机的组网地址，形如 tcp://1.2.3.4:11010。留空则等手机来连。',
+                    },
+                    bindPort: {
+                        type: 'number',
+                        description: '本机转发监听端口，默认 45731（与联动端口一致）。',
+                    },
+                    dstAddr: {
+                        type: 'string',
+                        description: '手机虚拟 IP 与端口，如 10.144.0.3:45731。**必填** —— 端口转发要指向它。',
+                    },
+                },
+                async execute(args) { return opEasyTierStart(args ?? {}); },
+            },
+            {
+                name: 'link_easytier_stop',
+                description: '停止内嵌组网（不影响直连与已连设备）。',
+                parameters: {},
+                async execute() { return opEasyTierStop(); },
             },
             // ── 操作手机 ────────────────────────────────────────────────────────
             {
@@ -1083,7 +1308,7 @@ function apply(ctx, config = {}) {
                             deviceId: identity?.deviceId,
                             kind: 'desktop',
                         },
-                        methods: advertisedMethods(),
+                        methods: advertisedMethods(ctx),
                         log,
                     });
                     const peerId = conn.peer?.deviceId;

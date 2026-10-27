@@ -47,6 +47,37 @@ export const RELAY_POLICY = {
 export const RELAY_METHOD = 'llm.relay';
 
 /**
+ * 跨端取模型列表的方法名。
+ *
+ * ── 为什么需要它（listProviders 是同步的，跨端做不到）───────────────────────
+ * 直觉上「共享模型列表」= 把 `llm.listProviders()` 转发过去就行，但**它做不到**：
+ *
+ *   dsh-llm/lib/index.js：
+ *     listProviders() {
+ *       return [...this.adapters.values()].map(…)   // ← 同步，只读**本机内存**
+ *     }
+ *
+ * 它是同步函数、只返回本机已注册的 adapter，不发任何请求，也就**无从得知对端
+ * 有什么**。要让手机看到桌面的 provider，本质上需要一次 IPC —— 而同步函数
+ * 等不了。
+ *
+ * `listModels(provider)` 是 async（`await this.registration(provider).adapter
+ * .listModels(provider)`），会真的去问 API，所以它**可以**跨端转发。
+ *
+ * 于是分工是：
+ *   · provider 列表  → 桌面在**应答时**顺带带上（一次往返，不额外请求）
+ *   · model 列表     → 按需转发 llm.listModels
+ *   · 手机侧         → 连上后异步预取一次，缓存成本地快照
+ *
+ * 用户展开下拉时读的是本地缓存，不产生额外往返 —— 否则每展开一次都要等
+ * 一次网络请求，明显卡顿。
+ */
+export const LIST_METHOD = 'llm.list';
+
+/** 宣告的方法名（与转发能力一起宣告）。 */
+export const LIST_ADVERTISED = LIST_METHOD;
+
+/**
  * 服务方在握手里**宣告**的方法名。
  *
  * 为什么单独列：`methods` 列表是给对端做能力发现的（peerMethods）。转发能力
@@ -82,6 +113,49 @@ export const REMOTE_PROVIDER_LABEL = '经另一台设备调用';
 
 /** 单次请求的分块转发用的分片 ID 前缀（诊断用）。 */
 export const RELAY_TRACE_PREFIX = 'llm-relay';
+
+/**
+ * 取本机 provider 名列表（跨端应答 llm.list 用）。
+ *
+ * ⚠️ 只回**名字**，不回配置或凭据 —— 对端拿到的是「这台机器有哪几个 provider」，
+ *   而不是「怎么登录它们」。凭据留在本机，与 llm.relay 的原则一致。
+ *
+ * @param {object} llm 本机 llm 服务。
+ * @returns {string[]} provider 名列表。
+ */
+export function safeProviders(llm) {
+    try {
+        return llm.listProviders().map((p) => p?.id ?? p?.name ?? String(p));
+    } catch (e) {
+        // listProviders 是同步读内存，理论上不会失败；真失败也不该让整个应答崩。
+        return [];
+    }
+}
+
+/**
+ * 取某个 provider 的模型列表，失败时返回空数组。
+ *
+ * ⚠️ **必须容错**：某个 provider 没配好（缺 key、登录态过期）时 listModels 会
+ *   抛错。让它冒泡出去的结果是「对方的模型一个都看不到」—— 而实际只是少了
+ *   一个 provider。前者让人以为功能坏了，后者才是真相。
+ *
+ * @param {object} llm 本机 llm 服务。
+ * @param {string} provider provider 名。
+ * @returns {Promise<Array<{id: string, name: string}>>}
+ */
+export async function safeModels(llm, provider) {
+    try {
+        const list = await llm.listModels(provider);
+        if (!Array.isArray(list)) return [];
+        // 只保留渲染需要的字段：完整对象可能含配置或凭据相关的字段，
+        // 跨端传没必要也不该传。
+        return list.map((m) =>
+            typeof m === 'string' ? { id: m, name: m } : { id: m?.id, name: m?.name ?? m?.id },
+        );
+    } catch {
+        return [];
+    }
+}
 
 /**
  * 把请求转发到对端，并把对端产生的 chunk 逐块交回本地消费方。

@@ -349,6 +349,52 @@ window.__ModuleLoader__.load({
           : null,
       ));
 
+      // ── 异地组网 ────────────────────────────────────────────────────────
+      //
+      // ⚠️ 这一块刻意放在「服务」之后、「配对码」之前：用户的心智顺序是
+      //    「先有个服务 → 异地也能连上 → 配对」，而不是「配对 → 配对 → 突然
+      //    要装什么东西」。
+      //
+      // available=false 时**不显示成错误**：手机照样能通过直连或 mesh 连进来，
+      // 组网只是异地方案。而它不可用的常见原因是「动态库没随安装包带上」，
+      // 那是我们的问题，写成红色报错只会让用户以为整个功能坏了。
+      var et = snap.easytier || {};
+      if (et.available) {
+        nodes.push(h('div', { key: 'et', style: cardStyle },
+          h('div', { style: rowStyle },
+            h('span', { style: labelStyle }, '异地组网'),
+            h('span', null, et.running ? '已启动' : '未启动'),
+            h('span', { style: { flex: 1 } }),
+            et.running
+              ? h(Btn, { variant: 'outline', disabled: st.busy === 'etStop', onClick: function () { act('etStop', '/easytier/stop', 'POST'); } }, '停止')
+              : h(Btn, { variant: 'primary', disabled: st.busy === 'etStart', onClick: function () { act('etStart', '/easytier/start', 'POST'); } }, '启动'),
+          ),
+          h('p', { style: hintStyle },
+            '手机与本机不在同一网络时用它连上。不用另装 App、不需要 VPN 权限，' +
+            '也不影响本机其它 App 的网络。'),
+          et.running && et.peers && et.peers.length
+            ? h('div', { key: 'p' }, [
+              h('div', { key: 'l', style: labelStyle }, '已连设备'),
+              h('div', { key: 'r' }, et.peers.map(function (p, i) {
+                return h('div', { key: i, style: monoStyle, margin: '4px 0' },
+                  p.name + (p.ipv4 ? '  ·  ' + p.ipv4 : ''));
+              })),
+            ])
+            : null,
+        ));
+      } else {
+        nodes.push(h('div', { key: 'etOff', style: cardStyle },
+          h('div', { style: rowStyle },
+            h('span', { style: labelStyle }, '异地组网'),
+            h('span', null, '当前版本未提供'),
+          ),
+          h('p', { style: hintStyle },
+            '手机与本机在同一网络（或已用其它组网工具）时不需要它，' +
+            '不影响直连与已配对设备。'),
+          et.hint ? h('p', { key: 'hn', style: hintStyle }, et.hint) : null,
+        ));
+      }
+
       // ── 配对码 ──────────────────────────────────────────────────────────
       if (running) {
         var codeNodes = [];

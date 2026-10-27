@@ -93,6 +93,13 @@ export function registerRoutes(ctx, spec) {
         // mesh：已配对设备清单与拓扑切换（仅手机侧提供）。
         ['/devices', 'GET', spec.devices],
         ['/topology', 'POST', spec.topology],
+        // 内嵌组网（仅桌面侧提供）。
+        // ⚠️ spec 的键名是驼峰（easytierStatus/Start/Stop），路径是小写连字符 ——
+        //    两处必须一起改。踩过：先在调用侧按路径命名、这里没注册，
+        //    界面点「启动组网」得到 404，而没有任何报错指向命名不符。
+        ['/easytier/status', 'GET', spec.easytierStatus],
+        ['/easytier/start', 'POST', spec.easytierStart],
+        ['/easytier/stop', 'POST', spec.easytierStop],
     ];
     for (const [suffix, method, fn] of routes) {
         if (typeof fn !== 'function') continue;
