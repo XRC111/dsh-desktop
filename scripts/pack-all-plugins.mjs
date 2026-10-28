@@ -31,6 +31,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { reapplyLocalPatches } from './lib/local-patches.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
@@ -148,6 +149,9 @@ function writeMark(pkgFile, raw, version, hash) {
 
 console.log(`[pack-all] 白名单 ${targets.length} 个：${targets.map((p) => p.name).join('、')}${DRY ? '（dry-run）' : ''}`);
 
+// 补丁重放抽在 scripts/lib/local-patches.mjs 里：它只在非 dry-run 的 upstream
+// 分支才跑得到，藏在这里等于没法测。而它正是「兼容层被静默抹掉」的唯一防线。
+
 let bumped = 0;
 for (const entry of targets) {
   const name = entry.name;
@@ -183,6 +187,29 @@ for (const entry of targets) {
     // 而且 writeMark 会拿旧的 package.json 原文覆盖刚同步下来的新文件。
     raw = fs.readFileSync(pkgFile, 'utf8');
     pkg = JSON.parse(raw);
+    // upstream 刚把整个目录换成了上游版本 —— 我们对它的本地改动必须重放，
+    // 否则这一次打出来的包就是「没有兼容层」的市场。
+    const patched = reapplyLocalPatches(root, name);
+    if (patched.applied.length > 0) {
+      console.log(`  · ${name}：已重放本地补丁 ${patched.applied.join('、')}`);
+    }
+    if (patched.relaxed !== undefined && patched.relaxed.length > 0) {
+      console.log(`  · ${name}：其中 ${patched.relaxed.join('、')} 只在忽略空白差异后打上（多半是 CRLF 工作区）`);
+    }
+    if (patched.already.length > 0) {
+      console.log(`  · ${name}：补丁已在（${patched.already.join('、')}）`);
+    }
+    for (const failure of patched.failed) {
+      // 不能警告了事：补丁打不上意味着这次产出的是「没有兼容层」的市场，
+      // 发出去之后症状是旧插件全被标成不兼容，而且看不出原因。
+      console.error(`  ✗ ${name}：本地补丁 ${failure.file} 打不上`);
+      console.error(failure.output);
+      console.error('  多半是上游改动了补丁涉及的行。需要人工把改动重做到新版本上，');
+      console.error('  再重新生成补丁（git diff > ' + path.join('scripts/patches', failure.file) + '）。');
+      process.exitCode = 1;
+    }
+    // 补丁改动的是代码内容，内容哈希必须重算 —— 否则版本号判据看到的是
+    // 「覆盖后、打补丁前」的哈希，会误判成内容未变而不升版本。
     hash = contentHash(dir);
     known = pkg.dshDesktopBuild;
     changed = known !== hash;

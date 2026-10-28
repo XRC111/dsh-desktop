@@ -12,6 +12,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { compareSemver, isSemver, satisfiesRange } from './check.js';
 import { classifyPeer, crossesImplicitCeiling } from './compatibility.js';
+import { crossesLine } from './legacy-compat.js';
 import { marketFetch } from './net.js';
 const CACHE_SCHEMA = 'dsh-market/discovery-compatibility-cache/v1';
 const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -89,10 +90,27 @@ function rangeResult(hostVersion, declared) {
  */
 function declarationResult(declaration, hostVersion) {
     const satisfied = rangeResult(hostVersion, declaration.range);
+    if (satisfied === true)
+        return true;
+    // ── 旧插件兼容层 ────────────────────────────────────────────────────────
+    // 跨了版本线（`^0.1.x` 声明遇上 0.2.x 宿主）不再直接判死，而是给 null。
+    // null 在 deriveHostCompatibility 里会落成 status 'unknown' —— 也就是
+    // 「市场不知道，但不拦」。
+    //
+    // 为什么是「不知道」而不是「兼容」：这一层拿到的只有 npm manifest，
+    // 没有插件源码。替用户断言「能跑」是编的；断言「不能跑」又把大量实际
+    // 能跑的插件挡在外面。诚实的第三种状态只有一个。
+    //
+    // 真正的判定在外壳：插件落位后有源码，逐 import 核对包与符号，
+    // 跑不了的会被禁用并给出原因（见 dsh-desktop 的 legacy-compat）。
+    //
+    // engine 也走这条路：0.2 之前写的插件普遍只声明 `engines.dsh: "^0.1.5"`，
+    // 那是同一个跨线问题，没道理只放行 peer 那一半。
+    if (crossesImplicitCeiling(hostVersion, declaration.range)) {
+        return crossesLine(hostVersion, declaration.range) ? null : false;
+    }
     if (declaration.kind === 'engine' || satisfied !== false)
         return satisfied;
-    if (crossesImplicitCeiling(hostVersion, declaration.range))
-        return false;
     const verdict = classifyPeer('discovery', declaration.package ?? '@deepseek-ai/dsh', declaration.range, hostVersion, false);
     if (verdict.kind === 'risk')
         return false;

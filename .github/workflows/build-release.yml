@@ -265,7 +265,17 @@ jobs:
           $scripts = @(
             'verify-safe-mode',
             'verify-view-layout',
-            'verify-updater-picks'
+            'verify-updater-picks',
+            # 兼容层是**改在 vendored 的 dshmarket 里**的，同步上游会整目录覆盖。
+            # 没有这道检查，覆盖后没有任何报错，只是市场又开始把旧插件标成不兼容 ——
+            # 属于「静默失效」，正是这一步该拦的。
+            'check-dshmarket-compat',
+            # 上面那道只保证「代码还在」，这两道保证「代码还是那个意思」：
+            # 补丁能重放不代表语义没被改坏，而判错的方向（宽/严）后果都很糟；
+            # local-patches 则是覆盖补丁重放本身 —— 它的失败方式是「以为补丁
+            # 已在」然后什么都不做，日志还会写「补丁已在」。
+            'dshmarket-legacy-compat.test',
+            'local-patches.test'
           )
           $failed = @()
           foreach ($s in $scripts) {

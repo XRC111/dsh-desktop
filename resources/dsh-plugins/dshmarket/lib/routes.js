@@ -38,6 +38,7 @@ import { asRegion, githubProxyManaged, normalizeGithubProxy, REGIONS, routesFor,
 import { resolveRegion } from './region-probe.js';
 import { acceleratedTarget, resolveHeadCommit } from './accelerate.js';
 import { updateNotesFor } from './changelog.js';
+import { exemptionsFor as legacyExemptionsFor, mergeExemptions as mergeLegacyExemptions, parseExactTarget as legacyParseTarget } from './legacy-compat.js';
 import { checkUpdates, compareVersions, fetchNpmLatest, invalidateUpdates, resolveGitRemoteHead, isUpgrade, latestPublishedRecently, setUpdateRegistry, versionOnChannel } from './updates.js';
 import { createThemeManager } from './themes.js';
 import { readJsonBody, sameOrigin, sendJson } from './http.js';
@@ -736,8 +737,69 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
             logEvent('warn', 'hot-sweep', `${name}: package removed outside the market — live mount dropped`);
         }
     }
+    /**
+     * 安装前为「只适配旧版」的插件写精确豁免。
+     *
+     * ── 为什么必须在安装**之前** ───────────────────────────────────────────
+     * dsh 的 gate 在 pnpm 动手之前就跑：解析 named spec 的 manifest、比对
+     * engines/peer，不满足直接 `installation rejected` 退出，**一个包都不装**。
+     * 所以豁免必须先落盘，事后补救没有意义。
+     *
+     * ── 为什么只写「精确 name@version」 ─────────────────────────────────────
+     * dsh 的 readProfileCompatibility 只认精确键与精确版本；写区间会被判非法
+     * 并整条丢弃（还会在 stderr 留 warning）。这也是我们只处理
+     * `pkg@1.2.3` 这种精确 target 的原因：range、git、本地路径都拿不到
+     * 「用户最终会装到哪个版本」，写不出有意义的豁免。
+     *
+     * ── 失败为什么静默 ─────────────────────────────────────────────────────
+     * 网络拿不到 manifest 时，最坏结果是「和没有兼容层一样」—— dsh 照常拒绝，
+     * 用户看到原始报错。绝不能因为兼容层自己出错就阻断一次正常安装。
+     */
+    async function preauthorizeLegacy(targets) {
+        const hostVersion = dshHostInfo()?.version ?? null;
+        if (hostVersion === null) return;
+        // 目标解析放在 legacy-compat.js 里：那是唯一被测试覆盖到的地方。
+        // 写在这里的话，判错的表现是「一条豁免都没写」—— 不报错、不告警，
+        // 用户仍然看到原来那句 incompatible，没有任何线索指向这里。
+        const specs = targets.map(legacyParseTarget).filter((spec) => spec !== null);
+        if (specs.length === 0) return;
+        const provisions = {};
+        for (const { name, version } of specs) {
+            try {
+                const facts = await discoveryManifests.lookupVersion(name, version, routesFor(region).npmRegistry);
+                if (facts === null || facts === undefined) continue;
+                const manifestLike = {
+                    name,
+                    version: facts.version ?? version,
+                    engines: typeof facts.enginesDsh === 'string' ? { dsh: facts.enginesDsh } : undefined,
+                    peerDependencies: facts.peerDependencies,
+                };
+                Object.assign(provisions, legacyExemptionsFor(manifestLike, hostVersion));
+            }
+            catch { /* 拿不到 manifest 就跳过，不阻断安装 */ }
+        }
+        if (Object.keys(provisions).length === 0) return;
+        try {
+            const result = mergeLegacyExemptions(activeProfileDir, provisions);
+            if (result.written) {
+                logEvent('info', 'install', `legacy-compat: ${result.added.join('、')} 的声明停在旧版本线，已写入 DSH ${hostVersion} 的精确豁免`);
+            } else if (result.reason === 'unreadable') {
+                logEvent('warn', 'install', 'legacy-compat: compatibility.json 读不动，跳过自动豁免（不覆盖用户手写的授权）');
+            }
+        }
+        catch (error) {
+            logEvent('warn', 'install', `legacy-compat: 写豁免失败：${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
     /** Every plugin command goes through the pnpm-drift recovery wrapper (#20). */
-    const runPlugin = (profile, args) => withHoistRecovery(commands.runPlugin, profile, args, activeProfileDir, { marketFlags });
+    const runPlugin = async (profile, args) => {
+        // 只在 add 上做：remove / install 不引入新包，没有要豁免的对象。
+        if (Array.isArray(args) && args.includes('add')) {
+            const targets = args.slice(args.indexOf('add') + 1).filter((arg) => typeof arg === 'string' && !arg.startsWith('-'));
+            await preauthorizeLegacy(targets);
+        }
+        return withHoistRecovery(commands.runPlugin, profile, args, activeProfileDir, { marketFlags });
+    };
     /** The same, minus the release-age bypass: for a fresh install pinned to a young release (#594). */
     const runPluginKeepingReleaseAge = (profile, args) => withHoistRecovery(commands.runPlugin, profile, args, activeProfileDir, { releaseAgeBypass: false, marketFlags });
     /**
