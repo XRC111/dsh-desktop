@@ -1,16 +1,30 @@
 diff --git a/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js b/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js
-index 4d8d45c..42a401e 100644
+index 4d8d45c..5514bf4 100644
 --- a/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js
 +++ b/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js
-@@ -12,6 +12,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+@@ -11,7 +11,8 @@
+ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
  import { dirname } from 'node:path';
  import { compareSemver, isSemver, satisfiesRange } from './check.js';
- import { classifyPeer, crossesImplicitCeiling } from './compatibility.js';
+-import { classifyPeer, crossesImplicitCeiling } from './compatibility.js';
++import { classifyPeer } from './compatibility.js';
 +import { crossesLine } from './legacy-compat.js';
  import { marketFetch } from './net.js';
  const CACHE_SCHEMA = 'dsh-market/discovery-compatibility-cache/v1';
  const DEFAULT_TTL_MS = 24 * 60 * 60 * 1000;
-@@ -89,10 +90,27 @@ function rangeResult(hostVersion, declared) {
+@@ -80,19 +81,44 @@ function rangeResult(hostVersion, declared) {
+  * policy: below-min and explicit upper/exact violations are definite; a
+  * newer host above an implicit caret/tilde ceiling remains compatible.
+  *
+- * One case is carved out of that leniency: a host that has crossed the
+- * implicit ceiling outright rather than merely straddling the prerelease gate
+- * is a release line the author has left behind, and dsh's own gate refuses the
+- * release for exactly that reason (#756 shape). Reporting it compatible is how
+- * one install produces two contradicting verdicts — the market's, then the
+- * gate's "installation rejected". See {@link crossesImplicitCeiling}.
++ * ⚠️ 上面这段是上游原本的说明，描述的是「caret/tilde ceiling」那一版判据。
++ *    本地兼容层把它换成了 crossesLine（见下），保留原文是为了让以后同步上游
++ *    时能一眼看出这里被改过、改的是什么。
   */
  function declarationResult(declaration, hostVersion) {
      const satisfied = rangeResult(hostVersion, declaration.range);
@@ -28,10 +42,21 @@ index 4d8d45c..42a401e 100644
 +    // 真正的判定在外壳：插件落位后有源码，逐 import 核对包与符号，
 +    // 跑不了的会被禁用并给出原因（见 dsh-desktop 的 legacy-compat）。
 +    //
++    // ── 为什么判断条件从 crossesImplicitCeiling 换成「gate 会拒」──────────
++    // 前者只从 `^` / `~` 里提版本线，还显式排除了 `^0.0.x`（认为它「没点名
++    // 任何一条 minor 线」）。这等于把兼容范围钉死在 0.1.x 起：
++    // `>=0.0.1 <0.1.0`、`<=0.1.9`、`0.1.x`、`^0.0.5` 一条都不含 caret/tilde，
++    // 于是绕过这里、在下面被判成 definite false。而它们和 `^0.1.5` 是同一类
++    // 问题 —— 声明的是过去，宿主在现在。
++    //
++    // 现在的判据交给 crossesLine：只要宿主不满足，且某条 `||` 分支的下界不高于
++    // 宿主（= 这条声明本来就是写给更早版本的），就判「未知」。要求更高版本的
++    // （下界 > 宿主）照旧判不兼容 —— 那是宿主缺 API，兼容层解决不了。
++    //
 +    // engine 也走这条路：0.2 之前写的插件普遍只声明 `engines.dsh: "^0.1.5"`，
 +    // 那是同一个跨线问题，没道理只放行 peer 那一半。
-+    if (crossesImplicitCeiling(hostVersion, declaration.range)) {
-+        return crossesLine(hostVersion, declaration.range) ? null : false;
++    if (crossesLine(hostVersion, declaration.range)) {
++        return null;
 +    }
      if (declaration.kind === 'engine' || satisfied !== false)
          return satisfied;
@@ -42,10 +67,10 @@ index 4d8d45c..42a401e 100644
          return false;
 diff --git a/resources/dsh-plugins/dshmarket/lib/legacy-compat.js b/resources/dsh-plugins/dshmarket/lib/legacy-compat.js
 new file mode 100644
-index 0000000..3a7f0ab
+index 0000000..e0eb548
 --- /dev/null
 +++ b/resources/dsh-plugins/dshmarket/lib/legacy-compat.js
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,309 @@
 +/**
 + * 旧插件兼容层 —— dsh-market 侧接入。
 + *
@@ -85,63 +110,125 @@ index 0000000..3a7f0ab
 +import { readFileSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
 +import { join } from 'node:path';
 +
++import { compareSemver, isSemver, satisfiesRange } from './check.js';
++
 +/** dsh 认的豁免文件名（见 @deepseek-ai/dsh-app-boot 的 PROFILE_COMPATIBILITY_FILENAME）。 */
 +export const COMPATIBILITY_FILENAME = 'compatibility.json';
 +
-+/** 兼容层仅覆盖 0.1.x 起的插件；更早的（0.0.x）不在承诺范围内。 */
-+const MIN_LINE = [0, 1];
++/** 一个 `||` 分支里能被当作「下界」的操作符。 */
++const FLOOR_OPS = new Set(['', '^', '~', '>=', '>']);
 +
 +/**
-+ * 从区间里取出它声明的版本线（`major.minor` 数组）。
-+ * 只看 `^` / `~` —— `>=0.1.0 <0.3.0` 这种宽区间本来就不会被判不兼容。
++ * 把 `0.1.x` / `0.1.*` 这类通配写法展开成下界（`0.1.0`）。
++ * 展开不了就返回 null —— 宁可不算这一项，也不能猜。
 + *
-+ * @param {string} range
-+ * @returns {Array<[number, number]>}
++ * @param {string} raw
++ * @returns {string|null}
 + */
-+function declaredLines(range) {
-+    const lines = [];
-+    if (typeof range !== 'string') return lines;
-+    for (const alternative of range.split('||')) {
-+        for (const raw of alternative.trim().split(/\s+/).filter(Boolean)) {
-+            const m = /^(\^|~)\s*(\d+)\.(\d+)\./.exec(raw);
-+            if (m !== null) {
-+                const line = [Number(m[2]), Number(m[3])];
-+                if (!lines.some((x) => x[0] === line[0] && x[1] === line[1])) lines.push(line);
-+            }
-+        }
-+    }
-+    return lines;
-+}
-+
-+/** 宿主所在的版本线。 */
-+function hostLine(hostVersion) {
-+    const m = /^(\d+)\.(\d+)\./.exec(String(hostVersion ?? ''));
++function expandFloor(raw) {
++    const m = /^(\d+)(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?(?:-([0-9A-Za-z.-]+))?/.exec(raw);
 +    if (m === null) return null;
-+    return [Number(m[1]), Number(m[2])];
++    const seg = (value) => (value === undefined || /^[xX*]$/.test(value) ? 0 : Number(value));
++    const patch = seg(m[3]);
++    const minor = seg(m[2]);
++    const major = Number(m[1]);
++    // 通配出现的位置之后一律归零：`0.1.x` → `0.1.0`，`0.x` → `0.0.0`。
++    const pre = m[4] === undefined ? '' : `-${m[4]}`;
++    return `${major}.${minor}.${patch}${pre}`;
 +}
 +
-+/** a 严格早于 b。 */
-+const before = (a, b) => a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]);
-+const atLeast = (a, b) => !before(a, b);
++/**
++ * 一个 `||` 分支接受的最早版本。
++ *
++ * 只取**下界**型比较器（`^` `~` `>=` `>` 与裸版本），取其中最大的一个 ——
++ * 分支内部是「与」关系，下界就是最紧的那条。`<` / `<=` 不构成下界，
++ * 所以 `<0.1.0` 这种会得到 `0.0.0`，符合「它在要一个旧版本」的事实。
++ *
++ * @param {string} alternative
++ * @returns {string|null} null 表示这一支里有看不懂的写法
++ */
++function floorOf(alternative) {
++    let floor = '0.0.0';
++    for (const part of alternative.trim().split(/\s+/).filter(Boolean)) {
++        const m = /^(\^|~|>=|>|<=|<|=)?\s*(.+)$/.exec(part);
++        if (m === null) return null;
++        const op = m[1] ?? '';
++        if (!FLOOR_OPS.has(op)) continue; // `<` `<=` `=` 不提供下界
++        const expanded = expandFloor(m[2].trim());
++        if (expanded === null) return null;
++        if (compareSemver(expanded, floor) > 0) floor = expanded;
++    }
++    return floor;
++}
++
++/**
++ * 取版本所在的版本线（`major.minor`）。
++ * @param {string} version
++ * @returns {[number, number]|null}
++ */
++function lineOf(version) {
++    const m = /^(\d+)\.(\d+)\./.exec(version);
++    return m === null ? null : [Number(m[1]), Number(m[2])];
++}
++
++/** a 严格早于 b（按版本线比）。 */
++function earlierLine(a, b) {
++    return a !== null && b !== null && (a[0] < b[0] || (a[0] === b[0] && a[1] < b[1]));
++}
 +
 +/**
 + * 这条声明是否属于「跨了版本线、但可能仍能跑」的情形。
 + *
-+ * 判据：声明的 line 全部**早于**宿主所在线，且至少一条落在 0.1.x 及以后。
-+ * 与上游 `crossesImplicitCeiling` 的方向一致，但把「更老的线」也算进来 ——
-+ * 用户的插件可能还停在 0.1.2。
++ * ── 判据（全版本通用，不写死任何一条线）──────────────────────────────────
++ *   1. 宿主**不满足**这条声明 —— 满足的话本来就不需要兼容层；
++ *   2. 且这条声明的某一条 `||` 分支，其**下界不高于宿主**。
++ *
++ * 第 2 条用来区分两个方向：下界 ≤ 宿主 = 这是给旧版本写的声明（兼容层该管）；
++ * 下界 > 宿主 = 插件要求的是**更新的** dsh，宿主确实没有那些 API，兼容层解决
++ * 不了，应当照旧判不兼容。
++ *
++ * ── 为什么不再只看 `^` / `~` ───────────────────────────────────────────────
++ * 旧实现只从 `^` / `~` 里提取版本线，注释里写着「`>=0.1.0 <0.3.0` 这种宽区间
++ * 本来就不会被判不兼容」。这个假设是错的：`>=0.0.1 <0.1.0`、`<=0.1.9`、
++ * `0.1.x` 都会把 0.2.x 排除在外，而它们一条都不含 `^` 或 `~`，于是市场照旧
++ * 判死，用户点不了安装。既然判据要覆盖「所有历史版本」，就不能再靠区间写法
++ * 做枚举 —— 一律交给与上游同一套 `satisfiesRange`，它才是 gate 的镜像。
 + *
 + * @param {string} hostVersion 当前 dsh 版本
 + * @param {string} range 插件声明的区间
 + * @returns {boolean}
 + */
 +export function crossesLine(hostVersion, range) {
-+    const host = hostLine(hostVersion);
-+    if (host === null) return false;
-+    const lines = declaredLines(range);
-+    if (lines.length === 0) return false;
-+    if (!lines.every((line) => before(line, host))) return false;
-+    return lines.some((line) => atLeast(line, MIN_LINE));
++    if (typeof range !== 'string' || range.trim() === '') return false;
++    // 宿主版本读不出来时不下任何结论。`satisfiesRange` 对 null 会直接抛
++    // （它内部要 trim 版本号），而这里被调用在 discovery 的每条声明上 ——
++    // 一次崩溃等于整个列表页白屏，比判错严重得多。
++    if (typeof hostVersion !== 'string' || !isSemver(hostVersion.trim())) return false;
++    const host = hostVersion.trim();
++    const hostLine = lineOf(host);
++    // 必须带 includePrerelease：dsh 的 gate 就是这么调的（见 dsh-app-boot 的
++    // plugin-compatibility）。少了它，0.2.1-rc.4 这种宿主会被自己的区间判不满足。
++    const whole = satisfiesRange(host, range, { includePrerelease: true });
++    if (whole === true) return false;
++
++    for (const alternative of range.split('||')) {
++        const one = satisfiesRange(host, alternative.trim(), { includePrerelease: true });
++        // 这一支满足 → gate 不会拒这条声明（`^0.1.5 || ^0.2.0` 就是靠它放行的）。
++        if (one === true) return false;
++        const floor = floorOf(alternative);
++        if (floor === null) continue;
++        if (one === false) {
++            // 确定不满足，可以按精确版本比。
++            if (compareSemver(floor, host) <= 0) return true;
++            continue;
++        }
++        // one === null：`check.js` 不认这种写法（`0.1.x` / `0.1.*` 通配）。
++        // 精确比较在这里**不可用** —— `0.1.x` 在 0.1.5 上明明满足，只是它
++        // 解析不了。退到版本线级别：只有下界所在线严格早于宿主线，才说明
++        // 这条声明是在要一个过去的版本。同线的一律不碰。
++        if (earlierLine(lineOf(floor), hostLine)) return true;
++    }
++    return false;
 +}
 +
 +/**

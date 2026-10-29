@@ -32,6 +32,8 @@ const MOD = path.join(ROOT, 'resources/dsh-plugins/dshmarket/lib/legacy-compat.j
 
 const { crossesLine, bridgeableDeclarations, isBridgeable, exemptionsFor, readExemptions, mergeExemptions, parseExactTarget } =
     await import(MOD);
+// 直接用上游那套 semver 复核方向 —— 它就是 dsh gate 的镜像。
+const { satisfiesRange } = await import(path.join(ROOT, 'resources/dsh-plugins/dshmarket/lib/check.js'));
 
 const HOST = '0.2.1-rc.4';
 
@@ -85,9 +87,41 @@ check('宽区间（>=0.1.0 <0.3.0）→ 不跨线', () => {
     assert.equal(crossesLine(HOST, '>=0.1.5 <0.3.0'), false);
 });
 
-check('0.0.x（比承诺范围更老）→ 不跨线', () => {
-    // 兼容层只承诺 0.1.x 起。0.0.x 的插件连 API 都对不上，不该被静默放行。
-    assert.equal(crossesLine(HOST, '^0.0.9'), false);
+check('^0.0.x 也跨线（全版本，不再有 0.1 下限）', () => {
+    // 旧实现有 `MIN_LINE = [0,1]`，把 0.0.x 排除在外，理由是「太老，连 API 都
+    // 对不上，不该静默放行」。但那等于替作者断言他用了哪些 API —— 而 0.0.1
+    // 时代就有的 ctx.effect / ctx.tools.register 今天一个都没变。真正的判断
+    // 依据只能是插件源码（外壳侧干的事），不是它写在 package.json 里的号。
+    assert.equal(crossesLine(HOST, '^0.0.9'), true);
+    assert.equal(crossesLine(HOST, '^0.0.1'), true);
+    assert.equal(crossesLine(HOST, '~0.0.5'), true);
+});
+
+check('不含 ^ / ~ 的老声明同样跨线', () => {
+    // 旧实现只从 `^` / `~` 里提版本线，注释里假设「宽区间本来就不会被判不
+    // 兼容」。这个假设是错的：下面每一条都把 0.2.1 排除在外，而它们一条都
+    // 不含 caret/tilde —— 于是市场照旧判死，用户点不了安装。
+    assert.equal(crossesLine(HOST, '>=0.0.1 <0.1.0'), true);
+    assert.equal(crossesLine(HOST, '<=0.1.9'), true);
+    assert.equal(crossesLine(HOST, '<0.1.0'), true);
+    assert.equal(crossesLine(HOST, '0.1.5'), true); // 精确钉在旧版本上
+    assert.equal(crossesLine(HOST, '>0.1.0 <0.2.0'), true);
+});
+
+check('通配形式的旧线也跨线', () => {
+    // registry 上大量 `0.1.x` / `0.x`。`satisfiesRange` 对它们返回 null（它
+    // 只认精确的目标版本），所以这条走的是 floorOf 的通配展开分支。
+    assert.equal(crossesLine(HOST, '0.1.x'), true);
+    assert.equal(crossesLine(HOST, '0.1.*'), true);
+});
+
+check('要求更高版本 → 不跨线（该升级的是 dsh，不是兼容层）', () => {
+    // 方向判定：下界高于宿主 = 插件要的是未来版本，宿主确实没有那些 API。
+    // 把它判成跨线会让用户装上一个必然跑不起来的插件。
+    assert.equal(crossesLine(HOST, '>=0.2.2'), false);
+    assert.equal(crossesLine(HOST, '>0.2.1'), false);
+    assert.equal(crossesLine(HOST, '^1.0.0'), false);
+    assert.equal(crossesLine(HOST, '>=0.3.0 <0.4.0'), false);
 });
 
 check('区间里只要有一条落在宿主线或更高 → 不跨线', () => {
@@ -95,9 +129,47 @@ check('区间里只要有一条落在宿主线或更高 → 不跨线', () => {
     assert.equal(crossesLine(HOST, '^0.1.5 || ^0.2.0'), false);
 });
 
+check('判据不写死任何一条线：宿主升到 0.3 / 1.0 时同样成立', () => {
+    // 「全版本」的另一个方向是未来。只要插件声明的是更早的线，结论就一样 ——
+    // 实现里没有任何 `0.1` / `0.2` 的字面量，这条断言就是钉住这一点。
+    assert.equal(crossesLine('0.3.0-rc.1', '^0.2.0'), true);
+    assert.equal(crossesLine('0.3.0-rc.1', '^0.1.5'), true);
+    assert.equal(crossesLine('1.0.0', '^0.2.0'), true);
+    assert.equal(crossesLine('0.3.0-rc.1', '^0.3.0'), false);
+    assert.equal(crossesLine('0.3.0-rc.1', '^0.4.0'), false);
+});
+
 check('无法解析的宿主版本 → 一律不跨线（保守）', () => {
     assert.equal(crossesLine('not-a-version', '^0.1.5'), false);
     assert.equal(crossesLine(null, '^0.1.5'), false);
+});
+
+check('判跨线的声明，一定是 gate 会拒的（否则等于凭空绕过一次 gate）', () => {
+    // 这是整件事的安全底线：市场判「跨线」→ 安装前写豁免 → gate 放行。
+    // 如果那条声明其实是满足的，这一步就是给一个正常插件白送一条豁免。
+    //
+    // 用同一套 satisfiesRange 复核（它跟 dsh gate 是同一份 node-semver 语义）。
+    // 允许 null：`0.1.x` 这种通配 check.js 解析不了，但它在旧宿主上确实不满足 ——
+    // crossesLine 走的是版本线比较那条路，不是「确定不满足」那条。
+    const forms = [
+        '^0.0.1', '^0.0.5', '~0.0.1', '^0.1.2', '^0.1.5', '~0.1.7', '^0.1.2-alpha.1',
+        '^0.1.5 || ^0.2.0', '^0.2.0', '^0.3.0', '>=0.1.5 <0.3.0', '>=0.2.2', '*',
+        '>=0.0.1 <0.1.0', '<=0.1.9', '<0.1.0', '0.1.5', '0.1.x', '0.1.*',
+        '>0.1.0 <0.2.0', '^1.0.0', '>=0.3.0 <0.4.0', '0.2.x', '<=0.0.9',
+    ];
+    for (const range of forms) {
+        if (!crossesLine(HOST, range)) continue;
+        assert.notEqual(satisfiesRange(HOST, range, { includePrerelease: true }), true,
+            `${range} 被判跨线，但 gate 认为它满足`);
+    }
+});
+
+check('同线通配不会误伤（0.1.x 在 0.1.5 上本来就满足）', () => {
+    // 这条是上面那个「退到版本线比较」分支的反面：check.js 解析不了 `0.1.x`，
+    // 如果直接按下界比，0.1.0 ≤ 0.1.5 就会被判跨线 —— 而它明明满足。
+    assert.equal(crossesLine('0.1.5-rc.3', '0.1.x'), false);
+    assert.equal(crossesLine('0.2.1-rc.4', '0.2.x'), false);
+    assert.equal(crossesLine('0.1.5-rc.3', '0.1.*'), false);
 });
 
 // ── bridgeableDeclarations ──────────────────────────────────────────────────

@@ -33,10 +33,28 @@ const CHECKS = [
         test: (text) => text.includes('export function crossesLine') && text.includes('export function mergeExemptions'),
     },
     {
+        // 「全版本」的守护。判据本身不能出现任何一条写死的版本线 ——
+        // 一旦有人把 `MIN_LINE = [0, 1]` 加回来（那个常量曾把 0.0.x 排除在外），
+        // 或者退回「只从 ^ / ~ 里提版本线」的写法，这条会红。
+        file: 'lib/legacy-compat.js',
+        label: '判据里没有写死的版本线',
+        test: (text) => !text.includes('MIN_LINE')
+            && !text.includes('declaredLines(')
+            && text.includes('satisfiesRange(host, range'),
+    },
+    {
         file: 'lib/discovery-compatibility.js',
         label: '市场列表按兼容层放行',
         test: (text) => /import\s*\{\s*crossesLine\s*\}\s*from\s*'\.\/legacy-compat\.js'/.test(text)
             && text.includes('crossesLine(hostVersion, declaration.range)'),
+    },
+    {
+        // 旧判据只认 caret/tilde 且排除 ^0.0.x，等于把范围钉死在 0.1 起。
+        // 它被 crossesLine 完全接管了 —— 如果这里又调回它，0.0.x 和
+        // `>=0.0.1 <0.1.0` 这类声明会重新被判死。
+        file: 'lib/discovery-compatibility.js',
+        label: '列表阶段不再用 crossesImplicitCeiling 做闸门',
+        test: (text) => !/crossesImplicitCeiling\(\s*hostVersion/.test(text),
     },
     {
         file: 'lib/routes.js',

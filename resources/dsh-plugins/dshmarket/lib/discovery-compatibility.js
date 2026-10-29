@@ -11,7 +11,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { compareSemver, isSemver, satisfiesRange } from './check.js';
-import { classifyPeer, crossesImplicitCeiling } from './compatibility.js';
+import { classifyPeer } from './compatibility.js';
 import { crossesLine } from './legacy-compat.js';
 import { marketFetch } from './net.js';
 const CACHE_SCHEMA = 'dsh-market/discovery-compatibility-cache/v1';
@@ -81,12 +81,9 @@ function rangeResult(hostVersion, declared) {
  * policy: below-min and explicit upper/exact violations are definite; a
  * newer host above an implicit caret/tilde ceiling remains compatible.
  *
- * One case is carved out of that leniency: a host that has crossed the
- * implicit ceiling outright rather than merely straddling the prerelease gate
- * is a release line the author has left behind, and dsh's own gate refuses the
- * release for exactly that reason (#756 shape). Reporting it compatible is how
- * one install produces two contradicting verdicts — the market's, then the
- * gate's "installation rejected". See {@link crossesImplicitCeiling}.
+ * ⚠️ 上面这段是上游原本的说明，描述的是「caret/tilde ceiling」那一版判据。
+ *    本地兼容层把它换成了 crossesLine（见下），保留原文是为了让以后同步上游
+ *    时能一眼看出这里被改过、改的是什么。
  */
 function declarationResult(declaration, hostVersion) {
     const satisfied = rangeResult(hostVersion, declaration.range);
@@ -104,10 +101,21 @@ function declarationResult(declaration, hostVersion) {
     // 真正的判定在外壳：插件落位后有源码，逐 import 核对包与符号，
     // 跑不了的会被禁用并给出原因（见 dsh-desktop 的 legacy-compat）。
     //
+    // ── 为什么判断条件从 crossesImplicitCeiling 换成「gate 会拒」──────────
+    // 前者只从 `^` / `~` 里提版本线，还显式排除了 `^0.0.x`（认为它「没点名
+    // 任何一条 minor 线」）。这等于把兼容范围钉死在 0.1.x 起：
+    // `>=0.0.1 <0.1.0`、`<=0.1.9`、`0.1.x`、`^0.0.5` 一条都不含 caret/tilde，
+    // 于是绕过这里、在下面被判成 definite false。而它们和 `^0.1.5` 是同一类
+    // 问题 —— 声明的是过去，宿主在现在。
+    //
+    // 现在的判据交给 crossesLine：只要宿主不满足，且某条 `||` 分支的下界不高于
+    // 宿主（= 这条声明本来就是写给更早版本的），就判「未知」。要求更高版本的
+    // （下界 > 宿主）照旧判不兼容 —— 那是宿主缺 API，兼容层解决不了。
+    //
     // engine 也走这条路：0.2 之前写的插件普遍只声明 `engines.dsh: "^0.1.5"`，
     // 那是同一个跨线问题，没道理只放行 peer 那一半。
-    if (crossesImplicitCeiling(hostVersion, declaration.range)) {
-        return crossesLine(hostVersion, declaration.range) ? null : false;
+    if (crossesLine(hostVersion, declaration.range)) {
+        return null;
     }
     if (declaration.kind === 'engine' || satisfied !== false)
         return satisfied;
