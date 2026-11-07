@@ -36,6 +36,7 @@ import { registerRoutes } from './link-protocol/routes.js';
 import { RELAY_METHOD, REMOTE_PROVIDER, REMOTE_PROVIDER_LABEL, RELAY_ADVERTISED, RELAY_POLICY, relayStream, LIST_METHOD, LIST_ADVERTISED, safeProviders, safeModels } from './link-protocol/llmrelay.js';
 import { createRemoteAdapter, setForwardStream, isRemoteProvider } from './link-protocol/remote-adapter.js';
 import { executeLocally } from './link-protocol/relayexec.js';
+import { featureFlags } from './link-protocol/features.js';
 import { describeAddresses } from './link-protocol/netinfo.js';
 import { loadOrCreateIdentity, TOPOLOGY } from './link-protocol/mesh-identity.js';
 import * as et from './easytier.js';
@@ -93,7 +94,16 @@ const DESKTOP_CAPS = [...DESKTOP_METHODS, ...COMMON_METHODS, TRANSIT_METHOD];
  * @param {object} ctx Cordis 上下文，用于探测本机是否挂了 llm 服务。
  */
 function advertisedMethods(ctx) {
-    return [...DESKTOP_CAPS, ...(ctx.get('llm') ? [RELAY_ADVERTISED, LIST_ADVERTISED] : [])];
+    // ⚠️ 实验性功能默认关闭（见 features.js）。关闭时不宣告 —— 宣告了却用不了，
+    //    对端会白白预取一次（手机会去调 llm.list），两端还可能互相等对方
+    //    宣告而闭合成空转（这一轮踩过）。
+    //    这里重新读一次而不是用插件级的 flags：这个函数在模块顶层，
+    //    拿不到 definePlugin 闭包里的变量。
+    const flags = featureFlags(ctx);
+    return [
+        ...DESKTOP_CAPS,
+        ...(ctx.get('llm') && flags.relay ? [RELAY_ADVERTISED, LIST_ADVERTISED] : []),
+    ];
 }
 
 
@@ -340,6 +350,10 @@ function apply(ctx, config = {}) {
     let relayTarget = '';
 
     ctx.effect(() => {
+        // ⚠️ 实验性功能默认关闭（见 features.js）。关闭时整个 effect 不注册 ——
+        //    不然用户会在模型选择器里看到一个「经另一台设备调用」的 provider，
+        //    选了却不生效。
+        if (!featureFlags(ctx).relay) return;
         if (!ctx.get('llm')) return;
         // ── 注册「经另一台设备调用」为**真正的** provider ───────────────────
         //
@@ -474,7 +488,11 @@ function apply(ctx, config = {}) {
      *    「改了没效果」来源。此前这里就重复注册过 TRANSIT_METHOD。
      */
     function registerHostMethods(conn) {
-        conn.handleStream(RELAY_METHOD, async (args, emit, meta) => {
+        // ⚠️ 实验性功能默认关闭（见 features.js）：关闭时 llm.relay / llm.list
+        //    这两个方法**不注册**。对端据此只会看到「本机没有这个能力」，
+        //    而不是「调了却没反应」。
+        const flags = featureFlags(ctx);
+        if (flags.relay) conn.handleStream(RELAY_METHOD, async (args, emit, meta) => {
             const llm = ctx.get('llm');
             if (!llm) {
                 const e = new Error('本机没有 llm 服务，无法代为执行。');
@@ -491,7 +509,7 @@ function apply(ctx, config = {}) {
         // 每个 provider 的 listModels 单独容错：某个 provider 没配好（缺 key、
         // 登录态过期）不该让整个列表失败 —— 那会让「桌面的模型全都看不到」，
         // 而实际只是少了一个。
-        conn.handle(LIST_METHOD, async ({ provider } = {}) => {
+        if (flags.relay) conn.handle(LIST_METHOD, async ({ provider } = {}) => {
             const llm = ctx.get('llm');
             if (!llm) {
                 const e = new Error('本机没有 llm 服务，无法提供模型列表。');
@@ -896,7 +914,25 @@ function apply(ctx, config = {}) {
  *    异地场景才需要组网。而它 unavailable 的常见原因是「那个动态库没随安装包
  *    带上」或「系统缺 WinPcap」—— 都是可解释的正常状态，不是故障。
  */
-function easytierStatus() {
+    /**
+     * 「功能未启用」的占位返回。
+     *
+     * ⚠️ 不要把它做成故障态（available:false + error）：experimental 开关关闭
+     *    是**预期状态**，如实说明即可，别做成一个看起来像故障的状态。
+     */
+    function disabledEasyTier() {
+        return {
+            available: false,
+            running: false,
+            peers: [],
+            disabled: true,
+            note: '内嵌组网是实验性功能，当前版本未启用。不影响直连与已配对设备。',
+        };
+    }
+
+    function easytierStatus() {
+        // ⚠️ 实验性功能默认关闭（见 features.js）。
+        if (!featureFlags(ctx).easytier) return disabledEasyTier();
         try {
             const s = et.status(pluginRoot());
             return {
@@ -934,6 +970,7 @@ function easytierStatus() {
      * 自己是哪一端填错了。
      */
     function opEasyTierStart(body = {}) {
+        if (!featureFlags(ctx).easytier) return disabledEasyTier();
         const networkName = String(body.networkName || OVERLAY_NETWORK_NAME).trim();
         const networkSecret = String(body.networkSecret || OVERLAY_NETWORK_SECRET);
         const peerUri = String(body.peerUri || '').trim();
@@ -973,6 +1010,7 @@ function easytierStatus() {
 
     /** 停止组网。 */
     function opEasyTierStop() {
+        if (!featureFlags(ctx).easytier) return disabledEasyTier();
         et.stop();
         return { ...easytierStatus(), note: '已停止。' };
     }
@@ -1342,7 +1380,16 @@ function easytierStatus() {
 
     
 
-    for (const spec of registry) {
+    // ⚠️ 实验性功能关闭时，从工具列表里**剔除**对应的工具（见 features.js）。
+    //    不剔除的话模型仍能看到 link_easytier_start 之类，用户/模型调用
+    //    只会拿到一句「未启用」—— 不如一开始就不出现。
+    const _flags = featureFlags(ctx);
+    const visible = registry.filter((spec) => {
+        if (spec.name.startsWith('link_easytier_')) return _flags.easytier;
+        return true;
+    });
+
+    for (const spec of visible) {
             // ⚠️ 必填是**逐属性**的 `required: true` 注解，不是参数级数组、
             //    也不是 `optional` 字段（我第一版写错了，dsh 的 schema 不认）。
             ctx.tools.register(defineTool({
@@ -1357,7 +1404,7 @@ function easytierStatus() {
                 presentCall: () => ({ card: 'generic', title: spec.name, kind: 'read', rawInput: {} }),
             }));
         }
-        log('已注册 ' + registry.length + ' 个桌面侧联动工具');
+        log('已注册 ' + visible.length + ' 个桌面侧联动工具');
     }
 
     // mesh 拓扑下，插件加载时就把服务起起来。
