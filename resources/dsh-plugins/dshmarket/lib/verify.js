@@ -26,15 +26,52 @@
  *             or a declared entry artifact that is missing
  *   missing – not present in node_modules
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { createRequire, isBuiltin } from 'node:module';
 import { Script } from 'node:vm';
 import { join } from 'node:path';
 import { listHotMounts, parseSimplePatch } from './hot.js';
 import { userPatchPackageReferences } from './patch.js';
 import { nameMatchesPackage } from './entry-identity.js';
-import { bundlePatchInsertedIds, hasDshManifest, hasLoadableEntry, profileDir, readInstalled } from './profile.js';
-import { compareSemver, satisfiesRange } from './check.js';
+import { bundlePatchInsertedIds, declaredBundlePatchFiles, hasDshManifest, hasLoadableEntry, pluginSubdirs, profileDir, readInstalled } from './profile.js';
+import { compareSemver, composeLayers, parsePatchFile, satisfiesRange } from './check.js';
 import { dshHostInfo } from './dsh-install.js';
+/**
+ * Whether every bundle patch the package declares parses to an empty list.
+ *
+ * Such a bundle row loads nothing at boot: listing it in `dsh.profile.bundles`
+ * or taking it out changes nothing, so neither "restart to apply" nor the
+ * #696 "removed from bundles means off" inference applies to it (#813). A
+ * patch that is missing or unreadable is NOT empty — other verdicts own it.
+ */
+export function bundlePatchIsEmpty(packageDir) {
+    const files = declaredBundlePatchFiles(packageDir);
+    return files.length > 0 && files.every(file => parsePatchFile(file)?.length === 0);
+}
+/**
+ * Whether the profile's own `cordis.patch.yml` names this package anywhere,
+ * at any depth — including rows nested in another plugin's config, such as
+ * an Agent preset's `plugins:` list, which never enter the host loader.
+ * Evidence of where the plugin comes from, not of whether it is running.
+ */
+function profilePatchMentions(activeProfileDir, name) {
+    const rows = parsePatchFile(join(activeProfileDir, 'cordis.patch.yml'));
+    if (rows === null)
+        return false;
+    const seen = new Set();
+    const visit = (value) => {
+        if (value === null || typeof value !== 'object' || seen.has(value))
+            return false;
+        seen.add(value);
+        if (Array.isArray(value))
+            return value.some(visit);
+        const row = value;
+        if (nameMatchesPackage(row.name, name))
+            return true;
+        return Object.values(row).some(visit);
+    };
+    return rows.some(visit);
+}
 /** The profile manifest's `dsh.profile.bundles` — what the CLI reconciled. */
 function readBundles(profile, explicitDir) {
     try {
@@ -45,6 +82,10 @@ function readBundles(profile, explicitDir) {
     catch {
         return new Set();
     }
+}
+/** Manifest-only library declaration; observed loader activity can override its status. */
+export function isDeclaredLibraryDsh(dsh) {
+    return dsh?.kind === 'library' && dsh.bundle === undefined && dsh.client === undefined;
 }
 /**
  * True when `live` contains the package itself or a subpath entry of it.
@@ -147,11 +188,28 @@ const isDshPeer = (peer) => peer === '@deepseek-ai/dsh' || peer.startsWith('@dee
  * peers fail at once.
  */
 export function hostPeerGate(activeProfileDir, name, facts) {
+    return peerGateAt(join(activeProfileDir, 'node_modules', name), name, facts);
+}
+/**
+ * The unmet requirement, if any, and the remedy side it points at.
+ *
+ * Which side of the range the runtime sits on decides the remedy: below the
+ * floor, upgrading the host genuinely helps; above the cap (#757's own
+ * shape) no upgrade can satisfy it, and suggesting one points the wrong way
+ * (#758).
+ */
+function unmetOf(peer, range, runtimeVersion) {
+    const floor = /[0-9]+\.[0-9]+\.[0-9]+[-+0-9A-Za-z.]*/.exec(range);
+    const hostTooOld = floor !== null && compareSemver(runtimeVersion, floor[0]) < 0;
+    return { peer, range, runtimeVersion, hostTooOld };
+}
+/** Same prediction for a patch plugin resolved outside the profile's flat node_modules. */
+function peerGateAt(packageDir, name, facts) {
     if (facts.runtimeVersion === null)
         return null;
     let manifest;
     try {
-        manifest = JSON.parse(readFileSync(join(activeProfileDir, 'node_modules', name, 'package.json'), 'utf8'));
+        manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
     }
     catch {
         return null;
@@ -160,21 +218,100 @@ export function hostPeerGate(activeProfileDir, name, facts) {
     if (version !== '' && (facts.exemptions[`${name}@${version}`] ?? []).includes(facts.runtimeVersion)) {
         return null;
     }
+    // An own `engines.dsh` range decides ALONE and peerDependencies are then
+    // ignored — the host's rule, read from unmetRequirements in
+    // @deepseek-ai/dsh-app-boot, and the reason a gate that only read peers
+    // was too lenient on 62 of 2796 (package, runtime) pairs measured over the
+    // live catalog: `dsh-file-explorer-kit` (engines.dsh ^0.1.1) and
+    // `dsh-workspace-kit` (^0.1.2-rc.1) declare NO dsh peer at all, so the
+    // family that refuses them was invisible here and the card promised a
+    // restart the host would not honour. A non-string range throws inside the
+    // host's own evaluator; that is not a verdict this can predict, so the
+    // old answer stands (#757).
+    const engines = manifest.engines?.dsh;
+    if (engines !== undefined) {
+        if (typeof engines !== 'string')
+            return null;
+        const range = engines.trim();
+        // `workspace:` is substituted only for PEERS: the host counts it as an
+        // unmet range for engines, so an empty or invalid range stays unmet too.
+        const satisfied = range === '' ? false : satisfiesRange(facts.runtimeVersion, range, { includePrerelease: true });
+        return satisfied ? null : unmetOf('engines.dsh', range, facts.runtimeVersion);
+    }
     for (const [peer, requirement] of Object.entries(manifest.peerDependencies ?? {})) {
         if (!isDshPeer(peer) || typeof requirement !== 'string')
             continue;
         const range = requirement.trim();
         const satisfied = range === '' ? false : satisfiesRange(facts.runtimeVersion, range, { includePrerelease: true });
-        if (satisfied === false) {
-            // Which side of the range the runtime sits on decides the remedy:
-            // below the floor, upgrading the host genuinely helps; above the cap
-            // (#757's own shape) no upgrade can satisfy it, and suggesting one
-            // points the wrong way (#758).
-            const floor = /[0-9]+\.[0-9]+\.[0-9]+[-+0-9A-Za-z.]*/.exec(range);
-            let hostTooOld = false;
-            if (floor !== null)
-                hostTooOld = compareSemver(facts.runtimeVersion, floor[0]) < 0;
-            return { peer, range, runtimeVersion: facts.runtimeVersion, hostTooOld };
+        if (satisfied === false)
+            return unmetOf(peer, range, facts.runtimeVersion);
+    }
+    return null;
+}
+/**
+ * #867: only the bundle's own effective loader rows are evidence, never its
+ * ordinary dependency closure or arbitrary names in plugin configuration.
+ * Compose every declared file together so later disables take effect. An
+ * unreadable file or an expression-gated row gives no rejection evidence.
+ */
+function bundleRowPeerGate(packageDir, activeProfileDir, facts) {
+    if (facts.runtimeVersion === null)
+        return null;
+    try {
+        const patches = declaredBundlePatchFiles(packageDir).map(parsePatchFile);
+        if (patches.some(rows => rows === null))
+            return null;
+        const { resolvableRows } = composeLayers([{
+                label: 'bundle', kind: 'bundle', patches: patches.flatMap(rows => rows ?? []), parseError: null,
+            }]);
+        const checked = new Set();
+        for (const row of resolvableRows) {
+            if (row.activation !== 'required' || typeof row.name !== 'string')
+                continue;
+            // Bare npm names and subpath entries only. Relative files, builtins,
+            // aliases and expressions need runtime resolution; do not guess.
+            if (/^[.#/\\]|[:\\]/u.test(row.name) || isBuiltin(row.name))
+                continue;
+            const parts = row.name.split('/');
+            const name = parts.slice(0, row.name.startsWith('@') ? 2 : 1).join('/');
+            if (!/^(?:@[\w.-]+\/)?[\w-][\w.-]*$/u.test(name) || checked.has(name))
+                continue;
+            checked.add(name);
+            const directory = resolveBundleRowPackage(packageDir, activeProfileDir, name);
+            if (directory === null)
+                continue;
+            const gate = peerGateAt(directory, name, facts);
+            if (gate !== null)
+                return { name, gate };
+        }
+    }
+    catch { /* malformed or cyclic patch data — no reliable prediction */ }
+    return null;
+}
+/**
+ * Probe Node's search paths, without resolving an entry or requiring a
+ * package.json export. The real bundle path reaches pnpm's adjacent and
+ * nested dependencies; the profile anchor also covers workspace hoisting.
+ * Stop at a present directory even if its manifest is missing: a broken
+ * nearer copy must not borrow an incompatible manifest from a fallback.
+ */
+function resolveBundleRowPackage(packageDir, activeProfileDir, name) {
+    const bundleAnchor = join(realpathSync(packageDir), 'package.json');
+    const manifest = JSON.parse(readFileSync(bundleAnchor, 'utf8'));
+    // The host publishes dependencies carried by selected bundles into its
+    // profile resolution. A stray nested copy not declared by this bundle is
+    // no evidence of what a profile row will import.
+    const carried = manifest.name === name || Object.hasOwn(manifest.dependencies ?? {}, name)
+        || Object.hasOwn(manifest.peerDependencies ?? {}, name);
+    const profileAnchor = join(activeProfileDir, 'package.json');
+    for (const anchor of carried ? [bundleAnchor, profileAnchor] : [profileAnchor]) {
+        for (const searchPath of createRequire(anchor).resolve.paths(name) ?? []) {
+            const candidate = join(searchPath, name);
+            try {
+                if (statSync(candidate).isDirectory())
+                    return candidate;
+            }
+            catch { /* try the next Node search path */ }
         }
     }
     return null;
@@ -242,7 +379,14 @@ export function defaultHostRuntimeFacts(activeProfileDir) {
     catch { /* no exemption file — nothing may bypass the gate */ }
     return { runtimeVersion: discoverRuntimeVersion(), exemptions };
 }
-export function verifyActivation(profile, name, live = new Set(listHotMounts()), explicitDir, isDisabled = false, hostFacts) {
+export function verifyActivation(profile, name, live = new Set(listHotMounts()), explicitDir, isDisabled = false, hostFacts, loaderObserved = false, 
+/**
+ * The host's OWN row for this package exists and has no fiber (#1023).
+ * The loader creates an entry before it imports the module, so an entry
+ * that never got a fiber is a row the boot tried and did not activate —
+ * "restart to apply" would promise something the next start cannot deliver.
+ */
+loaderNeverStarted = false) {
     const activeProfileDir = profileDir(profile, explicitDir);
     const bundles = readBundles(profile, activeProfileDir);
     const inBundles = bundles.has(name);
@@ -250,10 +394,14 @@ export function verifyActivation(profile, name, live = new Set(listHotMounts()),
     if (dsh === null) {
         return { state: 'missing', reasons: ['未安装 / not installed'], bundle: inBundles, hot: false };
     }
+    const declaredLibrary = isDeclaredLibraryDsh(dsh);
+    // A loader entry can remain after its fiber is switched off. Retain that
+    // evidence so an observed library can be re-enabled after disabling it.
+    const loaderLive = liveIncludes(live, name) || carriedRowLive(live, activeProfileDir, name);
     // A user-disabled plugin reads as disabled, never as "restart to apply":
     // the switch state (market disable list or the user patch layer) is the
     // dominant fact, and the loader keeps it off on every boot.
-    if (isDisabled) {
+    if (isDisabled && (!declaredLibrary || loaderLive || loaderObserved)) {
         return {
             state: 'disabled',
             reasons: ['已停用(市场开关或补丁层),重启后保持关闭 / disabled (market toggle or the patch layer) — stays off across restarts'],
@@ -268,7 +416,6 @@ export function verifyActivation(profile, name, live = new Set(listHotMounts()),
     // loaded by name from a bundle patch — @deepseek-ai/dsh-tools is loaded by
     // the official dsh-base patch and has no `dsh` field at all — so this check
     // has to come before any manifest-based verdict.
-    const loaderLive = liveIncludes(live, name) || carriedRowLive(live, activeProfileDir, name);
     if (!hasDshManifest(dir)) {
         if (loaderLive) {
             return {
@@ -289,19 +436,45 @@ export function verifyActivation(profile, name, live = new Set(listHotMounts()),
                 hot: false,
             };
         }
-        return inBundles
-            ? {
+        if (inBundles) {
+            return {
                 state: 'restart',
                 reasons: ['由你自己的 cordis.patch.yml 按名加载,重启后生效 / loaded by name from your own cordis.patch.yml — live after a restart'],
                 bundle: true,
                 hot: false,
-            }
-            : {
-                state: 'inert',
-                reasons: ['普通依赖(未声明 dsh 元数据),不是 profile 层插件;若它由某个 bundle patch 按名加载,启动后会显示为已加载 / a plain dependency with no dsh metadata — not a profile-layer plugin; if some bundle patch loads it by name it will read as live once running'],
-                bundle: false,
-                hot: false,
             };
+        }
+        // A collection repository's ROOT package says nothing about itself and
+        // holds the plugins one level down (#892). Installed whole — which the
+        // market used to do before it learned to retarget one, and which a user
+        // can still do by hand — it lands on this list as "installed, not in
+        // effect" with no way out of that sentence. Name the plugins it does
+        // carry and the way to install one: the dead end is the bug.
+        const carried = pluginSubdirs(dir);
+        const shown = carried.slice(0, 3).join('、');
+        const more = carried.length > 3 ? `等 ${carried.length} 个` : '';
+        const shownEn = carried.slice(0, 3).join(', ');
+        const moreEn = carried.length > 3 ? ` and ${carried.length - 3} more` : '';
+        return {
+            state: 'inert',
+            reasons: [carried.length > 0
+                    ? `这是集合仓库的根包,本身不是插件。可安装的子包：${shown}${more}。请装子包而不是它(仓库地址后加 #path:/子包目录) / this is a collection repository's root package, not a plugin itself; install one of its plugins instead — ${shownEn}${moreEn} — by adding #path:/<subdirectory> to the repository URL`
+                    : '普通依赖(未声明 dsh 元数据),不是 profile 层插件;若它由某个 bundle patch 按名加载,启动后会显示为已加载 / a plain dependency with no dsh metadata — not a profile-layer plugin; if some bundle patch loads it by name it will read as live once running'],
+            bundle: false,
+            hot: false,
+        };
+    }
+    // A declared library is shared code, not a plugin waiting to start. This
+    // manifest fact does not overrule an observed loader entry or a real plugin
+    // surface, and a library need not have a loadable plugin entry artifact.
+    if (!loaderLive && !loaderObserved && declaredLibrary) {
+        return {
+            state: 'inert',
+            library: true,
+            reasons: ['供其他插件使用，无需启用 / for other plugins to use; no need to enable it'],
+            bundle: inBundles,
+            hot: false,
+        };
     }
     // Carrier bundles (#103) ship no entry of their own — what they mount is
     // the point — so judge by "is anything loadable", not by this package's
@@ -329,19 +502,68 @@ export function verifyActivation(profile, name, live = new Set(listHotMounts()),
             hot: true,
         };
     }
+    // An empty bundle patch (#813): the bundle row brings nothing in, so a
+    // restart cannot change the verdict and "restart to apply" would stand
+    // forever. Say where the plugin comes from instead, when the profile's own
+    // patch names it; otherwise nothing loads it, and that is the truth.
+    if (dsh.client === undefined && bundlePatchIsEmpty(dir)) {
+        return profilePatchMentions(activeProfileDir, name)
+            ? {
+                state: 'inert',
+                loadedByProfile: true,
+                reasons: ['它自带的 bundle 补丁是空的，由你的配置（例如 Agent 预设）加载；市场看不到它是否正在运行 / its own bundle patch is empty, so your own setup (an Agent preset, for example) loads it; the market cannot see whether it is running'],
+                bundle: inBundles,
+                hot: false,
+            }
+            : {
+                state: 'inert',
+                reasons: ['它自带的 bundle 补丁是空的，你的配置里也没有引用它，所以不会加载 / its own bundle patch is empty and your setup does not reference it, so nothing loads it'],
+                bundle: inBundles,
+                hot: false,
+            };
+    }
     if (inBundles) {
         // #757: "restart to apply" is only honest when the next boot would
         // actually load the bundle. The host skips bundles whose dsh peer
         // range excludes the running runtime — predict that verdict here so
         // the plugin reads as incompatible instead of promising a restart
         // that cannot fix it.
-        const gate = hostPeerGate(activeProfileDir, name, hostFacts ?? defaultHostRuntimeFacts(activeProfileDir));
+        const facts = hostFacts ?? defaultHostRuntimeFacts(activeProfileDir);
+        const gate = hostPeerGate(activeProfileDir, name, facts);
         if (gate !== null) {
             const remedy = peerGateRemedy(gate);
             return {
                 state: 'incompatible',
                 reasons: [
                     `新版本要求宿主 ${gate.range},当前运行 ${gate.runtimeVersion},重启也不会生效;${remedy.zh} / the new version needs host ${gate.range}, but this host runs ${gate.runtimeVersion} — a restart will not activate it; ${remedy.en}`,
+                ],
+                bundle: true,
+                hot: false,
+            };
+        }
+        const child = bundleRowPeerGate(dir, activeProfileDir, facts);
+        if (child !== null) {
+            const { gate, name: plugin } = child;
+            const remedy = gate.hostTooOld
+                ? { zh: '升级 dsh，或更新此插件包以匹配当前 dsh', en: 'upgrade dsh, or update this bundle to match the current dsh' }
+                : { zh: '更新此插件包，或安装与当前 dsh 兼容的版本；升级 dsh 解决不了', en: 'update this bundle or install a version compatible with the current dsh — upgrading dsh will not help' };
+            return {
+                state: 'incompatible',
+                reasons: [
+                    `它加载的插件 ${plugin} 要求 ${gate.peer} ${gate.range}，当前 dsh 为 ${gate.runtimeVersion}，重启也不会生效；${remedy.zh} / its plugin ${plugin} requires ${gate.peer} ${gate.range}, but dsh runs ${gate.runtimeVersion} — a restart will not activate it; ${remedy.en}`,
+                ],
+                bundle: true,
+                hot: false,
+            };
+        }
+        // #1023: an entry the loader created and never started is not a pending
+        // change. A restart re-runs the same import, so the banner it produced
+        // ("1 change needs a restart") could never be cleared by restarting.
+        if (loaderNeverStarted) {
+            return {
+                state: 'failed',
+                reasons: [
+                    '宿主这次启动没能加载它；重启会再试一次，还是失败就说明它和当前宿主版本不兼容——更新它，或卸载 / the host could not load it during this start; a restart tries again, but if it keeps failing the package does not fit this host version — update it, or remove it',
                 ],
                 bundle: true,
                 hot: false,
@@ -477,6 +699,117 @@ export function clientBundlePath(exportsField, depth = 0) {
     return null;
 }
 /**
+ * One assignment of a string literal to a name, and the `configForms.get`
+ * call sites (#810).
+ *
+ * The namespace a client asks its config from is a PROFILE ENTRY ID, not a
+ * package name. A client that writes the package name reads nothing: the
+ * settings document has no entry under it, the call returns empty, and the
+ * plugin degrades silently — blank or unwritable settings forms, and in the
+ * reported case a panel stuck on a hardcoded fallback port. Nothing logs it,
+ * and nothing on the market side noticed.
+ *
+ * `configForms.get` is matched by name, so an aliased receiver
+ * (`const forms = ctx.configForms; forms.get("x")`) is not seen — the same
+ * honesty as the syntax check above: this reports what it can prove, and
+ * says nothing otherwise.
+ */
+const STRING_ASSIGNMENT = /(?:^|[^\w$.])(?:var|let|const)?\s*([A-Za-z_$][\w$]*)\s*=\s*(['"])([^'"\\\n]*)\2/gu;
+const CONFIG_FORMS_GET = /configForms\s*\.\s*get\s*\(\s*(?:([A-Za-z_$][\w$]*)|(['"])([^'"\\\n]*)\2)\s*\)/gu;
+/** A value that is a plain loader entry id: a backslash means it is not one. */
+function plainNamespace(value) {
+    return value !== '' && value.length <= 200 && !value.includes('\\') && /^[\w@/.:-]+$/u.test(value) ? value : null;
+}
+/**
+ * Every namespace a client bundle asks its config from (#810).
+ *
+ * One level of constant propagation, as asked for in the report: the plugin
+ * that started this writes `var NAMESPACE = "dsh-comfyui-canvas"` and calls
+ * `configForms.get(NAMESPACE)`, so a literal-only scan would miss the very
+ * case the check exists for. A name assigned twice is dropped rather than
+ * guessed at — which value it holds at the call site is not decidable from
+ * text alone, and a wrong guess here would be reported as a plugin defect.
+ */
+export function configFormNamespaces(source) {
+    // Measured on a 750KB bundle: these scans cost ~9ms, because both walk
+    // every character, and this runs on a request the market polls. Almost no
+    // client mentions configForms at all, and — an order of magnitude rarer —
+    // almost none of those calls a method on it: for both, this pair of plain
+    // substring searches IS the whole cost (0.23ms measured), and only a client
+    // that actually asks for a config pays for a scan.
+    if (!source.includes('configForms') || !source.includes('configForms.get'))
+        return [];
+    const constants = new Map();
+    for (const match of source.matchAll(STRING_ASSIGNMENT)) {
+        const name = match[1];
+        const value = plainNamespace(match[3]);
+        constants.set(name, constants.has(name) || value === null ? null : value);
+    }
+    const namespaces = new Set();
+    for (const match of source.matchAll(CONFIG_FORMS_GET)) {
+        // A namespace is a loader entry id: no escapes, no whitespace runs, no
+        // arbitrary length. Anything else is not this pattern and stays out.
+        const value = plainNamespace(match[3] ?? '') ?? constants.get(match[1]) ?? null;
+        if (value !== null)
+            namespaces.add(value);
+    }
+    return [...namespaces];
+}
+/** The client bundle of an installed package, read; null when it has none to read. */
+function readClientBundle(profile, name, explicitDir) {
+    const root = join(profileDir(profile, explicitDir), 'node_modules', name);
+    let manifest;
+    try {
+        manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
+    }
+    catch {
+        return null;
+    }
+    if (manifest.dsh?.client === undefined)
+        return null;
+    const exportsField = manifest.exports;
+    const relative = exportsField !== null && typeof exportsField === 'object' && !Array.isArray(exportsField)
+        ? clientBundlePath(exportsField['./client'])
+        : null;
+    if (relative === null)
+        return null;
+    try {
+        return readFileSync(join(root, relative), 'utf8');
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Installed plugins whose client reads its config from a name nothing serves
+ * (#810).
+ *
+ * `served` is the entry id set of the WHOLE composition — deliberately not
+ * this package's own ids: a package may legitimately mount another one
+ * (carrier form), and judging by own ids alone would flag those. `ownIdsOf`
+ * answers what the package itself declares, which is the value to write
+ * instead — the report asked for the correct spelling to be shown, not just
+ * the mistake.
+ *
+ * The scan reads one bundle per installed plugin. Measured against the same
+ * cost the syntax sweep above already pays (0.40ms per plugin on a 385KB
+ * bundle), so a 30-plugin profile is ~12ms — this runs on a request a user
+ * made, not in a loop.
+ */
+export function findUnservedConfigNamespaces(profile, served, ownIdsOf, explicitDir) {
+    const found = [];
+    for (const name of Object.keys(readInstalled(profile, explicitDir))) {
+        const source = readClientBundle(profile, name, explicitDir);
+        if (source === null)
+            continue;
+        const unserved = configFormNamespaces(source).filter(namespace => !served.has(namespace));
+        if (unserved.length === 0)
+            continue;
+        found.push({ name, namespaces: unserved, ownEntryIds: ownIdsOf(name) });
+    }
+    return found;
+}
+/**
  * Whether a package's client bundle still parses as JavaScript (#222).
  *
  * pnpm can leave a half-written or patch-mangled bundle behind — the report
@@ -542,34 +875,15 @@ export function newlyBrokenBundles(before, after) {
     return after.filter(entry => !seen.has(entry.name));
 }
 export function checkClientBundle(profile, name, explicitDir) {
-    const root = join(profileDir(profile, explicitDir), 'node_modules', name);
-    let manifest;
+    // Declared but absent is verifyActivation's territory (a missing entry
+    // artifact is already `broken` there); duplicating it here would report one
+    // problem twice in two different vocabularies — so the reader's null covers
+    // both "no client bundle" and "declared but unreadable" with the same ok.
+    const source = readClientBundle(profile, name, explicitDir);
+    if (source === null)
+        return { ok: true, reason: null };
     try {
-        manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
-    }
-    catch {
-        return { ok: true, reason: null };
-    }
-    if (manifest.dsh?.client === undefined)
-        return { ok: true, reason: null };
-    const exportsField = manifest.exports;
-    const relative = exportsField !== null && typeof exportsField === 'object' && !Array.isArray(exportsField)
-        ? clientBundlePath(exportsField['./client'])
-        : null;
-    if (relative === null)
-        return { ok: true, reason: null };
-    let source;
-    try {
-        source = readFileSync(join(root, relative), 'utf8');
-    }
-    catch {
-        // Declared but absent is verifyActivation's territory (a missing entry
-        // artifact is already `broken` there); duplicating it here would report
-        // one problem twice in two different vocabularies.
-        return { ok: true, reason: null };
-    }
-    try {
-        new Script(source, { filename: relative });
+        new Script(source, { filename: `${name}/client` });
         return { ok: true, reason: null };
     }
     catch (error) {

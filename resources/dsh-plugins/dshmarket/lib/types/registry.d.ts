@@ -14,6 +14,18 @@ export interface RegistryPlugin {
     npm?: string | null;
     tarball?: string | null;
     stars?: number | null;
+    starsCheckedAt?: string | null;
+    /** All public Release assets in this repository, lifetime count; never npm's window. */
+    githubReleaseDownloads?: number | null;
+    githubReleaseDownloadsCheckedAt?: string | null;
+    /** Public package declarations at this exact pinned install tag. */
+    releaseManifest?: {
+        tarball: string;
+        checkedAt: string;
+        version: string | null;
+        enginesDsh: string | null;
+        peerDependencies: Record<string, string>;
+    };
     /**
      * npm downloads in the last 30 days, when the entry has a published
      * package. `null`/absent means "no npm package" — a coverage gap, not a
@@ -31,6 +43,12 @@ export interface RegistryPlugin {
      * omits the byline segment rather than showing a placeholder.
      */
     version?: string | null;
+    /**
+     * Catalog-declared storefront tile (icon). Same trust boundary as screenshots:
+     * the catalog is untrusted input, so the client re-validates the URL before
+     * creating an <img>. Absent = fall back to the owner's GitHub avatar.
+     */
+    icon?: string | null;
     install: string;
     added: string;
     /**
@@ -41,6 +59,21 @@ export interface RegistryPlugin {
     deprecated?: boolean;
     /** Catalog name of the suggested replacement plugin, when deprecated. */
     replacement?: string;
+    /**
+     * npm package names this entry used BEFORE its current one (#1012).
+     *
+     * The catalog is the only place a rename can be stated ahead of time: the
+     * old name's npm metadata is gone (no dist-tags, no `deprecated` message),
+     * so nothing the market can fetch still knows the two names are one plugin.
+     * Same trust boundary as `deprecated`/`replacement` — absent for every
+     * normal entry, and a catalog without the field behaves exactly as before.
+     *
+     * Values are validated where they are consumed (normalized by
+     * {@link pluginPreviousNpm}, cross-entry rules in scripts/validate-registry.mjs):
+     * a former name must never be a live package in the catalog, and one former
+     * name may only have one successor.
+     */
+    previousNpm?: string[];
     /**
      * Capability disclosure (#401): what a static scan of the artifact a user
      * would install reported touching — `shell`, `network`, `credentials`,
@@ -71,6 +104,18 @@ export interface Registry {
     categories: Record<string, Record<string, string>>;
     plugins: RegistryPlugin[];
 }
+/**
+ * Former npm names for one catalog entry, normalized (#1012).
+ *
+ * Catalog JSON is external input, so a malformed declaration is dropped
+ * rather than trusted: only syntactically valid npm names survive, an entry
+ * may not list itself (its own `npm` or `name`), and duplicates collapse in
+ * declaration order. Cross-entry rules — a former name that is still live
+ * elsewhere, or two entries claiming one former name — cannot be judged per
+ * entry; the validator enforces them for the catalog, and
+ * `findCatalogRename` fails closed on ambiguity at runtime.
+ */
+export declare function pluginPreviousNpm(plugin: Pick<RegistryPlugin, 'name' | 'npm' | 'previousNpm'>): string[];
 /**
  * Drop what we remember, so the next call is unconditional.
  *

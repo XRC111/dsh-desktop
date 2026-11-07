@@ -19,9 +19,39 @@
  * its own host in that field.
  */
 import { gunzipSync } from 'node:zlib';
+import { fetchBodyWhileProgressing } from './body-progress.js';
 import { marketFetch } from './net.js';
 /** Long enough for a multi-megabyte tarball on a slow link, short enough to fall back. */
 const TIMEOUT_MS = 20_000;
+/**
+ * `dist.tarball` as an absolute URL.
+ *
+ * A registry behind a path prefix — Nexus, Verdaccio, a reverse proxy — may
+ * answer that field as a relative path (`/dsh-plugin-catalog/-/…`). pnpm
+ * resolves it against the registry; passing it straight to `fetch` threw
+ * "Failed to parse URL" instead, the npm source dropped out of the list, and
+ * the market read the catalog from somewhere else without saying so (#1117).
+ *
+ * Relative resolution follows the URL rules: a value starting with `/` is
+ * root-relative and a bare path is relative to the registry's own directory,
+ * which is where the registry serves it from. Nothing is rewritten when the
+ * field is already absolute.
+ */
+export function absoluteTarballUrl(tarball, registry) {
+    try {
+        return new URL(tarball).href;
+    }
+    catch {
+        // Not absolute — resolve below, and keep the raw value if even that fails
+        // so the error still names what the registry answered.
+    }
+    try {
+        return new URL(tarball, `${registry.replace(/\/+$/u, '')}/`).href;
+    }
+    catch {
+        return tarball;
+    }
+}
 /**
  * A tar entry header, as far as this needs to read one.
  *
@@ -101,11 +131,50 @@ file = 'package/plugins.json') {
     // Follow `dist.tarball` rather than composing a URL. A mirror rewrites
     // this field to its own host, and composing one would send the download
     // back to the origin registry the region exists to avoid.
-    const tarRes = await marketFetch(tarball, { signal: AbortSignal.timeout(TIMEOUT_MS) });
-    if (!tarRes.ok)
-        throw new Error(`HTTP ${String(tarRes.status)} reading ${pkg} tarball`);
-    const bytes = fileFromTarball(Buffer.from(await tarRes.arrayBuffer()), file);
+    //
+    // The body is read under a stall watchdog rather than a total budget
+    // (#1049). A 3.2 MB tarball needs 158 KB/s to clear a fixed 20s ceiling,
+    // and a China mirror jittering to 17–40 KB/s cannot: both attempts died at
+    // the ceiling while bytes were still arriving, and the catalog fell through
+    // to a source that took longer still. TIMEOUT_MS still bounds the wait for
+    // the response to start, the one thing a fixed timer is good at.
+    const bytes = fileFromTarball(Buffer.from(await fetchBodyWhileProgressing(marketFetch, absoluteTarballUrl(tarball, registry), `${pkg} tarball`)), file);
     if (bytes === null)
         throw new Error(`${pkg}@${version} carries no ${file}`);
     return { version, data: JSON.parse(bytes.toString('utf8')) };
+}
+/**
+ * One file out of a package's newest tarball, or null when it cannot be read
+ * (#1012).
+ *
+ * The install route asks a package what it declares before it installs it: a
+ * rename can only be detected from the rows the artifact carries, not from
+ * the name it was published under. A failed read is not a verdict — the
+ * caller treats null as "not declared", because a registry hiccup must never
+ * become a refusal to install.
+ *
+ * @param registry - registry base, no trailing slash.
+ * @param pkg - package name.
+ * @param file - exact entry name inside the tarball (`package/cordis.patch.yml`).
+ */
+export async function packageFileFromRegistry(registry, pkg, file) {
+    try {
+        const metaRes = await marketFetch(`${registry}/${encodeURIComponent(pkg)}/latest`, {
+            signal: AbortSignal.timeout(TIMEOUT_MS),
+            headers: { accept: 'application/json', 'user-agent': 'dsh-market' },
+        });
+        if (!metaRes.ok)
+            return null;
+        const meta = (await metaRes.json());
+        const tarball = typeof meta.dist?.tarball === 'string' ? meta.dist.tarball : null;
+        if (tarball === null)
+            return null;
+        const tarRes = await marketFetch(absoluteTarballUrl(tarball, registry), { signal: AbortSignal.timeout(TIMEOUT_MS) });
+        if (!tarRes.ok)
+            return null;
+        return fileFromTarball(Buffer.from(await tarRes.arrayBuffer()), file);
+    }
+    catch {
+        return null;
+    }
 }

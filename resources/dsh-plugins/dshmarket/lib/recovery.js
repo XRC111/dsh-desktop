@@ -32,10 +32,10 @@ import { spawn } from 'node:child_process';
 import { appendFileSync, openSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { connect } from 'node:net';
-import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJsonBody, sameOrigin, sendJson } from './http.js';
+import { redactHomePaths } from './log-redaction.js';
 import { disableRow, enableRow } from './patch.js';
 import { addProfileBundle, removeProfileBundle } from './profile.js';
 /** How long the replacement gets to bind the port before it is a failure. */
@@ -464,8 +464,7 @@ async function waitForPortFree(port, timeoutMs) {
  * one unreadable line, which is the opposite of what the export is for.
  */
 function redactLog(text) {
-    return text
-        .replaceAll(homedir(), '~')
+    return redactHomePaths(text)
         .replace(/sk-[A-Za-z0-9_-]{8,}/g, 'sk-***')
         .replace(/gh[pousr]_[A-Za-z0-9]{16,}/g, 'gh*_***')
         .replace(/npm_[A-Za-z0-9]{16,}/g, 'npm_***')
@@ -938,6 +937,16 @@ export async function runRecovery(config, facts = { exitCode: null, bound: false
     const servePort = options.port ?? config.port;
     /** Write errors from the previous apply; they travel into the next payload. */
     let writeErrors = [];
+    // A port that ANSWERS is proof the host came up, and it needs no pid to say
+    // so (#854). The helper's pid is the process IT spawned, which on Windows is
+    // the `powershell.exe` wrapper rather than the node host that binds — so the
+    // guard below cannot be trusted on its own, and a helper that gave up late
+    // handed this surface a pid that was already gone while the host was still
+    // starting. Asking the socket settles it either way.
+    if (servePort !== null && servePort !== 0 && await portListening(servePort)) {
+        note(config, `port ${String(servePort)} is already answering — the host came up after all; leaving it alone`);
+        return 'booted';
+    }
     // The replacement is not necessarily dead just because it has not bound the
     // port: on a slow host it is still starting. It gets the same grace as a
     // released port before the surface takes the port out from under it (#719).

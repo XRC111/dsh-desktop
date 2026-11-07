@@ -6,8 +6,46 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 /** Write a JSON payload with no-store caching. */
 export declare function sendJson(response: ServerResponse, status: number, payload: unknown): void;
+/**
+ * The host's own request gate, when it publishes one (#603).
+ *
+ * DSH's Host Connection service exposes `requestRejection(request)`: its
+ * Host/Origin fence, then its browser login — 403, 401, or `undefined` for a
+ * request it would admit to its own API. The market's routes never passed
+ * through it: they are exact registrations on the bare webServer (see the
+ * trusted-hosts note below), so with the login on, a client holding no session
+ * could still read the market's state and install or remove plugins — which on
+ * a deployment behind a proxy or a tunnel is code execution on that machine for
+ * anyone who can reach the port. The fix is not a second login: it is asking
+ * the one the host already runs.
+ *
+ * `undefined` source (a host older than this service, 0.1.0-rc.8) leaves every
+ * route exactly as it was.
+ */
+export type HostRequestGate = (request: IncomingMessage) => number | undefined;
+/** Point the market at the host's request gate. Returns the previous source. */
+export declare function setRequestGateSource(source: () => HostRequestGate | undefined): () => HostRequestGate | undefined;
+/**
+ * Answer the request with the host's rejection, if it has one.
+ * @returns true when the request was refused and answered here.
+ */
+export declare function refuseUnadmitted(request: IncomingMessage, response: ServerResponse): boolean;
 /** Point the fence at the host's declared authorities. Returns the previous source. */
 export declare function setTrustedHostsSource(source: () => readonly string[]): () => readonly string[];
+/**
+ * The authorities this deployment declared, as the fence reads them right now.
+ *
+ * `sameOrigin` consults them through the private source above. The privileged
+ * routes (the backup export, the self-uninstall, the one-click restart) need
+ * the same list, and a second private copy of it would be a second thing to
+ * keep in step — the fence that guards the market's ordinary routes and the
+ * fence that guards its privileged ones have to agree about what this
+ * deployment serves.
+ *
+ * Read per request, exactly as the source itself is: a deployment that
+ * declares an authority later is honoured from that request on.
+ */
+export declare function declaredTrustedHosts(): readonly string[];
 /**
  * Whether a request authority is one of the declared ones.
  *
@@ -39,7 +77,10 @@ export declare function trustedAuthority(host: string, trustedHosts: readonly st
  * - a cross-site page is refused — its Origin is present and different;
  * - `Origin: null` (a sandboxed iframe, a `data:` document) is refused, because
  *   `null` is a present-but-unparseable origin, not an absent one;
- * - a same-host-but-different-port request is refused;
+ * - a same-host-but-different-port request is refused, except that a loopback
+ *   Host accepts a port-less same-hostname Origin (#1031: Chrome 151+ omits
+ *   the port on loopback Origins, and the dsh core fence follows the same
+ *   rule);
  * - an EMPTY Origin is refused too: the header being present and unparseable
  *   is not the same statement as its being absent, and only absence is what
  *   a stripping proxy produces.

@@ -4,6 +4,8 @@
  * dist-tag for registry installs — with a TTL cache.
  */
 import { type Channel } from './channels.ts';
+import { type CatalogReleaseSource } from './release-updates.ts';
+import type { GitToNpmMigration, NpmRenameMigration } from './source-migration.ts';
 export interface UpdateStatus {
     /**
      * `generation` is a `link:` the desktop host wrote (#497): the host
@@ -21,13 +23,62 @@ export interface UpdateStatus {
      * as "there is an upgrade" and labels a button accordingly.
      */
     updateAvailable: boolean;
+    /** Exact mature npm stable target for Desktop; `latest` remains the registry tag. */
+    eligibleVersion?: string;
+    /**
+     * HEAD of the chosen line for a floating git install whose repository has
+     * moved without publishing: newer commits exist (current ≠ latest) but the
+     * version did not advance, so #824's rule answers `updateAvailable: false`
+     * — the update channel installs releases, not arbitrary branch heads.
+     *
+     * This field keeps the fact visible instead of collapsing it into "up to
+     * date": the market shows "有新提交（未发版）<short sha>" so a user who
+     * DOES want the unreleased bits knows a rebuild-installed row is behind,
+     * while everyone else is not nagged by a permanent update button.
+     */
+    unreleasedCommit?: string;
+    /**
+     * This package is a plain dependency, not a plugin: no `dsh` field, not in
+     * `dsh.profile.bundles`, and no row of the user's own patch loads it
+     * (#793). A newer release can exist and is reported as `latest`, but it is
+     * never `updateAvailable` — the update channel installs a BUNDLE, and
+     * handing it a package with no bundle patch is refused by the host as
+     * `not-bundle` after the run, with a rollback message that reads as though
+     * the profile were damaged when nothing was touched.
+     */
+    notAPlugin?: true;
+    /**
+     * A newer build exists on a tag other than `latest` (#867).
+     *
+     * Some packages leave `latest` pointing at an older line than the one they
+     * actually publish on: `@deepseek-ai/dsh-experimental-agent-team-profile`
+     * answers `latest` with 0.1.5-alpha.2 while `alpha` is 0.2.1-alpha.4, so a
+     * user who installed 0.2.1-alpha.2 reads "up to date" while the line they
+     * are following has moved. Named, and never `updateAvailable`: the market's
+     * channels are the market's own, and this is the fact, not an upgrade the
+     * market decided to offer.
+     */
+    newerPrerelease?: string;
     /** Taking this update replaces a local package source with its matched online release. */
     restoreRequired?: boolean;
-    /** Independent, explicit source switch offered for verified legacy Git installs. */
-    sourceMigration?: {
-        kind: 'git-to-npm';
-        repo: string;
-        target: string;
+    /**
+     * Independent, explicit source switch offered for an installed profile: a
+     * verified legacy Git install (#461), or an npm install whose package was
+     * renamed and no longer resolves (#1012).
+     */
+    sourceMigration?: GitToNpmMigration | NpmRenameMigration;
+    /**
+     * A newer release exists but this profile's `minimumReleaseAge` will not let
+     * pnpm install it yet (#945). The official Desktop takes no one-shot bypass,
+     * so offering the update there means offering a button that is guaranteed
+     * to fail; the market names the wait instead. `updateAvailable` can still
+     * be true if `eligibleVersion` names a different, already mature upgrade.
+     * `until` is when the newer held release should become installable.
+     */
+    heldUpdate?: {
+        latest: string;
+        until: string;
+        estimated?: true;
     };
     /**
      * The version this package's channel points at, when it differs from what
@@ -48,6 +99,32 @@ export interface UpdateStatus {
      */
     channelSwitch?: string;
 }
+/**
+ * Whether a direct dependency is a plugin the update channel can apply (#793).
+ *
+ * The update path installs a BUNDLE: it re-adds the package and lets the host
+ * compose its patch. A direct dependency that is only a library or a CLI
+ * (`@mnemon-dev/mnemon` — a `bin` and no `dsh` field) is listed because it is
+ * in `package.json`, and nothing before this asked what it was, so a newer
+ * release made it "updatable" and the click ended in the host's `not-bundle`.
+ *
+ * Three independent facts each count as "this is a plugin", and a package
+ * must have none of them to be left out:
+ *
+ *  - its own manifest declares a `dsh` field;
+ *  - the profile lists it in `dsh.profile.bundles`;
+ *  - a row of the user's own `cordis.patch.yml` loads it by name — a package
+ *    can be a real, working plugin while declaring nothing itself (the
+ *    official `@deepseek-ai/dsh-tools` has no `dsh` field and is loaded by the
+ *    base patch), and treating that as a library would silently stop
+ *    offering its updates.
+ *
+ * Every uncertainty resolves toward "is a plugin": an unreadable patch, an
+ * unreadable manifest, a package that is not installed yet. This only ever
+ * REMOVES an offer, so being unsure has to leave the offer standing — the
+ * old behaviour — rather than hide an update the user wanted.
+ */
+export declare function isUpdatablePlugin(activeProfileDir: string, name: string, bundles: ReadonlySet<string>): boolean;
 /**
  * HEAD for an arbitrary smart-HTTP git remote (Gitea, GitLab, …). Same
  * advertisement format as GitHub's info/refs; kept here so accelerate.ts
@@ -84,6 +161,38 @@ export declare function invalidateUpdates(): void;
  * cannot yet serve.
  */
 export declare function setUpdateRegistry(base: string): void;
+export interface DesktopMatureResult {
+    candidate: string | null;
+    latest: string | null;
+    heldUpdate?: {
+        latest: string;
+        until: string;
+        estimated?: true;
+    };
+    nextMaturityAt: number | null;
+    reason: string;
+}
+/** Shared fresh registry/policy verification for listing and locked execution. */
+export declare function resolveDesktopMatureUpdate(name: string, installed: string | null, profile: string, activeProfileDir: string, endpointLatest: string | null, maxVersion?: string): Promise<DesktopMatureResult>;
+/**
+ * The maturity of ONE precisely named version, for the compatibility dialog.
+ * "You can update to 1.7.11" is only advice; this answers whether that exact
+ * version may be installed right now, and if not, when. Never throws: an
+ * unreadable policy or an unreachable registry is reported as unknown so the
+ * UI can stay quiet instead of promising something the install would refuse.
+ */
+export interface RequestedVersionMaturity {
+    version: string;
+    /** true = installable now, false = held, null = not verifiable here. */
+    installable: boolean | null;
+    held: boolean;
+    exempt: boolean;
+    publishedAt: string | null;
+    nextMaturityAt: string | null;
+    releaseAgeMs: number | null;
+    reason: 'eligible' | 'held' | 'unknown-age' | 'policy-unknown' | 'registry-unavailable' | 'unknown-version';
+}
+export declare function readVersionMaturity(name: string, version: string, profile: string, activeProfileDir: string, now?: number): Promise<RequestedVersionMaturity>;
 /**
  * Evidence check behind the "wait a day" stale diagnosis (#45): whether the
  * package's CURRENT latest release was published recently enough to sit
@@ -119,6 +228,15 @@ export declare function latestPublishedRecently(name: string, windowMs?: number)
  */
 export declare function versionOnChannel(name: string, channel: Channel, stable: string | null): Promise<string | null>;
 export declare function fetchNpmLatest(name: string): Promise<string | null>;
+/**
+ * The newest build above `installed` that some tag other than `latest`
+ * points at, or null (#867).
+ *
+ * A fact about the registry, not a channel decision: this is what makes the
+ * difference visible to someone whose installed pin is ahead of `latest`
+ * without the market volunteering anyone's prerelease as an update.
+ */
+export declare function newerPrereleaseFor(name: string, installed: string | null): Promise<string | null>;
 /** Per-plugin update checks; a failed check reports no update rather than failing the listing. */
 export declare function checkUpdates(profile: string, force?: boolean, explicitDir?: string, 
 /**
@@ -141,4 +259,15 @@ onlineSourceFor?: ReadonlyMap<string, string>,
  * entry that owns both the repo and the name, the npm fallback would
  * compare the install with whatever package merely shares its name.
  */
-catalogNpmByRepo?: ReadonlyMap<string, string>): Promise<Record<string, UpdateStatus>>;
+catalogNpmByRepo?: ReadonlyMap<string, string>, 
+/**
+ * Hold back releases that this profile's `minimumReleaseAge` will refuse
+ * (#945). Only true where the install path has no bypass: the official
+ * Desktop's manager takes no pnpm options, while the CLI path retries once
+ * with `--config.minimum-release-age=0` and CAN install a young release.
+ * Hiding those on the CLI would suppress updates that work.
+ */
+options?: {
+    holdYoungReleases?: boolean;
+    releaseSources?: ReadonlyMap<string, CatalogReleaseSource>;
+}): Promise<Record<string, UpdateStatus>>;

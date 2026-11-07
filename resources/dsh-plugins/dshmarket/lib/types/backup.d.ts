@@ -87,6 +87,23 @@ export declare function isPublicTarget(hostname: string): boolean;
 export declare function isPublicIpv6(ip: string): boolean;
 /** Resolve once, reject every unsafe answer, and return the address to pin. */
 export declare function resolvePublicAddress(hostname: string): Promise<PublicAddress>;
+/**
+ * Why a WebDAV target was refused, when the answer is not "the URL is wrong"
+ * (#999).
+ *
+ * The gate used to answer `invalid WebDAV URL` for every branch — a non-https
+ * scheme, embedded credentials, a `.local` name, an empty DNS answer and a
+ * private resolution all read the same. That made one very common setup
+ * undebuggable: a proxy client in fake-ip mode (Clash/Mihomo, the default for
+ * most Chinese setups) answers `198.18.x.x` for every proxied hostname, so
+ * every WebDAV target was refused with a message pointing at the URL.
+ */
+export type WebdavUrlErrorCode = 'webdav_bad_url' | 'webdav_unresolvable' | 'webdav_private_resolution';
+export declare class WebdavUrlError extends Error {
+    readonly code: WebdavUrlErrorCode;
+    readonly address?: string | undefined;
+    constructor(code: WebdavUrlErrorCode, message: string, address?: string | undefined);
+}
 export declare function downloadWebdav(url: string, username: string, password: string): Promise<unknown>;
 export interface PluginSelection {
     deps: Record<string, string>;
@@ -128,4 +145,27 @@ export declare function unportableDeps(dependencies: unknown): Array<{
     spec: string;
 }>;
 export declare function mergeRestoreManifest(backupManifest: Record<string, unknown>, current: Record<string, unknown>, selection?: PluginSelection): Record<string, unknown>;
+/**
+ * Dependencies a restore must leave at the spec the target already has — the
+ * market itself, while it is the package running the restore.
+ *
+ * A restore applies the backup's manifest through `pnpm install`, which
+ * rewrites whatever that manifest pins. When the backup was written by a
+ * different market version, that install replaces THIS package's files under
+ * the live module: the mixed state the update route refuses (#608), made
+ * worse here because the code answering the restore request is the code being
+ * swapped out. The running spec therefore wins, and the backup's spec is
+ * returned so the caller can report it — the update flow can apply it later,
+ * with its restart and rollback machinery.
+ *
+ * Only string specs take part: anything else is not a pin this can compare.
+ */
+export declare function pinRunningDeps(merged: Record<string, unknown>, current: Record<string, unknown>, names: ReadonlySet<string>): {
+    dependencies: Record<string, unknown>;
+    pinned: Array<{
+        name: string;
+        from: string;
+        to: string;
+    }>;
+};
 export {};

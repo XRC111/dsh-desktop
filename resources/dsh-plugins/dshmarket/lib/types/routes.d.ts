@@ -31,13 +31,7 @@ export interface MarketHost {
         await(): Promise<unknown>;
         dispose(): Promise<unknown> | void;
     };
-    on?(event: string, callback: (fiber: {
-        entry?: {
-            options?: {
-                name?: string;
-            };
-        };
-    }) => void): () => void;
+    on?(event: string, callback: (payload: unknown) => void): () => void;
     logger?: {
         info?(message: string): void;
         warn(message: string): void;
@@ -82,6 +76,15 @@ export interface MarketConfig {
      * no longer tells a desktop shell apart from an ordinary `dsh` run.
      */
     desktopHost?: boolean;
+    /**
+     * How long to wait for the host's own replay of a fresh install before
+     * hot-mounting it (#814). A desktop shell that watches the profile replays
+     * the composition itself, about two seconds after the manifest lands; one
+     * that does not publish `pluginActivation` gives the market no way to ask,
+     * and mounting first made the host's replay fail as a duplicate. Unset,
+     * the wait follows the host's own profile watcher instead (#827).
+     */
+    hostReplayWaitMs?: number;
     /** Detached self-restart is unsafe under systemd/launchd/pm2; operators can disable it (#14). */
     allowRestart?: boolean;
     /** Which release channel the market offers ITSELF from; other plugins never follow it. */
@@ -98,6 +101,24 @@ export interface MarketConfig {
      * the market computes for its children.
      */
     buildEnv?: Record<string, string>;
+    /**
+     * Where `profile` came from, for the exported log (#744). Not used for any
+     * decision: it exists because "why did the market think this was the web
+     * profile" stalled an investigation for want of exactly this line.
+     */
+    origin?: {
+        /** Which source named the profile. */
+        profileSource: string;
+        /** The launcher's `profileContext` as the market saw it at start. */
+        launcherAtStart: string;
+        /**
+         * The same, read again now. Absent at start but present later means the
+         * service arrived after the market mounted (timing); absent both times
+         * means the market cannot see it at all (scope) — the two causes need
+         * different fixes, and only a live read tells them apart.
+         */
+        launcherNow: () => string;
+    };
 }
 export declare function marketVersion(): string;
 /**

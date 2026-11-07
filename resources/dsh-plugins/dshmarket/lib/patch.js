@@ -29,7 +29,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logEvent } from './log.js';
 import { parsePatchFile, parsePatchText } from './check.js';
-import { bundlePatchInsertedIds, parsePatchRows } from './profile.js';
+import { bundleOptOutRowIds, bundlePatchInsertedIds, declaredBundlePatchFiles, parsePatchRows } from './profile.js';
 /**
  * Host infrastructure rows: disabling any of these breaks the very chain
  * the patch layer runs on (e.g. timer → HMR, webserver → the page itself),
@@ -115,15 +115,113 @@ export function findUserPatchPath(host, profileDir) {
 }
 /** Row ids the market is allowed to write: plain unquoted YAML scalars. */
 const ROW_ID_RE = /^[A-Za-z0-9_.-]+$/u;
+function nextPatchContentLine(lines, from) {
+    let index = from;
+    while (index < lines.length) {
+        const line = (lines[index] ?? '').trim();
+        if (line !== '' && !line.startsWith('#'))
+            break;
+        index += 1;
+    }
+    return index;
+}
 /**
  * Line-wise scan of one patch file — the plugin-hub shapes. Deliberately
  * not a YAML parse: the file may hold structures the market's dialect
  * rejects, but a plain `- id: X` + `disabled: true|false` pair is enough
  * to know what the user patch layer says.
  */
+/**
+ * The value of a top-level key in a patch entry that starts after `start`.
+ *
+ * An entry runs until the next `- ` at column 0, and its keys sit at exactly
+ * two spaces; anything deeper belongs to `config:` and says nothing about the
+ * row itself. Reading only the line AFTER `- id:` missed `disabled: true`
+ * whenever `name`, `inject` or a config block came first — the row then read
+ * as enabled, so a plugin the user had switched off was reported "restart to
+ * apply" forever, every boot (#1099).
+ *
+ * @returns the scalar as written (comments stripped), or null when the entry
+ *   does not carry the key at all.
+ */
+function entryKeyValue(lines, start, key) {
+    const pattern = new RegExp(`^ {2}${key}:[ \\t]*(.*?)[ \\t]*$`, 'u');
+    for (let index = start; index < lines.length; index += 1) {
+        const line = lines[index] ?? '';
+        if (/^- /u.test(line))
+            return null;
+        const match = pattern.exec(line);
+        // A `#` starts a comment only after whitespace; `#` inside a bare scalar
+        // is data, and YAML would keep it.
+        if (match !== null)
+            return (match[1] ?? '').replace(/[ \t]+#.*$/u, '').trim();
+    }
+    return null;
+}
+/**
+ * Whether a patch entry speaks for the row it names.
+ *
+ * The host skips an entry whose `name` is not the name that row's id composes
+ * to — `applyPatches` in dsh-app-boot, `if (name && name !== target.name)`,
+ * the same line in every published version. A row left behind by a package
+ * rename therefore never takes effect, while anything that counts the flag
+ * alone reports the plugin as off (#1113). Only a row that CARRIES a name is
+ * compared, and only when the composed name is known: an id that is not in
+ * the loader has nothing to compare against, and its flag stands.
+ *
+ * @param name - the `name` the entry carries, if any.
+ * @param expected - the composed entry's own name, or null when unknown.
+ */
+function rowApplies(name, expected) {
+    if (typeof name !== 'string' || name === '')
+        return true;
+    return expected === null || name === expected;
+}
+/**
+ * The name the loader composed for a row, or null when the id is not there.
+ *
+ * This is the comparison the host makes, against the composed entry's own
+ * `name` — NOT `nameMatchesPackage()`, which judges package ownership and
+ * treats a subpath name and a foreign package name the same way (#1113).
+ */
+export function composedRowName(host, rowId) {
+    for (const entry of host.loader.entries()) {
+        if (loaderEntryId(entry) !== rowId)
+            continue;
+        const name = entry.options?.name;
+        return typeof name === 'string' && name !== '' ? name : null;
+    }
+    return null;
+}
+/**
+ * Whether the user layer's flag for this row is a decision the host applies.
+ *
+ * @param state - the user patch state.
+ * @param rowId - the row being asked about.
+ * @param expected - the composed entry's name, or null when the id is not in
+ *   the loader.
+ */
+export function rowFlagApplies(state, rowId, expected) {
+    const carried = state.names?.[rowId];
+    return carried === undefined || rowApplies(carried, expected);
+}
+/** The state with one row's flags dropped when its `name` does not apply. */
+function withoutMismatchedRow(state, rowId, expected) {
+    if (rowFlagApplies(state, rowId, expected))
+        return state;
+    return {
+        disables: state.disables.filter(id => id !== rowId),
+        forced: state.forced.filter(id => id !== rowId),
+        inserts: state.inserts,
+        ...(state.names !== undefined ? { names: state.names } : {}),
+    };
+}
 export function readUserPatchState(patchPath) {
-    const disables = [];
-    const forced = [];
+    // The host composes the file in order, later entries override earlier ones,
+    // so a row has one final flag: listing it as both disabled and forced showed
+    // a plugin as off while the file had it on (#1099).
+    const flags = new Map();
+    const names = new Map();
     const inserts = [];
     let text = '';
     try {
@@ -146,16 +244,31 @@ export function readUserPatchState(patchPath) {
                 inserts.push(insertRow[1]);
             continue;
         }
-        const disableRow = /^- id: ([A-Za-z0-9_.-]+)\s*$/u.exec(line);
+        const disableRow = /^- id: (?:([A-Za-z0-9_.-]+)|'([A-Za-z0-9_.-]+)'|"([A-Za-z0-9_.-]+)")[ \t]*$/u.exec(line);
         if (disableRow === null)
             continue;
-        const next = lines[index + 1] ?? '';
-        if (/^ {2}disabled: true\s*$/u.test(next))
-            disables.push(disableRow[1]);
-        else if (/^ {2}disabled: false\s*$/u.test(next))
-            forced.push(disableRow[1]);
+        const id = (disableRow[1] ?? disableRow[2] ?? disableRow[3]);
+        const value = entryKeyValue(lines, index + 1, 'disabled');
+        if (value !== 'true' && value !== 'false')
+            continue;
+        flags.set(id, value);
+        // A row that names a module is only applied by the host when that name is
+        // the one the row's id composes to; the flag stays here so the caller can
+        // make that comparison (#1113).
+        const named = entryKeyValue(lines, index + 1, 'name');
+        const unwrapped = named === null ? null : named.replace(/^(['"])(.*)\1$/u, '$2');
+        if (unwrapped !== null && unwrapped !== '')
+            names.set(id, unwrapped);
+        else
+            names.delete(id);
     }
-    return { disables, forced, inserts };
+    const withFlag = (flag) => [...flags.keys()].filter(id => flags.get(id) === flag);
+    return {
+        disables: withFlag('true'),
+        forced: withFlag('false'),
+        inserts,
+        ...(names.size > 0 ? { names: Object.fromEntries(names) } : {}),
+    };
 }
 /**
  * User-authored insert rows that still load `packageName` (or one of its
@@ -232,6 +345,30 @@ export function userPatchPackageReferences(patchPath, packageName) {
     }
     return [...insertedNames].filter(reference => reference === packageName || reference.startsWith(`${packageName}/`));
 }
+/**
+ * A loader entry's id as a string, or '' when it has none.
+ *
+ * `EntryOptions.id` is a TypeScript interface, not a runtime check: an
+ * unquoted `- id: 1` in `cordis.patch.yml` is parsed by YAML as the NUMBER 1,
+ * the host's loader accepts it, and every `.split(':')` on it then throws —
+ * `/dsh-market/installed` answered 400 with an empty body and the UI showed
+ * "no community plugins installed" (#1071). The market's own regex parser
+ * only ever produces strings, so this is reachable only through the loader.
+ *
+ * Numbers are stringified rather than dropped: `id: 1` names the same entry
+ * the user wrote, and the market's own row comparisons are string-keyed.
+ *
+ * @param entry - a host loader entry.
+ * @returns the id as a string, '' when absent or not a string/number.
+ */
+export function loaderEntryId(entry) {
+    const id = entry?.options?.id;
+    if (typeof id === 'string')
+        return id;
+    if (typeof id === 'number' && Number.isFinite(id))
+        return String(id);
+    return '';
+}
 /** The include entry's id prefix (loader entry ids look like `include:X`). */
 function includePrefix(host) {
     for (const entry of host.loader.entries()) {
@@ -278,7 +415,7 @@ export function rowIdsForPackage(host, profileDirectory, packageName) {
     for (const entry of host.loader.entries()) {
         if (entry.options?.name !== packageName)
             continue;
-        let id = entry.options.id ?? '';
+        let id = loaderEntryId(entry);
         if (id === '')
             continue;
         if (prefix !== '' && id.startsWith(prefix))
@@ -308,42 +445,70 @@ function foreignDisableIds(rows) {
     return ids;
 }
 /**
- * The ids of OTHER plugins a package's bundle patch DISABLES — top-level
- * `- id: X` + `disabled: true` rows targeting plugins it does not own. This is
- * the precise marker of a bundle whose toggle-off can brick the boot (#224):
- * dsh-postgres-backends disables session-persistence-jsonl, so once the market
- * also disables the postgres backends nothing provides sessionPersistence.
+ * Top-level patch rows that add an `inject:` requirement to another plugin.
+ *
+ * Same shape rule as foreignDisableIds: anything at the top level with an id
+ * is a statement about a plugin this package does not own. An `inject` there
+ * makes that foreign row depend on a service — usually one this bundle
+ * provides — so switching this package off while leaving its patch in the
+ * stack strands the row: #938's billion-context adds
+ * `inject: [biliBasicCompactionPolicy]` to the four official agent presets,
+ * and a row-level disable left them unable to activate.
+ */
+function foreignInjectIds(rows) {
+    const ids = [];
+    for (const row of rows) {
+        if (row === null || typeof row !== 'object' || Array.isArray(row))
+            continue;
+        const record = row;
+        const id = record.id;
+        if (typeof id === 'string' && record.inject !== undefined && !ids.includes(id))
+            ids.push(id);
+    }
+    return ids;
+}
+/**
+ * The ids of OTHER plugins a package's bundle patch rewires — top-level rows
+ * that either `disabled: true` a plugin it does not own, or add an `inject:`
+ * requirement to one.
+ *
+ * Both are the marker of a bundle whose toggle-off can brick the boot while
+ * its patch keeps applying (#224, #938):
+ *  - dsh-postgres-backends disables session-persistence-jsonl, so once the
+ *    market also disables the postgres backends nothing provides
+ *    sessionPersistence;
+ *  - billion-context adds `inject: [biliBasicCompactionPolicy]` to the four
+ *    official agent presets, so disabling only its own row leaves the presets
+ *    waiting for a service that no longer exists — every preset disappears.
  *
  * A bundle that merely RECONFIGURES a neighbour is deliberately NOT counted:
  * the e2e fixture-cross tweaks dshm-fixture-b's config, and #147 requires
  * disabling it to leave that neighbour live — dropping such a bundle from the
  * stack broke its re-enable. Config-only side effects stay on the normal #147
- * path; only a foreign `disabled: true` triggers the bundle removal. Removing
- * the bundle still neutralizes any config side effects it carries, since its
- * whole patch stops applying.
+ * path. Removing the bundle still neutralizes any config side effects it
+ * carries, since its whole patch stops applying.
  *
- * Reads both patch sources like rowIdsForPackage — the declared dsh.bundle.patch
- * and the conventional root cordis.patch.yml — so either form is detected.
+ * Reads both patch sources like rowIdsForPackage — the declared
+ * dsh.bundle.patch (one file or a LIST of them, #792) and the conventional
+ * root cordis.patch.yml — so either form is detected, and every declared file
+ * is attributed.
  */
-export function carrierDisableIds(profileDirectory, packageName) {
+export function carrierRowIds(profileDirectory, packageName) {
     const packageDir = join(profileDirectory, 'node_modules', packageName);
-    const disabled = new Set();
+    const rows = new Set();
     const collectFromFile = (patchPath) => {
-        const rows = parsePatchFile(patchPath);
-        if (rows === null)
+        const parsed = parsePatchFile(patchPath);
+        if (parsed === null)
             return;
-        for (const id of foreignDisableIds(rows))
-            disabled.add(id);
+        for (const id of foreignDisableIds(parsed))
+            rows.add(id);
+        for (const id of foreignInjectIds(parsed))
+            rows.add(id);
     };
-    try {
-        const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
-        const declared = manifest.dsh?.bundle?.patch;
-        if (typeof declared === 'string' && declared !== '')
-            collectFromFile(join(packageDir, declared));
-    }
-    catch { /* package not installed — nothing to attribute */ }
+    for (const file of declaredBundlePatchFiles(packageDir))
+        collectFromFile(file);
     collectFromFile(join(packageDir, 'cordis.patch.yml'));
-    return [...disabled];
+    return [...rows];
 }
 /**
  * The ids a package's bundle patch touches WITHOUT inserting them itself.
@@ -360,10 +525,10 @@ export function carrierDisableIds(profileDirectory, packageName) {
  * fixture-cross e2e exist to protect, where the neighbour must keep running
  * and the bundle must keep re-enabling.
  *
- * Reads both patch sources like carrierDisableIds: the declared
- * `dsh.bundle.patch` and the conventional root cordis.patch.yml. Ownership is
- * judged per file, because a package may ship both and only the file's own
- * `insert:` block says which ids it brings in.
+ * Reads both patch sources like carrierRowIds: the declared
+ * `dsh.bundle.patch` (one file or a LIST, #792) and the conventional root
+ * cordis.patch.yml. Ownership is judged per file, because a package may ship
+ * both and only the file's own `insert:` block says which ids it brings in.
  */
 export function foreignRowIds(profileDirectory, packageName) {
     const packageDir = join(profileDirectory, 'node_modules', packageName);
@@ -387,13 +552,8 @@ export function foreignRowIds(profileDirectory, packageName) {
         }
         catch { /* no such patch — nothing attributed to it */ }
     };
-    try {
-        const manifest = JSON.parse(readFileSync(join(packageDir, 'package.json'), 'utf8'));
-        const declared = manifest.dsh?.bundle?.patch;
-        if (typeof declared === 'string' && declared !== '')
-            readPatch(join(packageDir, declared));
-    }
-    catch { /* package not installed — nothing to attribute */ }
+    for (const file of declaredBundlePatchFiles(packageDir))
+        readPatch(file);
     readPatch(join(packageDir, 'cordis.patch.yml'));
     return [...foreign];
 }
@@ -408,9 +568,20 @@ export function packagePatchFlags(host, profileDirectory, names, state) {
     const forced = [];
     for (const name of names) {
         const rows = rowIdsForPackage(host, profileDirectory, name);
-        if (rows.some(id => state.disables.includes(id)))
+        // Rows the package's own layer already ships off say nothing about what
+        // the user decided (#876): `dsh-mnemon` ships four strategy rows as
+        // opt-in, its user patch layer repeats one of them, and the package was
+        // reported as 「已停用 / 重启后保持关闭」 while it was running. Only the
+        // user's decisions ABOVE the bundle's own default count.
+        const optOut = new Set(bundleOptOutRowIds(join(profileDirectory, 'node_modules', name)));
+        const decidedByUser = (id) => !optOut.has(id);
+        // A row that names a module other than this id's does nothing in the
+        // host, so it is not a decision about this package (#1113): the shape a
+        // package rename leaves behind.
+        const applies = (id) => rowFlagApplies(state, id, composedRowName(host, id));
+        if (rows.some(id => decidedByUser(id) && applies(id) && state.disables.includes(id)))
             disabled.push(name);
-        if (rows.some(id => state.forced.includes(id)))
+        if (rows.some(id => decidedByUser(id) && applies(id) && state.forced.includes(id)))
             forced.push(name);
     }
     return { disabled, forced };
@@ -429,11 +600,136 @@ function rowBlock(rowId, disabled) {
     return `- id: ${rowId}\n  disabled: ${disabled ? 'true' : 'false'}\n`;
 }
 /**
+ * Rewrite standalone id/flag rows while preserving the surrounding file.
+ * Comments and blank lines may separate the fields (#930). Look beyond them
+ * after the flag too: an indented config/name/key makes this a longer entry,
+ * whose first lines must never be removed (#821). Trailing comments stay put.
+ */
+function rewriteRowBlocks(text, rowId, disabled, replace, expected = null) {
+    const id = escapeRegExp(rowId);
+    const idLine = new RegExp(`^- id: (?:${id}|'${id}'|"${id}")[ \t]*$`, 'u');
+    const lines = text.match(/[^\n]*(?:\n|$)/gu)?.filter(Boolean) ?? [];
+    const offsets = [0];
+    for (const line of lines)
+        offsets.push(offsets[offsets.length - 1] + line.length);
+    let result = '', copied = 0;
+    for (let index = 0; index < lines.length; index += 1) {
+        if (!idLine.test(lines[index].replace(/\r?\n$/u, '')))
+            continue;
+        // A row that names another module is skipped by the host, so rewriting it
+        // would report a change that never happens (#1113).
+        const named = entryKeyValue(lines, index + 1, 'name');
+        if (!rowApplies(named === null ? null : named.replace(/^(['"])(.*)\1$/u, '$2'), expected))
+            continue;
+        const flagIndex = nextPatchContentLine(lines, index + 1);
+        const flag = /^ {2}disabled: (true|false)[ \t]*(?:\r?\n)?$/u.exec(lines[flagIndex] ?? '');
+        if (flag === null || (disabled !== 'any' && flag[1] !== disabled))
+            continue;
+        const following = nextPatchContentLine(lines, flagIndex + 1);
+        if (/^[ \t]/u.test(lines[following] ?? ''))
+            continue;
+        const start = offsets[index], end = offsets[flagIndex + 1];
+        result += text.slice(copied, start) + replace(text.slice(start, end));
+        copied = end;
+        index = flagIndex;
+    }
+    return result + text.slice(copied);
+}
+/**
+ * What the patch file finally says about one row: the flag of its last
+ * `- id: X` entry that carries one, rows with more keys included. Later
+ * entries override earlier ones.
+ */
+/**
+ * The row's own flag as the HOST will compose it, from a real YAML parse.
+ *
+ * The line scanner is deliberately conservative, so it is blind to spellings
+ * it was not written for — flow style `- { id: x, disabled: true }`, `disabled`
+ * above `id`, `True`, a comment on the id line (#1112). The host parses the
+ * file and applies entries in order, the last one winning, so this is both the
+ * reading the user means and the one that decides.
+ *
+ * @returns 'true'/'false' from the last entry naming the row, or null when the
+ *   text cannot be read as DSH's patch dialect — the caller then keeps the line
+ *   scanner's answer rather than guessing.
+ */
+function composedRowFlag(text, rowId, expected = null) {
+    let rows;
+    try {
+        rows = parsePatchText(text);
+    }
+    catch {
+        return null;
+    }
+    if (rows === null)
+        return null;
+    let flag = null;
+    for (const row of rows) {
+        if (row === null || typeof row !== 'object' || Array.isArray(row))
+            continue;
+        const entry = row;
+        if (entry.id !== rowId)
+            continue;
+        // A row naming another module never reaches this id's entry (#1113).
+        if (!rowApplies(entry.name, expected))
+            continue;
+        // An `!!js` expression arrives as a function (or a tag object): it decides
+        // by itself, and flattening it here would freeze one host's answer.
+        if (entry.disabled === true)
+            flag = 'true';
+        else if (entry.disabled === false)
+            flag = 'false';
+    }
+    return flag;
+}
+function lastRowFlag(text, rowId, expected = null) {
+    const id = escapeRegExp(rowId);
+    const idLine = new RegExp(`^- id: (?:${id}|'${id}'|"${id}")\\s*$`, 'u');
+    const lines = text.split(/\r?\n/u);
+    let flag = null;
+    for (let index = 0; index < lines.length; index += 1) {
+        if (!idLine.test(lines[index] ?? ''))
+            continue;
+        const named = entryKeyValue(lines, index + 1, 'name');
+        const name = named === null ? null : named.replace(/^(['"])(.*)\1$/u, '$2');
+        if (!rowApplies(name, expected))
+            continue;
+        const value = entryKeyValue(lines, index + 1, 'disabled');
+        if (value === 'true' || value === 'false')
+            flag = value;
+    }
+    return flag;
+}
+/**
  * Append one top-level patch entry, refusing when the file is not a valid
  * entry list. The refusal is the point: a malformed patch layer (the
  * `[]` + items mistake, or any broken YAML) must never be made worse —
  * the market reports it and keeps its own live/state.json toggle instead.
  */
+/**
+ * Write the patch file, or say in the user's words why it could not be
+ * written (kettly1260's family of reports, and #582's read-only case): a bare
+ * `EACCES: permission denied, open '…'` reaching the UI tells a user nothing
+ * they can act on, while the plugin's actual state has already changed.
+ */
+function writePatchFile(patchPath, contents) {
+    try {
+        writeFileSync(patchPath, contents);
+        return { ok: true, reason: null };
+    }
+    catch (error) {
+        const code = error !== null && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+        const detail = code === 'EACCES' || code === 'EPERM' || code === 'EROFS'
+            ? '文件不可写（只读或被系统保护）'
+            : code === 'ENOSPC'
+                ? '磁盘空间不足'
+                : error instanceof Error ? error.message : String(error);
+        return {
+            ok: false,
+            reason: `补丁层文件写不进去：${detail} / the patch file could not be written: ${code === 'EACCES' || code === 'EPERM' || code === 'EROFS' ? 'it is read-only' : detail}`,
+        };
+    }
+}
 function appendPatchEntry(patchPath, block) {
     let text = '';
     try {
@@ -442,8 +738,7 @@ function appendPatchEntry(patchPath, block) {
     catch { /* created below */ }
     const core = text.trim();
     if (core === '') {
-        writeFileSync(patchPath, block);
-        return { ok: true, reason: null };
+        return writePatchFile(patchPath, block);
     }
     // The dsh profile template ships an empty `[]` placeholder (a valid
     // empty list). Appending after it would create TWO top-level elements in
@@ -453,14 +748,12 @@ function appendPatchEntry(patchPath, block) {
     // Comments only (the user dropped the placeholder): append after them.
     if (withoutComments === '') {
         const next = text.endsWith('\n') ? text : `${text}\n`;
-        writeFileSync(patchPath, `${next}${block}`);
-        return { ok: true, reason: null };
+        return writePatchFile(patchPath, `${next}${block}`);
     }
     if (withoutComments === '[]' || withoutComments === '[ ]') {
         const commented = text.replace(/^[ \t]*\[[ \t]*\][ \t]*(?:#.*)?(?:\r?\n|$)/mu, '# []\n');
         const next = commented.endsWith('\n') ? commented : `${commented}\n`;
-        writeFileSync(patchPath, `${next}${block}`);
-        return { ok: true, reason: null };
+        return writePatchFile(patchPath, `${next}${block}`);
     }
     // A top-level flow LIST (other than the placeholder above) cannot be
     // appended to: `- id: X` after `[1, 2]` would create two top-level
@@ -485,33 +778,22 @@ function appendPatchEntry(patchPath, block) {
         };
     }
     const next = text.endsWith('\n') ? text : `${text}\n`;
-    writeFileSync(patchPath, `${next}${block}`);
-    return { ok: true, reason: null };
+    return writePatchFile(patchPath, `${next}${block}`);
 }
-/** Disable one row: append `- id: X` + `disabled: true` (idempotent). */
-export function disableRow(patchPath, rowId) {
+/**
+ * Disable one row: `- id: X` + `disabled: true` (idempotent).
+ *
+ * A force-enable block already there is flipped in place rather than
+ * followed by a second block (#821): the pair cancelled out by order alone,
+ * and an uninstall that cleared one of them left the other behind to switch
+ * a later reinstall off. Duplicates an older version left are folded into
+ * the one block at the same time.
+ */
+export function disableRow(patchPath, rowId, options = {}) {
     return queuedWrite(async () => {
         if (!ROW_ID_RE.test(rowId)) {
             return { ok: false, reason: `行 id 含特殊字符,不支持写入补丁层 / row id ${rowId} cannot be written to the patch layer` };
         }
-        const state = readUserPatchState(patchPath);
-        if (state.disables.includes(rowId))
-            return { ok: true, reason: null };
-        const result = appendPatchEntry(patchPath, rowBlock(rowId, true));
-        if (result.ok)
-            logEvent('info', 'patch', `disabled row ${rowId} in ${patchPath}`);
-        return result;
-    });
-}
-/** Enable one row: remove the `disabled: true` block; force-enable with
- * `disabled: false` when a lower layer (bundle/home patch) holds it down. */
-export function enableRow(patchPath, rowId) {
-    return queuedWrite(async () => {
-        if (!ROW_ID_RE.test(rowId)) {
-            return { ok: false, reason: `行 id 含特殊字符,不支持写入补丁层 / row id ${rowId} cannot be written to the patch layer` };
-        }
-        const state = readUserPatchState(patchPath);
-        const blockRe = new RegExp(`^- id: ['\"]?${escapeRegExp(rowId)}['\"]?\\r?\\n  disabled: true\\r?\\n`, 'mu');
         const text = (() => {
             try {
                 return readFileSync(patchPath, 'utf8');
@@ -520,11 +802,85 @@ export function enableRow(patchPath, rowId) {
                 return '';
             }
         })();
-        if (blockRe.test(text)) {
-            writeFileSync(patchPath, withPlaceholderRestored(text.replace(blockRe, '')));
-            logEvent('info', 'patch', `enabled row ${rowId} in ${patchPath}`);
+        let kept = false;
+        const next = rewriteRowBlocks(text, rowId, 'any', block => {
+            if (kept)
+                return '';
+            kept = true;
+            return block.replace(/^ {2}disabled: false(?=[ \t]*(?:\r?\n|$))/mu, '  disabled: true');
+        }, options.expectedName ?? null);
+        if (next !== text) {
+            const flipped = writePatchFile(patchPath, next);
+            if (!flipped.ok)
+                return flipped;
+            // A longer entry for the row further down still has the last word.
+            if (lastRowFlag(next, rowId, options.expectedName ?? null) !== 'true') {
+                const result = appendPatchEntry(patchPath, rowBlock(rowId, true));
+                if (!result.ok)
+                    return result;
+            }
+            logEvent('info', 'patch', `disabled row ${rowId} in ${patchPath}`);
             return { ok: true, reason: null };
         }
+        // A row whose `name` is not this entry's owns nothing here: counting it
+        // as already-disabled would answer "off" and change nothing, leaving the
+        // plugin running (#1113).
+        const state = withoutMismatchedRow(readUserPatchState(patchPath), rowId, options.expectedName ?? null);
+        if (state.disables.includes(rowId))
+            return { ok: true, reason: null };
+        const result = appendPatchEntry(patchPath, rowBlock(rowId, true));
+        if (result.ok)
+            logEvent('info', 'patch', `disabled row ${rowId} in ${patchPath}`);
+        return result;
+    });
+}
+/** Enable one row: remove its `disabled: true` blocks; force-enable with
+ * `disabled: false` when a lower layer (bundle/home patch) holds it down, or
+ * when a longer entry of the row still says `disabled: true` (#1099): that
+ * entry is never cut up (#821), so it can only be overridden from below.
+ *
+ * `cleanOnly` is that cleanup and nothing else: remove a block the market
+ * itself left on a row, never write a new one (#1110). An opt-in row of a
+ * bundle and a row whose `disabled` is an expression are off by design, and
+ * appending `disabled: false` above them force-opens a row that should stay
+ * closed — the host composes later entries last, so the append wins. */
+export function enableRow(patchPath, rowId, options = {}) {
+    const cleanOnly = options.cleanOnly === true;
+    const expected = options.expectedName ?? null;
+    return queuedWrite(async () => {
+        if (!ROW_ID_RE.test(rowId)) {
+            return { ok: false, reason: `行 id 含特殊字符,不支持写入补丁层 / row id ${rowId} cannot be written to the patch layer` };
+        }
+        const state = withoutMismatchedRow(readUserPatchState(patchPath), rowId, expected);
+        const text = (() => {
+            try {
+                return readFileSync(patchPath, 'utf8');
+            }
+            catch {
+                return '';
+            }
+        })();
+        const next = rewriteRowBlocks(text, rowId, 'true', () => '', expected);
+        if (next !== text) {
+            const written = writePatchFile(patchPath, withPlaceholderRestored(next));
+            if (!written.ok)
+                return written;
+            // A longer entry for the row may still have the last word — and so may a
+            // spelling the line scanner cannot see (#1112). Ask the parser the host
+            // uses; when the file is not readable as its dialect, fall back to the
+            // scanner.
+            const stillOff = composedRowFlag(next, rowId, expected) ?? lastRowFlag(next, rowId, expected);
+            if (!cleanOnly && stillOff === 'true') {
+                const result = appendPatchEntry(patchPath, rowBlock(rowId, false));
+                if (!result.ok)
+                    return result;
+            }
+            logEvent('info', 'patch', `${cleanOnly ? 'cleared the block on' : 'enabled'} row ${rowId} in ${patchPath}`);
+            return { ok: true, reason: null };
+        }
+        // Nothing of the market's own to clean: the row's default stands.
+        if (cleanOnly)
+            return { ok: true, reason: null };
         if (state.forced.includes(rowId))
             return { ok: true, reason: null };
         const result = appendPatchEntry(patchPath, rowBlock(rowId, false));
@@ -559,15 +915,15 @@ export function removeRowBlocks(patchPath, rowIds) {
         text = readFileSync(patchPath, 'utf8');
     }
     catch {
-        return;
-    }
+        return { ok: true, reason: null };
+    } // no file, nothing to remove
     let next = text;
-    for (const rowId of rowIds) {
-        const blockRe = new RegExp(`^- id: ['\"]?${escapeRegExp(rowId)}['\"]?\\r?\\n  disabled: (?:true|false)\\r?\\n`, 'mu');
-        next = next.replace(blockRe, '');
-    }
-    if (next !== text) {
-        writeFileSync(patchPath, withPlaceholderRestored(next));
+    for (const rowId of rowIds)
+        next = rewriteRowBlocks(next, rowId, 'any', () => '');
+    if (next === text)
+        return { ok: true, reason: null };
+    const written = writePatchFile(patchPath, withPlaceholderRestored(next));
+    if (written.ok)
         logEvent('info', 'patch', `removed patch rows for ${rowIds.join(', ')}`);
-    }
+    return written;
 }

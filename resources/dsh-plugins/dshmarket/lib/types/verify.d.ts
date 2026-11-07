@@ -26,7 +26,7 @@
  *             or a declared entry artifact that is missing
  *   missing – not present in node_modules
  */
-export type ActivationState = 'live' | 'restart' | 'incompatible' | 'inert' | 'broken' | 'missing' | 'disabled';
+export type ActivationState = 'live' | 'restart' | 'incompatible' | 'inert' | 'broken' | 'failed' | 'missing' | 'disabled';
 export interface ActivationResult {
     state: ActivationState;
     /** Bilingual, user-facing explanations (zh / en joined with " / "). */
@@ -41,7 +41,32 @@ export interface ActivationResult {
      * chose (#634). Only ever set on `inert`.
      */
     dependencyOf?: string;
+    /**
+     * Set on `inert` when the package's own bundle patch loads nothing but the
+     * user's own patch names it somewhere — an Agent preset's plugin row, say
+     * (#813). The market cannot see those trees, so it neither promises a
+     * restart nor calls the plugin off; it says where the plugin comes from.
+     */
+    loadedByProfile?: true;
+    /** The package explicitly declares itself a library, without a plugin surface. */
+    library?: true;
 }
+/**
+ * Whether every bundle patch the package declares parses to an empty list.
+ *
+ * Such a bundle row loads nothing at boot: listing it in `dsh.profile.bundles`
+ * or taking it out changes nothing, so neither "restart to apply" nor the
+ * #696 "removed from bundles means off" inference applies to it (#813). A
+ * patch that is missing or unreadable is NOT empty — other verdicts own it.
+ */
+export declare function bundlePatchIsEmpty(packageDir: string): boolean;
+interface PkgDsh {
+    bundle?: unknown;
+    client?: unknown;
+    kind?: unknown;
+}
+/** Manifest-only library declaration; observed loader activity can override its status. */
+export declare function isDeclaredLibraryDsh(dsh: PkgDsh | null | undefined): boolean;
 /**
  * What the running host is, for the #757 boot-gate prediction.
  *
@@ -101,7 +126,14 @@ export declare function peerGateRemedy(gate: PeerGate): {
  * compatibility.json takes effect without a market restart.
  */
 export declare function defaultHostRuntimeFacts(activeProfileDir: string): HostRuntimeFacts;
-export declare function verifyActivation(profile: string, name: string, live?: ReadonlySet<string>, explicitDir?: string, isDisabled?: boolean, hostFacts?: HostRuntimeFacts): ActivationResult;
+export declare function verifyActivation(profile: string, name: string, live?: ReadonlySet<string>, explicitDir?: string, isDisabled?: boolean, hostFacts?: HostRuntimeFacts, loaderObserved?: boolean, 
+/**
+ * The host's OWN row for this package exists and has no fiber (#1023).
+ * The loader creates an entry before it imports the module, so an entry
+ * that never got a fiber is a row the boot tried and did not activate —
+ * "restart to apply" would promise something the next start cannot deliver.
+ */
+loaderNeverStarted?: boolean): ActivationResult;
 /**
  * Correct a post-UPDATE verdict for a plugin that was already running.
  *
@@ -165,6 +197,43 @@ export interface BundleCheck {
     reason: string | null;
 }
 /**
+ * Every namespace a client bundle asks its config from (#810).
+ *
+ * One level of constant propagation, as asked for in the report: the plugin
+ * that started this writes `var NAMESPACE = "dsh-comfyui-canvas"` and calls
+ * `configForms.get(NAMESPACE)`, so a literal-only scan would miss the very
+ * case the check exists for. A name assigned twice is dropped rather than
+ * guessed at — which value it holds at the call site is not decidable from
+ * text alone, and a wrong guess here would be reported as a plugin defect.
+ */
+export declare function configFormNamespaces(source: string): string[];
+/** A package whose client asks for a namespace nothing in the composition serves (#810). */
+export interface UnservedConfigNamespace {
+    /** The installed package whose client bundle asks. */
+    name: string;
+    /** The namespaces it asks for that no loader entry id answers to. */
+    namespaces: string[];
+    /** Entry ids this package's own patch declares — the value it meant. */
+    ownEntryIds: string[];
+}
+/**
+ * Installed plugins whose client reads its config from a name nothing serves
+ * (#810).
+ *
+ * `served` is the entry id set of the WHOLE composition — deliberately not
+ * this package's own ids: a package may legitimately mount another one
+ * (carrier form), and judging by own ids alone would flag those. `ownIdsOf`
+ * answers what the package itself declares, which is the value to write
+ * instead — the report asked for the correct spelling to be shown, not just
+ * the mistake.
+ *
+ * The scan reads one bundle per installed plugin. Measured against the same
+ * cost the syntax sweep above already pays (0.40ms per plugin on a 385KB
+ * bundle), so a 30-plugin profile is ~12ms — this runs on a request a user
+ * made, not in a loop.
+ */
+export declare function findUnservedConfigNamespaces(profile: string, served: ReadonlySet<string>, ownIdsOf: (name: string) => string[], explicitDir?: string): UnservedConfigNamespace[];
+/**
  * Every installed plugin whose client bundle will not parse (#222 by
  * @MicroMilo).
  *
@@ -205,3 +274,4 @@ export declare function newlyBrokenBundles(before: readonly {
     reason: string;
 }[];
 export declare function checkClientBundle(profile: string, name: string, explicitDir?: string): BundleCheck;
+export {};

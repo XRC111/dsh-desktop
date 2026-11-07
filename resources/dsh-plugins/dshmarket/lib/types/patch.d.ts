@@ -55,13 +55,28 @@ export interface PatchState {
     forced: string[];
     /** Row ids the user patch inserts. */
     inserts: string[];
+    /** The `name` a flag row carries, when it carries one. A row whose name
+     * does not match the composed entry is skipped by the host, so its flag is
+     * not a decision about anything (#1113). */
+    names?: Record<string, string>;
 }
 /**
- * Line-wise scan of one patch file — the plugin-hub shapes. Deliberately
- * not a YAML parse: the file may hold structures the market's dialect
- * rejects, but a plain `- id: X` + `disabled: true|false` pair is enough
- * to know what the user patch layer says.
+ * The name the loader composed for a row, or null when the id is not there.
+ *
+ * This is the comparison the host makes, against the composed entry's own
+ * `name` — NOT `nameMatchesPackage()`, which judges package ownership and
+ * treats a subpath name and a foreign package name the same way (#1113).
  */
+export declare function composedRowName(host: PatchHost, rowId: string): string | null;
+/**
+ * Whether the user layer's flag for this row is a decision the host applies.
+ *
+ * @param state - the user patch state.
+ * @param rowId - the row being asked about.
+ * @param expected - the composed entry's name, or null when the id is not in
+ *   the loader.
+ */
+export declare function rowFlagApplies(state: PatchState, rowId: string, expected: string | null): boolean;
 export declare function readUserPatchState(patchPath: string): PatchState;
 /**
  * User-authored insert rows that still load `packageName` (or one of its
@@ -75,6 +90,27 @@ export declare function readUserPatchState(patchPath: string): PatchState;
  */
 export declare function userPatchPackageReferences(patchPath: string, packageName: string): string[] | null;
 /**
+ * A loader entry's id as a string, or '' when it has none.
+ *
+ * `EntryOptions.id` is a TypeScript interface, not a runtime check: an
+ * unquoted `- id: 1` in `cordis.patch.yml` is parsed by YAML as the NUMBER 1,
+ * the host's loader accepts it, and every `.split(':')` on it then throws —
+ * `/dsh-market/installed` answered 400 with an empty body and the UI showed
+ * "no community plugins installed" (#1071). The market's own regex parser
+ * only ever produces strings, so this is reachable only through the loader.
+ *
+ * Numbers are stringified rather than dropped: `id: 1` names the same entry
+ * the user wrote, and the market's own row comparisons are string-keyed.
+ *
+ * @param entry - a host loader entry.
+ * @returns the id as a string, '' when absent or not a string/number.
+ */
+export declare function loaderEntryId(entry: {
+    options?: {
+        id?: unknown;
+    };
+} | null | undefined): string;
+/**
  * The user-patch row ids one installed package owns: its bundle patch's
  * insert rows, plus the loader entries currently carrying its name.
  * Empty for client-only packages (no bundle rows) — the market's own
@@ -85,24 +121,32 @@ export declare function userPatchPackageReferences(patchPath: string, packageNam
  */
 export declare function rowIdsForPackage(host: PatchHost, profileDirectory: string, packageName: string): string[];
 /**
- * The ids of OTHER plugins a package's bundle patch DISABLES — top-level
- * `- id: X` + `disabled: true` rows targeting plugins it does not own. This is
- * the precise marker of a bundle whose toggle-off can brick the boot (#224):
- * dsh-postgres-backends disables session-persistence-jsonl, so once the market
- * also disables the postgres backends nothing provides sessionPersistence.
+ * The ids of OTHER plugins a package's bundle patch rewires — top-level rows
+ * that either `disabled: true` a plugin it does not own, or add an `inject:`
+ * requirement to one.
+ *
+ * Both are the marker of a bundle whose toggle-off can brick the boot while
+ * its patch keeps applying (#224, #938):
+ *  - dsh-postgres-backends disables session-persistence-jsonl, so once the
+ *    market also disables the postgres backends nothing provides
+ *    sessionPersistence;
+ *  - billion-context adds `inject: [biliBasicCompactionPolicy]` to the four
+ *    official agent presets, so disabling only its own row leaves the presets
+ *    waiting for a service that no longer exists — every preset disappears.
  *
  * A bundle that merely RECONFIGURES a neighbour is deliberately NOT counted:
  * the e2e fixture-cross tweaks dshm-fixture-b's config, and #147 requires
  * disabling it to leave that neighbour live — dropping such a bundle from the
  * stack broke its re-enable. Config-only side effects stay on the normal #147
- * path; only a foreign `disabled: true` triggers the bundle removal. Removing
- * the bundle still neutralizes any config side effects it carries, since its
- * whole patch stops applying.
+ * path. Removing the bundle still neutralizes any config side effects it
+ * carries, since its whole patch stops applying.
  *
- * Reads both patch sources like rowIdsForPackage — the declared dsh.bundle.patch
- * and the conventional root cordis.patch.yml — so either form is detected.
+ * Reads both patch sources like rowIdsForPackage — the declared
+ * dsh.bundle.patch (one file or a LIST of them, #792) and the conventional
+ * root cordis.patch.yml — so either form is detected, and every declared file
+ * is attributed.
  */
-export declare function carrierDisableIds(profileDirectory: string, packageName: string): string[];
+export declare function carrierRowIds(profileDirectory: string, packageName: string): string[];
 /**
  * The ids a package's bundle patch touches WITHOUT inserting them itself.
  *
@@ -118,10 +162,10 @@ export declare function carrierDisableIds(profileDirectory: string, packageName:
  * fixture-cross e2e exist to protect, where the neighbour must keep running
  * and the bundle must keep re-enabling.
  *
- * Reads both patch sources like carrierDisableIds: the declared
- * `dsh.bundle.patch` and the conventional root cordis.patch.yml. Ownership is
- * judged per file, because a package may ship both and only the file's own
- * `insert:` block says which ids it brings in.
+ * Reads both patch sources like carrierRowIds: the declared
+ * `dsh.bundle.patch` (one file or a LIST, #792) and the conventional root
+ * cordis.patch.yml. Ownership is judged per file, because a package may ship
+ * both and only the file's own `insert:` block says which ids it brings in.
  */
 export declare function foreignRowIds(profileDirectory: string, packageName: string): string[];
 /**
@@ -134,17 +178,41 @@ export declare function packagePatchFlags(host: PatchHost, profileDirectory: str
     disabled: string[];
     forced: string[];
 };
-/** Disable one row: append `- id: X` + `disabled: true` (idempotent). */
-export declare function disableRow(patchPath: string, rowId: string): Promise<{
+/**
+ * Disable one row: `- id: X` + `disabled: true` (idempotent).
+ *
+ * A force-enable block already there is flipped in place rather than
+ * followed by a second block (#821): the pair cancelled out by order alone,
+ * and an uninstall that cleared one of them left the other behind to switch
+ * a later reinstall off. Duplicates an older version left are folded into
+ * the one block at the same time.
+ */
+export declare function disableRow(patchPath: string, rowId: string, options?: {
+    expectedName?: string | null;
+}): Promise<{
     ok: boolean;
     reason: string | null;
 }>;
-/** Enable one row: remove the `disabled: true` block; force-enable with
- * `disabled: false` when a lower layer (bundle/home patch) holds it down. */
-export declare function enableRow(patchPath: string, rowId: string): Promise<{
+/** Enable one row: remove its `disabled: true` blocks; force-enable with
+ * `disabled: false` when a lower layer (bundle/home patch) holds it down, or
+ * when a longer entry of the row still says `disabled: true` (#1099): that
+ * entry is never cut up (#821), so it can only be overridden from below.
+ *
+ * `cleanOnly` is that cleanup and nothing else: remove a block the market
+ * itself left on a row, never write a new one (#1110). An opt-in row of a
+ * bundle and a row whose `disabled` is an expression are off by design, and
+ * appending `disabled: false` above them force-opens a row that should stay
+ * closed — the host composes later entries last, so the append wins. */
+export declare function enableRow(patchPath: string, rowId: string, options?: {
+    cleanOnly?: boolean;
+    expectedName?: string | null;
+}): Promise<{
     ok: boolean;
     reason: string | null;
 }>;
 /** Remove every disable/force block the market (or the user) wrote for a
  * row — the uninstall cleanup, so a removed plugin leaves no orphan rows. */
-export declare function removeRowBlocks(patchPath: string, rowIds: readonly string[]): void;
+export declare function removeRowBlocks(patchPath: string, rowIds: readonly string[]): {
+    ok: boolean;
+    reason: string | null;
+};

@@ -4,13 +4,15 @@
  * update staleness detection. Every function takes the plugin runner as a
  * parameter so tests can substitute a recording fake.
  */
-import { closeSync, existsSync, lstatSync, openSync, readlinkSync, readSync, rmSync, statSync } from 'node:fs';
+import { closeSync, existsSync, lstatSync, openSync, readFileSync, readlinkSync, readSync, rmSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { findDshInstallDir } from './dsh-install.js';
 import { classifyPnpmFailure, HOST_NAMESPACE_RE } from './pnpm-compat.js';
-import { conflictingEntryIds, dropFromManifest, hasDshManifest, hasLoadableEntry, mergeDuplicateReleaseAgeExcludes, pluginSubdirs, profileDir, readInstalled, readManifestDeps, readProfileBundles, dropUnparseableBuildKeys } from './profile.js';
+import { conflictingEntryIds, dropFromManifest, hasDshManifest, hasLoadableEntry, mergeDuplicateReleaseAgeExcludes, pluginSubdirs, profileDir, readGitResolutionCommit, readInstalled, readInstalledVersion, readLockCommits, readManifestDeps, readProfileBundles, dropUnparseableBuildKeys } from './profile.js';
 import { logEvent } from './log.js';
-import { cleanOrphanedStore } from './store.js';
+import { registryNameOf } from './official-desktop.js';
+import { hostedRepoKey } from './sources.js';
+import { cleanOrphanedIgnored, cleanOrphanedStore } from './store.js';
 /**
  * One-shot bypass for pnpm's fresh-release hold; scoped to a single command.
  *
@@ -117,6 +119,9 @@ export function isUnpublishedHostPeer(pkg, profile, explicitDir) {
  */
 export async function withHoistRecovery(run, profile, pluginArgs, profileDirectory, options = {}) {
     const marketFlags = options.marketFlags !== false;
+    // An already verified mature update must not rewrite the user's workspace
+    // policy as a side effect of market-level recovery (#991).
+    const repairProfilePolicy = options.preserveProfilePolicy !== true;
     /** The option a recovery step needed and this host does not accept (#732). */
     let unavailableOption = null;
     // Before the FIRST run, not after a failure: the shadowed duplicate rule
@@ -125,7 +130,7 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
     // small file read. Every verb that resolves the graph is covered, not just
     // add and remove: an `install` or an in-place `update` reads the same key.
     const verb = pluginArgs.find(argument => !argument.startsWith('-'));
-    if (verb === 'add' || verb === 'remove' || verb === 'install' || verb === 'update') {
+    if (repairProfilePolicy && (verb === 'add' || verb === 'remove' || verb === 'install' || verb === 'update')) {
         const merged = mergeDuplicateReleaseAgeExcludes(profile, profileDirectory);
         if (merged.length > 0) {
             logEvent('warn', 'install', `minimumReleaseAgeExclude held several rules for ${merged.join(', ')}, and pnpm honours only the FIRST per name (#732) — merged each package's rules into one, before running`);
@@ -133,9 +138,28 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
     }
     let result = await run(profile, pluginArgs);
     const ok = (r) => r.exitCode === 0 && !r.timedOut && !r.cancelled;
-    if (!ok(result) && !result.cancelled) {
-        const failure = classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode);
-        if (failure?.code === 'unparseable-build-key') {
+    // A shadowed rule written DURING the run is its own evidence (#732). The
+    // file was merged just before the run, so a duplicate now means pnpm — or
+    // the host driving it — appended one while this command ran, and every
+    // retry would trip on it. The repair below in the release-age branch only
+    // fired when pnpm's error text reached us; the official desktop host hands
+    // back its own message and `packageResult.output`, which need not carry
+    // `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`, so the line the host had just
+    // appended stayed dead (@Mlte0907, 1.66.7). The merge is a no-op when
+    // nothing is duplicated, so asking it costs one file read.
+    let repairedDuringRun = false;
+    if (repairProfilePolicy && !ok(result) && !result.cancelled && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove')) {
+        const mergedNow = mergeDuplicateReleaseAgeExcludes(profile, profileDirectory);
+        if (mergedNow.length > 0) {
+            repairedDuringRun = true;
+            logEvent('warn', 'install', `a second minimumReleaseAgeExclude rule for ${mergedNow.join(', ')} was appended during the run, and pnpm honours only the first, shadowing it (#732) — merged them into one and retrying once`);
+            result = await run(profile, pluginArgs);
+        }
+    }
+    if (!ok(result) && !result.cancelled && !repairedDuringRun) {
+        // The profile is the only place the recorded pnpm major lives (#1100).
+        const failure = classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode, { profileDirectory });
+        if (failure?.code === 'unparseable-build-key' && repairProfilePolicy) {
             // The profile's own allowBuilds block is what fails, so no retry of the
             // same command can pass until it is repaired (#698). Drop only the
             // source-form keys this pnpm cannot parse — bare names stay, and on
@@ -167,15 +191,14 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
             // (#732) or extending a version union (#733). Either way the same
             // rewrite fixes it, needs no option at all, and so also works on the
             // desktop bridge that refuses options. Retry the SAME argv afterwards.
-            const mergedNow = mergeDuplicateReleaseAgeExcludes(profile, profileDirectory);
+            const mergedNow = repairProfilePolicy ? mergeDuplicateReleaseAgeExcludes(profile, profileDirectory) : [];
             if (mergedNow.length > 0) {
                 logEvent('warn', 'install', `pnpm appended a second minimumReleaseAgeExclude rule for ${mergedNow.join(', ')} and honours only the first, shadowing its own entry (#732) — merged them into one and retrying once`);
                 result = await run(profile, pluginArgs);
             }
-            else if (options.releaseAgeBypass === false) {
-                // The caller declined the bypass (#594), and the duplicates were not
-                // what failed: this violation is the profile's own policy doing its
-                // job, so the command stands as it is.
+            else if (options.releaseAgeBypass === false || options.preserveProfilePolicy === true) {
+                // Fresh installs (#594) and mature updates/recovery (#991) never
+                // bypass age enforcement. Preserve the native failure and policy.
             }
             else if (!marketFlags) {
                 unavailableOption = RELEASE_AGE_OVERRIDE;
@@ -204,12 +227,39 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
                 result = await run(profile, [pluginArgs[0], AUTO_INSTALL_PEERS_OFF, ...pluginArgs.slice(1)]);
             }
         }
+        else if (failure?.code === 'profile-file-locked') {
+            // #786 follow-up: the profile's own file was momentarily held, so the
+            // SAME argv succeeds — no option is needed, which also means this works
+            // on the desktop bridge that refuses market options (#732).
+            //
+            // Covers both lockfiles pnpm writes through the same no-retry atomic
+            // rename: the profile's `pnpm-lock.yaml` and the one inside
+            // `node_modules/.pnpm/lock.yaml`.
+            //
+            // Retried here rather than in the route because `pnpmBlockedByOpenFiles`
+            // and the route's rollback both read the FINAL result: leaving this
+            // unretried made the route treat a transient lock as "the running host
+            // holds the plugin's files open", restore package.json and pnpm-lock.yaml
+            // — and thereby throw away a lockfile that already pointed at the newly
+            // built commit, which is what left the profile desynchronized.
+            logEvent('warn', 'install', `pnpm was momentarily refused on a profile file (antivirus or indexer) — retrying the same command once (#786)`);
+            result = await run(profile, pluginArgs);
+        }
         else if (failure?.code === 'transient-network'
             && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove')) {
             // #83: pnpm replays the whole tree, so any existing dependency's
             // momentary network hiccup fails the run — and a plain retry succeeds.
             // Do that retry ourselves instead of reporting a false failure.
             logEvent('warn', 'install', `transient network failure while pnpm replayed the dependency tree (#83) — retrying once`);
+            result = await run(profile, pluginArgs);
+        }
+        else if (failure?.code === 'exact-version-missing'
+            && (pluginArgs[0] === 'add' || pluginArgs[0] === 'remove' || pluginArgs[0] === 'update')) {
+            // #927: market pinned name@x.y.z from /latest, but this registry's
+            // packument (often a mirror) does not list that version yet. Same argv
+            // once more gives pnpm a chance to re-fetch; if it still fails the
+            // classifier's message names "try later / switch Download region".
+            logEvent('warn', 'install', `exact version missing on this registry's packument (#927) — retrying once to re-fetch`);
             result = await run(profile, pluginArgs);
         }
         else if (failure?.code === 'fetch-timeout'
@@ -235,7 +285,7 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
         // gone (the name carries it), so a live download is never touched.
         await cleanOrphanedStore(run, profile);
         const diagnostics = diagnosticsTail(result);
-        const failure = classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode);
+        const failure = classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode, { profileDirectory });
         if (failure !== null) {
             result = {
                 ...result,
@@ -243,25 +293,56 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
                 ...(failure.replaceOutput === true ? { stdout: '' } : {}),
             };
         }
-        else if (diagnostics !== null) {
-            // The dsh CLI redirects the whole pnpm run into a file and leaves one
-            // line on stderr: `dsh: pnpm failed; diagnostics: <path>` (its own
-            // literal message). Everything a user or a report needs is in that
-            // file, so show its tail rather than the one line (#672).
-            result = { ...result, stderr: `${result.stderr}\n\n--- dsh diagnostics (${diagnostics.path}) ---\n${diagnostics.text}` };
-        }
-        else if (result.pnpmError !== undefined && result.pnpmError !== '') {
-            // Nothing matched, but pnpm DID say what went wrong — in its ndjson
-            // stream, which never reaches stderr. Without this the user is shown
-            // the tail of dsh's wrapper output ("pnpm failed in profile
-            // directory …"), which is byte-identical for every possible cause and
-            // is why #244, #192 and #138 all read as "the UI shows a stack tail".
+        else {
+            // Nothing matched. Two things may still say what went wrong, and pnpm's
+            // own words come FIRST (#808).
             //
-            // An unrecognized error is exactly the case where the raw text is
+            // pnpm's structured error arrives in its ndjson stream, which never
+            // reaches stderr. Without it the user sees the tail of dsh's wrapper
+            // output ("pnpm failed in profile directory …"), byte-identical for
+            // every possible cause — why #244, #192 and #138 all read as "the UI
+            // shows a stack tail". An unrecognized error is where the raw text is
             // worth the most: a classified one has a written explanation, this one
-            // has only pnpm's own words, and hiding them leaves nothing at all.
-            const code = result.pnpmErrorCode === undefined ? '' : `${result.pnpmErrorCode}: `;
-            result = { ...result, stderr: `${result.stderr}\n\n${code}${result.pnpmError}` };
+            // has only pnpm's own words.
+            //
+            // The CLI's diagnostics file (`dsh: pnpm failed; diagnostics: <path>`,
+            // #672) used to carry the whole pnpm run. It no longer does: dsh now
+            // pipes pnpm's output straight to the market, and the file keeps only
+            // execa's one-line summary ("Command failed with exit code 1: pnpm add
+            // …"). Showing it INSTEAD of pnpm's error — which is what an either/or
+            // here did — put that summary in front of the user and hid the real
+            // cause behind it. Its path is still worth printing for a report, so it
+            // stays, after the error.
+            const blocks = [];
+            if (result.pnpmError !== undefined && result.pnpmError !== '') {
+                const code = result.pnpmErrorCode === undefined ? '' : `${result.pnpmErrorCode}: `;
+                blocks.push(`${code}${result.pnpmError}`);
+            }
+            if (diagnostics !== null)
+                blocks.push(`--- dsh diagnostics (${diagnostics.path}) ---\n${diagnostics.text}`);
+            if (blocks.length > 0)
+                result = { ...result, stderr: `${result.stderr}\n\n${blocks.join('\n\n')}` };
+        }
+    }
+    if (!marketFlags && !ok(result) && !result.cancelled
+        && classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode)?.code === 'windows-file-locked') {
+        // The classified text offers "run it from the command line with the app
+        // closed". On the official desktop app that is the one thing the market
+        // does not do for the user — it never falls back to `dsh plugin --profile
+        // desktop`, which is forbidden there — so the advice sent the reporter to a
+        // door the market itself keeps shut (#798). Say what to do instead: the
+        // app's own Plugins page runs the same managed pipeline.
+        //
+        // Not for the market itself: Settings → Plugins has no update entry for a
+        // package already in the profile (#909). That note would send a self-update
+        // to a shut door (#982).
+        const lockedTarget = pluginArgs.find(argument => !argument.startsWith('-') && argument !== verb) ?? '';
+        const lockedName = registryNameOf(lockedTarget) ?? lockedTarget;
+        if (lockedName !== 'dshmarket' && lockedName !== 'dsh-market') {
+            result = {
+                ...result,
+                stderr: `${result.stderr}\n\n这是官方桌面端：上面「在命令行执行」这一条在这里用不了，请改在应用自己的「设置 → 插件」里操作（退出重启后，或先停用加载该包的插件再重启）。 / This is the official desktop app: the "run it from the command line" option above is not available here — use the app's own Settings → Plugins instead (after restarting, or after disabling the plugin that loads this package and restarting).`,
+            };
         }
     }
     if (unavailableOption !== null && !ok(result) && !result.cancelled) {
@@ -269,11 +350,79 @@ export async function withHoistRecovery(run, profile, pluginArgs, profileDirecto
         // no options from us — but the classified message above says the market
         // retried. Say that it did not, or the user reads a retry that never
         // happened and looks for the wrong cause.
-        result = {
-            ...result,
-            stderr: `${result.stderr}\n\n这台宿主（官方桌面端）自己执行安装，不接受市场附加的 pnpm 参数（${unavailableOption}），所以这一步没有自动重试。 / This host (the official desktop app) runs the install itself and takes no pnpm options from the market (${unavailableOption}), so that automatic retry could not be attempted.`,
-        };
+        //
+        // The wait on a fresh release is the one of these where "no retry" leaves
+        // the user with nothing to do at all: the plugin IS published, pnpm just
+        // will not take it yet. #852 pointed at plain `dsh web`, but the desktop
+        // profile is host-managed — that door is shut (#909). Say the wait, and
+        // when pnpm named the publish time, how long is left (#919).
+        //
+        // Drop the classifier's "market already retried" sentence first: it was
+        // appended above and is false on this host, and the client prefers
+        // body.error / that classified half over a note tacked on afterwards.
+        let note;
+        if (unavailableOption === RELEASE_AGE_OVERRIDE) {
+            const classified = classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode);
+            if (classified?.code === 'release-age-violation') {
+                const cut = result.stderr.lastIndexOf(classified.message);
+                if (cut !== -1) {
+                    result = { ...result, stderr: result.stderr.slice(0, cut).trimEnd() };
+                }
+            }
+            const windowMs = readMinimumReleaseAgeMs(profile, profileDirectory);
+            const captured = `${result.stderr}\n${result.stdout}`;
+            const remaining = windowMs === null
+                ? null
+                : remainingReleaseAgeWait(captured, Date.now(), windowMs);
+            const wait = remaining === null ? { zh: '', en: '' } : formatRemainingReleaseAgeWait(remaining);
+            // #944: pnpm verifies the WHOLE lockfile, so the entry it refuses need
+            // not be the one this command asked for. When it names a different
+            // package, saying "this plugin's new version is too young" is wrong
+            // twice over — it blames an innocent package, and it attaches the
+            // remaining wait to that package's version rather than the offender's.
+            // Name the offender instead, and offer the one-line remedy the reporter
+            // used in place of waiting. Nothing is claimed when the output names no
+            // package, or names the one being installed: that path keeps #919's note.
+            const target = pluginArgs.find(argument => !argument.startsWith('-') && argument !== verb) ?? '';
+            const targetName = registryNameOf(target) ?? target;
+            const refused = refusedReleaseAgePackage(captured);
+            if (refused !== null && targetName !== '' && refused.name !== targetName) {
+                note = `拦住你的是 ${refused.name}@${refused.version}，不是你要装的这个插件：pnpm 在改动前校验整个 lockfile，而这个版本还在本机的新版本等待期内（#944）。官方桌面端不接受临时放行，所以这里没有自动重试。**等 ${refused.name}@${refused.version} 过了等待期再更新一次即可**${wait.zh}；想现在就装，在 profile 的 pnpm-workspace.yaml 里 minimumReleaseAgeExclude 中**这个名字的那一行**（没有就新增一行）追加 \` || ${refused.version}\`——带引号的行要加在引号里面。不要另开一行同名规则：pnpm 只读第一条（#883）。 / What is holding you is ${refused.name}@${refused.version}, not the plugin you asked to install: pnpm verifies the whole lockfile before any change, and that version is still inside this machine's fresh-release wait (#944). The official desktop app takes no one-shot bypass, so no automatic retry happens here. **Update again once ${refused.name}@${refused.version} is past the wait**${wait.en}; to install right now, append \` || ${refused.version}\` to the row for \`${refused.name}\` under minimumReleaseAgeExclude in the profile's pnpm-workspace.yaml — inside the quotes when the row is quoted, and in a new row only if none exists. Do not add a second row for the same name: pnpm reads only the first (#883).`;
+            }
+            else {
+                note = `这个插件的新版本比本机的新版本等待期还新，所以现在装不了（改别的插件也会被拦住）。官方桌面端不接受临时放行，所以这里没有自动重试。**等这个版本过了等待期再更新一次即可**${wait.zh}。过了等待期后再在市场点一次更新。 / The plugin's new version is younger than this machine's fresh-release wait, so the install was refused (a change to another plugin too). The official desktop app takes no one-shot bypass, so no automatic retry happens here. **Update again once the version is past the wait**${wait.en}. Try the market update again after the wait.`;
+            }
+        }
+        else {
+            note = `这台宿主（官方桌面端）自己执行安装，不接受市场附加的 pnpm 参数（${unavailableOption}），所以这一步没有自动重试。 / This host (the official desktop app) runs the install itself and takes no pnpm options from the market (${unavailableOption}), so that automatic retry could not be attempted.`;
+        }
+        result = { ...result, stderr: `${result.stderr}\n\n${note}` };
     }
+    // pnpm can append a second rule even on success (#883, #878), including
+    // after a recovery retry or an official Desktop manager install. Repair
+    // the final file now, before another plugin operation reads it; a successful
+    // command must never be retried just because its exclusions needed merging.
+    if (repairProfilePolicy && ok(result) && (verb === 'add' || verb === 'remove' || verb === 'install' || verb === 'update')) {
+        try {
+            const merged = mergeDuplicateReleaseAgeExcludes(profile, profileDirectory);
+            if (merged.length > 0) {
+                logEvent('warn', 'install', `merged duplicate minimumReleaseAgeExclude rules for ${merged.join(', ')} after success (#883, #878)`);
+            }
+        }
+        catch (error) {
+            logEvent('warn', 'install', `could not merge minimumReleaseAgeExclude after success (#883, #878): ${String(error)}`);
+        }
+    }
+    // After every mutation — success, failure, and cancel. Garbage lands in
+    // `.ignored` on the NEXT pnpm run, so a success-only hook would miss the
+    // run that just moved it there (#974). Must not fail the user's command.
+    try {
+        const removed = cleanOrphanedIgnored(profileDir(profile, profileDirectory));
+        if (removed.length > 0) {
+            logEvent('info', 'install', `removed ${removed.length} quarantined dir(s) from node_modules/.ignored: ${removed.slice(0, 3).join(', ')}${removed.length > 3 ? ', …' : ''}`);
+        }
+    }
+    catch { /* cleanup must never fail the install */ }
     return result;
 }
 /**
@@ -340,6 +489,181 @@ export function pnpmNeverStarted(result) {
     return classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode)?.code === 'pnpm-unusable';
 }
 /**
+ * Whether pnpm refused a too-young release without writing to the profile.
+ *
+ * Same nature as wroteNothing / pnpmNeverStarted for the update route's
+ * rollback (#919): pnpm DID start, read the lockfile, then exited 1 on
+ * ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION (or the sibling mature-match /
+ * resolution-policy shapes). Nothing was installed or removed, so restoring
+ * "the previous build" is alarm about an untouched profile — and on the
+ * official desktop bridge it pairs every wait with a false
+ * "restoration could not be verified" line that covers the real reason.
+ * @param result - the failed run.
+ * @returns true when the failure is pnpm's fresh-release gate.
+ */
+export function pnpmRefusedYoungRelease(result) {
+    return classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode)?.code === 'release-age-violation';
+}
+/** pnpm's default minimumReleaseAge window (1440 minutes). */
+const DEFAULT_RELEASE_AGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * Whether an environment variable names the top-level fresh-release window
+ * and carries a plain non-negative integer.
+ *
+ * DSH Desktop sets `pnpm_config_minimum_release_age=0` for every pnpm call,
+ * so a numeric environment value is a window the market can follow — not an
+ * unverifiable external policy (#1053).
+ *
+ * Measured 2026-10-30 against a release published 8 hours earlier, with
+ * `minimumReleaseAge: 100000` + `minimumReleaseAgeStrict: true` in the
+ * workspace file (so a block or a pass is unmistakable):
+ *
+ *   - pnpm 11.7.0 and 12.16.1 honour `pnpm_config_minimum_release_age` — the
+ *     install goes through, i.e. the environment overrides even a strict
+ *     workspace policy — and ignore `npm_config_minimum_release_age`;
+ *   - pnpm 10.20.0 ignores the `pnpm_config_` spelling (the `npm_config_` one
+ *     is what it reads).
+ *
+ * That is why this value outranks the file here rather than merely adding to
+ * it: on the engines the Desktop ships, it IS the effective policy.
+ */
+export function isNumericReleaseAgeWindow(key, value) {
+    const normalized = key.replace(/[-_]/g, '').toLowerCase();
+    return normalized === 'minimumreleaseage' && /^\d+$/.test(value?.trim() ?? '');
+}
+/** @returns minutes, `'invalid'` when the window variable is present but unreadable, or null when absent. */
+function readReleaseAgeMinutesFromEnv() {
+    let minutes = null;
+    for (const [key, value] of Object.entries(process.env)) {
+        const setting = /(?:^|_)(minimum[-_]?release[-_]?age[\w-]*)/i.exec(key);
+        if (setting === null)
+            continue;
+        if (setting[1].replace(/[-_]/g, '').toLowerCase() !== 'minimumreleaseage')
+            continue;
+        if (!isNumericReleaseAgeWindow(setting[1], value))
+            return 'invalid';
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed))
+            return 'invalid';
+        if (minutes !== null && minutes !== parsed)
+            return 'invalid';
+        minutes = parsed;
+    }
+    return minutes;
+}
+/**
+ * The profile's fresh-release wait window in ms (#919).
+ *
+ * Reads `minimumReleaseAge` (minutes) from pnpm-workspace.yaml, then
+ * `minimum-release-age` from `.npmrc`. A numeric environment window — the
+ * Desktop manager sets one for every pnpm call — takes precedence over both,
+ * because that is the value its pnpm actually uses (#1053). A key that is
+ * present but not a number returns null — callers must not invent a remaining
+ * wait. When neither file nor the environment names the key, pnpm's default
+ * 1440 minutes applies.
+ */
+export function readMinimumReleaseAgeMs(profile, explicitDir) {
+    const dir = profileDir(profile, explicitDir);
+    const fromEnv = readReleaseAgeMinutesFromEnv();
+    if (fromEnv === 'invalid')
+        return null;
+    if (typeof fromEnv === 'number')
+        return fromEnv * 60 * 1000;
+    const fromWorkspace = readReleaseAgeMinutesFromWorkspace(dir);
+    if (fromWorkspace === 'invalid')
+        return null;
+    if (typeof fromWorkspace === 'number')
+        return fromWorkspace * 60 * 1000;
+    const fromNpmrc = readReleaseAgeMinutesFromNpmrc(dir);
+    if (fromNpmrc === 'invalid')
+        return null;
+    if (typeof fromNpmrc === 'number')
+        return fromNpmrc * 60 * 1000;
+    return DEFAULT_RELEASE_AGE_WINDOW_MS;
+}
+/** @returns minutes, `'invalid'` when the key is present but unreadable, or null when absent. */
+function readReleaseAgeMinutesFromWorkspace(dir) {
+    let yaml;
+    try {
+        yaml = readFileSync(join(dir, 'pnpm-workspace.yaml'), 'utf8');
+    }
+    catch {
+        return null;
+    }
+    if (!/^minimumReleaseAge\s*:/m.test(yaml))
+        return null;
+    const match = /^minimumReleaseAge:\s*(\d+)\s*(?:#.*)?$/m.exec(yaml);
+    if (match === null)
+        return 'invalid';
+    const minutes = Number(match[1]);
+    return Number.isFinite(minutes) ? minutes : 'invalid';
+}
+/** @returns minutes, `'invalid'` when the key is present but unreadable, or null when absent. */
+function readReleaseAgeMinutesFromNpmrc(dir) {
+    let npmrc;
+    try {
+        npmrc = readFileSync(join(dir, '.npmrc'), 'utf8');
+    }
+    catch {
+        return null;
+    }
+    if (!/^minimum-release-age\s*=/m.test(npmrc))
+        return null;
+    const match = /^minimum-release-age\s*=\s*(\d+)\s*(?:#.*)?$/m.exec(npmrc);
+    if (match === null)
+        return 'invalid';
+    const minutes = Number(match[1]);
+    return Number.isFinite(minutes) ? minutes : 'invalid';
+}
+/**
+ * The `name@version` pnpm actually refused, when its refusal named one (#944).
+ *
+ * {@link remainingReleaseAgeWait} reads only the timestamp on the same line,
+ * which is fine while the offender IS the package being installed. It is not
+ * always: a plugin install can be refused by a DIFFERENT, younger package that
+ * is already in the lockfile, because pnpm verifies the whole lockfile before
+ * any mutation (#39). #944 hit exactly that — updating `dsh-cost-meter` failed
+ * with `dshmarket@1.66.44` named in the error, and the note then told the user
+ * to wait out *the plugin's* version, which was not the version holding them.
+ *
+ * Only the entry pnpm prints in its violation line is read (`  <name>@<version>
+ * was published at …`), so this cannot invent an offender from unrelated text.
+ * Null when no such line is present — callers must then keep their existing
+ * wording rather than guess.
+ */
+export function refusedReleaseAgePackage(output) {
+    const match = /^\s*((?:@[^/\s@]+\/)?[^@\s/]+)@(\d[^\s]*?)\s+was published at /im.exec(output);
+    if (match === null)
+        return null;
+    const name = match[1] ?? '';
+    const version = match[2] ?? '';
+    return name === '' || version === '' ? null : { name, version };
+}
+/**
+ * How long is left in the fresh-release wait, when pnpm named the publish
+ * time in its refusal (#919). Null when the output has no usable timestamp.
+ */
+export function remainingReleaseAgeWait(output, now = Date.now(), windowMs = DEFAULT_RELEASE_AGE_WINDOW_MS) {
+    const match = /published at (\d{4}-\d{2}-\d{2}T[\d:.]+Z)/i.exec(output);
+    if (match === null)
+        return null;
+    const published = Date.parse(match[1]);
+    if (!Number.isFinite(published))
+        return null;
+    return Math.max(0, published + windowMs - now);
+}
+/** Human remaining-wait fragment for the desktop release-age note. */
+function formatRemainingReleaseAgeWait(remainingMs) {
+    if (remainingMs <= 0) {
+        return { zh: '（现在再试一次即可）', en: ' (try again now)' };
+    }
+    const hours = Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000)));
+    return {
+        zh: `（大约还剩 ${hours} 小时）`,
+        en: ` (about ${hours} hour${hours === 1 ? '' : 's'} left)`,
+    };
+}
+/**
  * Whether pnpm failed because the running host holds the package's files
  * open, so nothing pnpm runs from inside that host can replace them.
  *
@@ -357,6 +681,73 @@ export function pnpmBlockedByOpenFiles(result) {
     return classifyPnpmFailure(`${result.stderr}\n${result.stdout}`, result.exitCode)?.code === 'windows-file-locked';
 }
 /**
+ * Whether a failed run is the running host colliding with a second profile
+ * boot (#975).
+ *
+ * Market install / update / uninstall spawn `dsh plugin …`. On a live
+ * `dsh web` that child can boot the profile again, bind the same port, and
+ * exit 1 AFTER pnpm has already written. The signature is DSH's own boot
+ * failure — `listen EADDRINUSE` plus `Full diagnostics` pointing at a
+ * `startup-*.log` — not a pnpm classifier code. All three pieces are
+ * required so a stray EADDRINUSE or an unrelated diagnostics line cannot
+ * flip a real failure into success.
+ */
+export function isHostPortCollision(result) {
+    const text = `${result.stderr}\n${result.stdout}`;
+    return /listen EADDRINUSE/i.test(text)
+        && /Full diagnostics/i.test(text)
+        && /startup-\S+\.log/i.test(text);
+}
+/**
+ * Whether this install left at least one new, loadable plugin on disk (#975).
+ *
+ * Read-only half of the #18 guard: a name that landed without a dsh surface
+ * or entry is not this operation's intent, so the caller still rolls back.
+ * The route then runs the full validator on the success path.
+ */
+export function installApplied(profile, before, explicitDir) {
+    const dir = profileDir(profile, explicitDir);
+    return Object.keys(readInstalled(profile, dir)).some((name) => {
+        if (before.has(name))
+            return false;
+        const packageDir = join(dir, 'node_modules', name);
+        return hasDshManifest(packageDir) && hasLoadableEntry(dir, name);
+    });
+}
+/**
+ * Whether this update changed the installed version or git commit (#975).
+ *
+ * Same question `isStaleUpdate` asks, but a missing after-value is "did not
+ * land", not "not stale". The package must still be on disk.
+ *
+ * Git commits use the same two reads as `gitIdentityCommit` in routes.ts:
+ * `type: git` first, then the archive/codeload URL a floating `github:`
+ * install actually leaves.
+ */
+export function updateApplied(check) {
+    const dir = profileDir(check.profile, check.explicitDir);
+    if (!existsSync(join(dir, 'node_modules', check.name, 'package.json')))
+        return false;
+    const afterVersion = readInstalledVersion(check.profile, check.name, dir);
+    if (check.isGit) {
+        const afterCommit = check.spec === undefined
+            ? null
+            : installedGitCommit(check.profile, check.spec, dir);
+        if (check.beforeCommit !== null && afterCommit !== null && afterCommit !== check.beforeCommit)
+            return true;
+        return check.beforeVersion !== null && afterVersion !== null && afterVersion !== check.beforeVersion;
+    }
+    return check.beforeVersion !== null && afterVersion !== null && afterVersion !== check.beforeVersion;
+}
+/** Commit on disk for `spec` — `type: git`, then archive/codeload. */
+function installedGitCommit(profile, spec, explicitDir) {
+    const fromGit = readGitResolutionCommit(profile, spec, explicitDir);
+    if (fromGit !== null)
+        return fromGit;
+    const key = hostedRepoKey(spec);
+    return key === null ? null : readLockCommits(profile, explicitDir).get(key) ?? null;
+}
+/**
  * The most specific description of a failed run available, for logs.
  *
  * pnpm's structured error beats the stderr tail whenever there is one — see
@@ -367,7 +758,27 @@ export function failureDetail(result, limit = 300) {
         const code = result.pnpmErrorCode === undefined ? '' : `${result.pnpmErrorCode}: `;
         return `${code}${result.pnpmError}`.slice(0, limit);
     }
-    return (result.stderr || result.stdout).slice(-limit);
+    const text = (result.stderr || result.stdout).trim();
+    if (text.length <= limit)
+        return text;
+    const tail = text.slice(-limit);
+    // Cut at a sentence end instead of mid-word, and say that something was
+    // dropped (#852). The market appends its own explanation to pnpm's output,
+    // and this tail is catalogued into user-facing sentences — including inside
+    // a parenthesis. A blunt cut landed inside the previous sentence and welded
+    // the fragment to the next one: the reporter's log read
+    // `（is, export the log and report it这台宿主…`, which is not a sentence in
+    // either language and says nothing about what to do.
+    const sentenceEnd = /[.!?。！？]["')\]）]?[\s\n]+/gu;
+    const match = sentenceEnd.exec(tail);
+    if (match !== null) {
+        const rest = tail.slice(match.index + match[0].length).trim();
+        // A boundary so near the end would leave a word or two; the raw tail is
+        // more use than the stub.
+        if (rest.length >= 40)
+            return `… ${rest}`;
+    }
+    return `…${tail.trim()}`;
 }
 /**
  * Some registry entries point at collection repos whose actual plugin lives
@@ -444,7 +855,10 @@ export async function validateAddedPlugins(run, profile, before, explicitDir, ho
         const packageDir = join(dir, 'node_modules', n);
         // hasLoadableEntry, not entryArtifactExists: carrier bundles legitimately
         // ship no entry of their own (#103) and must not be uninstalled here.
-        if (!hasDshManifest(packageDir) || !hasLoadableEntry(dir, n)) {
+        // The host install tree is passed too (#906): a carrier mounting only
+        // in-box packages resolves nowhere under the profile, and judging it by
+        // that alone deleted a package the host had just installed correctly.
+        if (!hasDshManifest(packageDir) || !hasLoadableEntry(dir, n, hostDirectory ?? findDshInstallDir())) {
             removedBroken.push(n);
             await removeAndReconcile(run, profile, dir, n, hostDirectory);
             continue;
@@ -668,24 +1082,66 @@ export function parsePrepareKey(stdout, stderr) {
     return m === null ? null : m[2];
 }
 /**
- * Package names pnpm reported as having their build scripts ignored
- * ("Ignored build scripts: esbuild, koffi."). Empty when none.
- * (#6 by @qichuang321.)
+ * The allowBuilds key pnpm derives for one ignored build — its own
+ * `allowBuildKeyFromIgnoredBuild`, transcribed.
+ *
+ * pnpm keeps the whole dep path when what follows the name's `@` is not a
+ * semver version (a git remote, a codeload archive, a tarball URL — all of them
+ * contain `:`, `/` or `#`), and collapses to the bare name otherwise. It writes
+ * the result into `allowBuilds` and matches an existing entry against it
+ * verbatim, so the market has to agree with it exactly: a bare name authorizes
+ * a registry dependency and nothing else, while a git dependency is authorized
+ * only by its full `name@git+…#<sha>` dep path.
  */
-export function parseIgnoredBuilds(stdout, stderr) {
+export function allowBuildKeyFromIgnoredBuild(depPath) {
+    const at = depPath.lastIndexOf('@');
+    if (at <= 0)
+        return depPath;
+    const version = depPath.slice(at + 1);
+    return version !== '' && /[:/#]/.test(version) ? depPath : depPath.slice(0, at);
+}
+/**
+ * The packages pnpm reported as having their build scripts ignored, each with
+ * the allowBuilds key pnpm itself keys that decision by.
+ *
+ * pnpm prints the dependency's full dep path — `name@git+https://…#<sha>` for
+ * a git source, `name@1.2.3` for a registry one — and `parseIgnoredBuilds`
+ * below has always collapsed both to the bare name. That is right for a
+ * registry dependency and drops the only key a git dependency is authorized
+ * by, which is what left approve-and-retry unable to make progress on one.
+ *
+ * `name` is what the approve-builds route matches its request against; `key`
+ * is the entry to write. They are equal for a registry dependency.
+ *
+ * Entries may also arrive inside pnpm's ndjson error line, where the sentence
+ * is followed by `","code":…`; the walk stops at the first character no dep
+ * path can contain, so the surrounding JSON is not swallowed.
+ */
+export function parseIgnoredBuildEntries(stdout, stderr) {
     const m = /Ignored build scripts:?\s*([^\n]+)/i.exec(`${stdout}\n${stderr}`);
     if (m === null)
         return [];
     const found = [];
     for (const chunk of m[1].split(',')) {
-        // Entries may carry a version suffix and the sentence's final period.
-        const trimmed = chunk.trim().replace(/\.$/, '');
-        if (trimmed === '')
+        // A dep path ends at whitespace, a JSON quote (plain or escaped) or the
+        // closing brace of the ndjson error object; the human line adds a period.
+        const walked = /^[^\s"\\}]*/.exec(chunk.trim());
+        const entry = (walked === null ? '' : walked[0]).replace(/\.$/, '');
+        if (entry === '')
             continue;
-        const at = trimmed.lastIndexOf('@');
-        const name = at > 0 ? trimmed.slice(0, at) : trimmed;
-        if (name !== '' && !found.includes(name))
-            found.push(name);
+        const at = entry.lastIndexOf('@');
+        const name = at > 0 ? entry.slice(0, at) : entry;
+        if (name !== '' && !found.some(seen => seen.name === name)) {
+            found.push({ name, key: allowBuildKeyFromIgnoredBuild(entry) });
+        }
     }
     return found;
+}
+/**
+ * Package names pnpm reported as having their build scripts ignored
+ * ("Ignored build scripts: esbuild, koffi."). Empty when none.
+ * (#6 by @qichuang321.)
+ */
+export function parseIgnoredBuilds(stdout, stderr) {
+    return parseIgnoredBuildEntries(stdout, stderr).map(entry => entry.name);
 }

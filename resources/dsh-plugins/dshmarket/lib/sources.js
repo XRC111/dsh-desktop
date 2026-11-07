@@ -3,6 +3,8 @@
  * installable pnpm target. Pure string logic, no I/O.
  */
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const MARKET_REPO = 'dsh-market/dsh-market';
+const MARKET_NPM_NAME = 'dshmarket';
 function validSubpath(subpath) {
     if (!/^[A-Za-z0-9_./-]+$/.test(subpath))
         return false;
@@ -264,6 +266,21 @@ export function gitRefOfTarget(spec) {
         return null;
     return refOfFragment(spec);
 }
+/**
+ * True when the spec's `#…` fragment carries a `semver:` range selector.
+ *
+ * A semver range is a line the user chose on purpose, like a branch: pnpm
+ * re-resolves inside that range, so a raw HEAD version ABOVE the range is not
+ * installable — asking it would advertise an update forever (#446 shape).
+ * `refOfFragment` deliberately answers null for those, so the update check
+ * needs this separate probe.
+ */
+export function hasSemverSelector(spec) {
+    const fragmentAt = spec.indexOf('#');
+    if (fragmentAt === -1)
+        return false;
+    return spec.slice(fragmentAt + 1).split('&').some(s => s.startsWith('semver:'));
+}
 /** The branch or tag a `#…` fragment selects, or null for the default branch. */
 function refOfFragment(spec) {
     const fragmentAt = spec.indexOf('#');
@@ -413,6 +430,74 @@ export function pinnedGitAllowBuildsKey(name, spec, sha) {
     return remote === null ? null : `${name}@${remote}#${sha}`;
 }
 /**
+ * The repo (`owner/repo`, original case) of a GitHub remote spelled as a URL
+ * (`git+https://github.com/owner/repo.git`), or null for anything else.
+ *
+ * pnpm itself writes this spelling into the manifest for a GitHub source —
+ * the market sends `github:owner/repo`, pnpm answers with
+ * `git+https://owner/repo.git` (#803) — so the market must recognize it to
+ * keep deriving the GitHub keys for deps that only ever appear this way.
+ */
+export function githubRepoOfRemote(spec) {
+    const remote = gitRemoteSpelling(spec);
+    if (remote === null)
+        return null;
+    const url = /^git\+https:\/\/github\.com\/([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/i.exec(remote);
+    if (url === null)
+        return null;
+    return url[1].endsWith('.git') ? url[1].slice(0, -4) : url[1];
+}
+/**
+ * Every commit-pinned allowBuilds key for one git source at one known commit
+ * (#784 by @sanqi-normal follow-up).
+ *
+ * Which pinned key pnpm checks depends on HOW it fetches the dependency,
+ * not on how the spec is spelled (review-measured on 11.7.0, empty store:
+ * a codeload download passes the codeload key and refuses the git+https#sha
+ * one; the git+https#sha refusal seen on dsh-better-sidebar came from a git
+ * clone fetch):
+ * - pnpm 11.21+ matches the stable unpinned clone-URL key (`gitAllowBuildsKey`).
+ * - a codeload download matches the commit-pinned codeload tarball URL.
+ * - a git clone matches the commit-pinned `name@git+https://…#<sha>` form,
+ *   and only when it matches the remote's own spelling (`.git` or not,
+ *   #665/#695 — pnpm matches the key literally).
+ *
+ * Writing ONE pinned form was the structural gap: a GitHub source derived
+ * only its codeload key, so a git-clone fetch ran with no key pnpm would
+ * read and only pnpm's own printed key could save the retry (#784's
+ * evidence). When the commit is known, BOTH pinned forms are written — one
+ * extra line in a YAML file versus the only button that could have
+ * unblocked the user.
+ *
+ * Non-GitHub remotes keep `pinnedGitAllowBuildsKey`'s single form: one key
+ * covers their fetch mode.
+ *
+ * @param sha - the commit the install will actually fetch.
+ * @returns the pinned keys (empty for no known git shape); callers merge the
+ *   stable key from `gitAllowBuildsKey` alongside.
+ */
+export function pinnedAllowBuildsKeys(name, spec, sha) {
+    if (!/^[0-9a-f]{40}$/.test(sha))
+        return [];
+    const githubRepo = repoFromTarget(spec)?.repo ?? githubRepoOfRemote(spec);
+    if (githubRepo !== null) {
+        // The git+https pinned form keeps the remote's own spelling (`.git` or
+        // not), which is what pnpm matches literally (#665/#695): reuse the
+        // stable key when one was derived, and only fall back to the canonical
+        // `.git` spelling when it was not.
+        const stable = gitAllowBuildsKey(name, spec);
+        const gitHttps = stable !== null && stable.startsWith(`${name}@git+https://`)
+            ? `${stable}#${sha}`
+            : `${name}@git+https://github.com/${githubRepo}.git#${sha}`;
+        return [
+            `${name}@https://codeload.github.com/${githubRepo}/tar.gz/${sha}`,
+            gitHttps,
+        ];
+    }
+    const pinned = pinnedGitAllowBuildsKey(name, spec, sha);
+    return pinned === null ? [] : [pinned];
+}
+/**
  * The pnpm install target for a registry entry. Repo-verified npm packages
  * win, followed by author-supplied prebuilt GitHub Release tarballs; both avoid
  * full-repo downloads and local build scripts.
@@ -422,14 +507,47 @@ export function installTargetFor(entry) {
     const source = parseSourceUrl(entry.url);
     if (source === null)
         return null;
+    // The market manages its own installation and is published to npm. Keep
+    // legacy catalog snapshots and self-update requests on that prebuilt
+    // registry package even when the entry has not yet gained its generated
+    // `npm` mapping; installing the repository URL runs its `prepare` script
+    // before the market can show the build-approval UI.
+    if (source.subpath === null && source.repo.toLowerCase() === MARKET_REPO)
+        return MARKET_NPM_NAME;
     if (typeof entry.npm === 'string' && NPM_NAME_RE.test(entry.npm))
         return entry.npm;
     const tarball = releaseTarballTarget(entry.tarball, source.repo);
     if (tarball !== null)
         return tarball;
+    return githubSourceTarget(source);
+}
+function githubSourceTarget(source) {
     return source.subpath !== null
         ? `github:${source.repo}#path:/${source.subpath}`
         : `github:${source.repo}`;
+}
+/**
+ * The target to retry with when a prebuilt release tarball could not be
+ * installed — the entry's own GitHub source, which is what it would have
+ * installed from had it carried no `tarball` (#797).
+ *
+ * pnpm 11.0 through 11.8 records NO `integrity` for a bare release-asset URL
+ * under `nodeLinker: hoisted` (measured: 11.7.0 and 11.8.0 fail with
+ * ERR_PNPM_MISSING_TARBALL_INTEGRITY; 11.9.0 onward writes it and installs),
+ * and every DSH profile is hoisted. The same entry installs from `github:` on
+ * the same pnpm, so the fast path is kept where it works and this is where it
+ * degrades to.
+ * @returns the `github:` target, or null when the install target is not this
+ *   entry's own verified release tarball (an npm package, or already source).
+ */
+export function sourceFallbackFor(entry, target) {
+    const source = parseSourceUrl(entry.url);
+    if (source === null)
+        return null;
+    const tarball = releaseTarballTarget(entry.tarball, source.repo);
+    if (tarball === null || tarball !== target)
+        return null;
+    return githubSourceTarget(source);
 }
 /** True for profile specs that are a local checkout or tarball, not a registry pin. */
 export function isLocalSpec(spec) {

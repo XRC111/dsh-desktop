@@ -19,6 +19,21 @@
  * its own host in that field.
  */
 /**
+ * `dist.tarball` as an absolute URL.
+ *
+ * A registry behind a path prefix — Nexus, Verdaccio, a reverse proxy — may
+ * answer that field as a relative path (`/dsh-plugin-catalog/-/…`). pnpm
+ * resolves it against the registry; passing it straight to `fetch` threw
+ * "Failed to parse URL" instead, the npm source dropped out of the list, and
+ * the market read the catalog from somewhere else without saying so (#1117).
+ *
+ * Relative resolution follows the URL rules: a value starting with `/` is
+ * root-relative and a bare path is relative to the registry's own directory,
+ * which is where the registry serves it from. Nothing is rewritten when the
+ * field is already absolute.
+ */
+export declare function absoluteTarballUrl(tarball: string, registry: string): string;
+/**
  * One file's bytes from a gzipped tar, or null when it is not in there.
  *
  * @param gz - the gzipped tarball.
@@ -45,3 +60,18 @@ file?: string): Promise<{
     version: string;
     data: unknown | null;
 }>;
+/**
+ * One file out of a package's newest tarball, or null when it cannot be read
+ * (#1012).
+ *
+ * The install route asks a package what it declares before it installs it: a
+ * rename can only be detected from the rows the artifact carries, not from
+ * the name it was published under. A failed read is not a verdict — the
+ * caller treats null as "not declared", because a registry hiccup must never
+ * become a refusal to install.
+ *
+ * @param registry - registry base, no trailing slash.
+ * @param pkg - package name.
+ * @param file - exact entry name inside the tarball (`package/cordis.patch.yml`).
+ */
+export declare function packageFileFromRegistry(registry: string, pkg: string, file: string): Promise<Buffer | null>;

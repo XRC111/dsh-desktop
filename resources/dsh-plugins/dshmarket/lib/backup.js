@@ -16,6 +16,29 @@ export const BACKUP_FORMAT = 'dsh-profile-backup';
 export const MAX_BACKUP_BYTES = 2 * 1024 * 1024;
 const MAX_FILES = 256;
 const SKIP_NAMES = new Set(['node_modules', '.dsh-market', '.git', 'pnpm-lock.yaml']);
+/**
+ * Directories that are caches by name, wherever they sit.
+ *
+ * The market's own cache is `.dsh-market` (skipped above), but another
+ * component writes `<profile>/cache` — not hidden, so the dot rule below let
+ * it through and the whole thing was read as configuration. With a few
+ * multi-megabyte json files in there the profile could not be backed up at
+ * all, and the error blamed the profile's own configuration (#1064).
+ *
+ * Only the exporter skips these; `validatedBackup` still accepts a document
+ * that carries them, because backups written before this rule put them in.
+ */
+const SKIP_DIRS = new Set(['cache']);
+/**
+ * Said when the profile does not fit: the way out has to be one that works.
+ *
+ * The old sentence offered "只导出选中的插件" unconditionally, but that path
+ * walks the same profile once "包含配置文件" is ticked and fails with the
+ * same words (#1064) — so it now names the trap as well.
+ */
+const EXPORT_SELECTED_ZH = '可以改成只导出选中的插件，并且别勾「包含配置文件」，那会撞同一个上限';
+const EXPORT_SELECTED_EN = 'export selected plugins instead, and leave "Include config files" unticked — ticking it hits the same cap';
+const BACKUP_TOO_LARGE = `这个 profile 的配置超过 ${MAX_BACKUP_BYTES / (1024 * 1024)} MB，整份备份放不下。${EXPORT_SELECTED_ZH}。 / this profile's configuration is larger than ${MAX_BACKUP_BYTES / (1024 * 1024)} MB, which is too much for one whole-profile backup; ${EXPORT_SELECTED_EN}.`;
 /** File names that routinely contain credentials (backup exports).
  *  Values are never masked in place — the export is one-to-one for
  *  faithful restores — but presence is surfaced by the UI warning. */
@@ -39,6 +62,15 @@ function profileFiles(root, dir = root) {
         // with the wreckage that made it need repairing (#205 by @Rudyy898).
         if (SKIP_NAMES.has(entry.name) || /\.bak\b/.test(entry.name))
             continue;
+        // Plugin caches live in hidden directories (`.dsh-mattskillsdeck-cache`,
+        // `.plugin-manager`, …). Walking them counted megabytes of logs as
+        // "configuration" and blew the 2 MB cap (#972). Hidden FILES stay —
+        // `.env` and `.npmrc` are real profile config.
+        if (entry.isDirectory() && entry.name.startsWith('.'))
+            continue;
+        // Same rule, one name the dot check cannot cover (#1064).
+        if (entry.isDirectory() && SKIP_DIRS.has(entry.name))
+            continue;
         const path = resolve(dir, entry.name);
         if (entry.isSymbolicLink())
             continue;
@@ -46,8 +78,11 @@ function profileFiles(root, dir = root) {
             files.push(...profileFiles(root, path));
         else if (entry.isFile())
             files.push(relative(root, path).split(sep).join('/'));
-        if (files.length > MAX_FILES)
-            throw new Error(`profile has more than ${MAX_FILES} configuration files`);
+        // Told in the user's words, with the way out: this is the cap a heavy
+        // profile actually hits, and the per-plugin export is the answer.
+        if (files.length > MAX_FILES) {
+            throw new Error(`这个 profile 的配置文件超过 ${MAX_FILES} 个，整份备份放不下。${EXPORT_SELECTED_ZH}。 / this profile has more than ${MAX_FILES} configuration files, which is too many for one whole-profile backup; ${EXPORT_SELECTED_EN}.`);
+        }
     }
     return files;
 }
@@ -99,7 +134,7 @@ export function createProfileBackup(profile, explicitDir, opts) {
         }
         const partial = { format: BACKUP_FORMAT, version: 0.2, createdAt: new Date().toISOString(), profile, files };
         if (Buffer.byteLength(JSON.stringify(partial)) > MAX_BACKUP_BYTES)
-            throw new Error('profile configuration is too large to back up');
+            throw new Error(BACKUP_TOO_LARGE);
         return partial;
     }
     const files = profileFiles(root).sort().map((path) => {
@@ -112,7 +147,7 @@ export function createProfileBackup(profile, explicitDir, opts) {
         throw new Error('profile package.json is missing');
     const backup = { format: BACKUP_FORMAT, version: 0.2, createdAt: new Date().toISOString(), profile, files };
     if (Buffer.byteLength(JSON.stringify(backup)) > MAX_BACKUP_BYTES)
-        throw new Error('profile configuration is too large to back up');
+        throw new Error(BACKUP_TOO_LARGE);
     return backup;
 }
 export function validatedBackup(value) {
@@ -136,8 +171,15 @@ export function validatedBackup(value) {
         if (path === '' || isAbsolute(path) || path.split(/[\\/]/).includes('..'))
             throw new Error(`unsafe backup path: ${path}`);
         const normalized = path.replaceAll('\\', '/');
-        if (normalized.split('/').some(part => SKIP_NAMES.has(part)))
+        const parts = normalized.split('/');
+        if (parts.some(part => SKIP_NAMES.has(part)))
             throw new Error(`excluded backup path: ${path}`);
+        // Official exports before #972 carried plugin cache/log dirs whenever
+        // they still fit under 2 MB. Those files are not configuration; dropping
+        // them keeps the rest of the backup restorable. Names this exporter has
+        // never written (SKIP_NAMES) still refuse the document.
+        if (parts.some((part, index) => part.startsWith('.') && index < parts.length - 1))
+            continue;
         if (paths.has(normalized))
             throw new Error(`duplicate backup path: ${path}`);
         paths.add(normalized);
@@ -223,9 +265,9 @@ async function webdavRequest(url, username, password, method, body) {
     if (parsed.protocol === 'http:')
         throw new Error('WebDAV requires an https:// URL');
     if (parsed.protocol !== 'https:')
-        throw new Error('invalid WebDAV URL');
+        throw new WebdavUrlError('webdav_bad_url', 'invalid WebDAV URL');
     if (parsed.username !== '' || parsed.password !== '')
-        throw new Error('invalid WebDAV URL');
+        throw new WebdavUrlError('webdav_bad_url', 'invalid WebDAV URL');
     const address = await resolvePublicAddress(parsed.hostname);
     const headers = { host: parsed.host };
     if (body !== undefined) {
@@ -321,10 +363,32 @@ export async function uploadWebdav(url, username, password, backup) {
     }
     const response = await webdavRequest(url, username, password, 'PUT', JSON.stringify(backup));
     if (response.status < 200 || response.status >= 300) {
-        throw new Error(response.status === 404
-            ? `WebDAV upload failed: HTTP 404 — the target folder does not exist and could not be created. Some providers (e.g. Jianguoyun) refuse files at the root: use a path inside a folder, e.g. https://dav.example.com/dsh/backup.json / 目标目录不存在且无法自动创建；部分服务商（如坚果云）不允许在根目录放文件，请使用形如 https://dav.example.com/dsh/backup.json 的子目录路径`
-            : `WebDAV upload failed: HTTP ${response.status}`);
+        throw new Error(describeUploadFailure(response.status));
     }
+}
+/**
+ * What an upload failure means, in the three things a report needs (#1058).
+ *
+ * A bare `HTTP 401` is the worst of them: it is by far the most common
+ * answer, it happens for a reason the user can fix in one field, and the
+ * message said nothing about either. The password is deliberately never
+ * stored, so "re-entered after a page reload" is the ordinary cause, not an
+ * edge case.
+ *
+ * @param status - the HTTP status the PUT answered with.
+ * @returns a bilingual sentence: what happened, why, and what to do.
+ */
+function describeUploadFailure(status) {
+    if (status === 401) {
+        return 'WebDAV 上传被拒绝（HTTP 401）：服务端不认这个用户名或密码。密码不会保存到磁盘，刷新页面或重启后需要重新输入；填好后点「上传备份」重试。 / The WebDAV server rejected these credentials (HTTP 401). The password is never stored, so it has to be entered again after a reload or restart; fill it in and press Upload backup.';
+    }
+    if (status === 403) {
+        return 'WebDAV 上传被拒绝（HTTP 403）：凭据有效，但这个账号没有写入该路径的权限。换一个可写的目录，或检查服务商的权限设置。 / The WebDAV server refused the write (HTTP 403): the credentials are valid but this account cannot write to that path. Use a writable folder, or check the provider\'s permissions.';
+    }
+    if (status === 404) {
+        return 'WebDAV upload failed: HTTP 404 — the target folder does not exist and could not be created. Some providers (e.g. Jianguoyun) refuse files at the root: use a path inside a folder, e.g. https://dav.example.com/dsh/backup.json / 目标目录不存在且无法自动创建；部分服务商（如坚果云）不允许在根目录放文件，请使用形如 https://dav.example.com/dsh/backup.json 的子目录路径';
+    }
+    return `WebDAV upload failed: HTTP ${status}`;
 }
 /** Refuse non-global IPv4 targets, including metadata and carrier NAT ranges. */
 export function isPublicIpv4(ip) {
@@ -383,18 +447,22 @@ export async function resolvePublicAddress(hostname) {
     const family = isIP(bare);
     if (family === 4 || family === 6) {
         if (!isPublicTarget(bare))
-            throw new Error('invalid WebDAV URL');
+            throw privateResolution(bare, bare);
         return { address: bare, family };
     }
     if (!isPublicHostname(bare))
-        throw new Error('invalid WebDAV URL');
+        throw new WebdavUrlError('webdav_bad_url', 'invalid WebDAV URL');
     const addresses = await lookup(bare, { all: true, verbatim: true });
-    if (addresses.length === 0 || addresses.some(({ address }) => !isPublicTarget(address))) {
-        throw new Error('invalid WebDAV URL');
+    if (addresses.length === 0) {
+        throw new WebdavUrlError('webdav_unresolvable', `域名 ${bare} 没有解析出任何地址，市场无法连接。请检查域名拼写和本机 DNS。 / ${bare} did not resolve to any address, so the market could not connect. Check the hostname and the machine's DNS.`);
     }
+    const unsafe = addresses.find(({ address }) => !isPublicTarget(address));
+    if (unsafe !== undefined)
+        throw privateResolution(bare, unsafe.address);
     const selected = addresses[0];
-    if (selected.family !== 4 && selected.family !== 6)
-        throw new Error('invalid WebDAV URL');
+    if (selected.family !== 4 && selected.family !== 6) {
+        throw new WebdavUrlError('webdav_unresolvable', `域名 ${bare} 的解析结果不可用 / the addresses ${bare} resolved to are not usable`);
+    }
     return { address: selected.address, family: selected.family };
 }
 /**
@@ -403,6 +471,20 @@ export async function resolvePublicAddress(hostname) {
  * indirection without letting two servers ping-pong forever.
  */
 const MAX_REDIRECTS = 5;
+export class WebdavUrlError extends Error {
+    code;
+    address;
+    constructor(code, message, address) {
+        super(message);
+        this.code = code;
+        this.address = address;
+        this.name = 'WebdavUrlError';
+    }
+}
+/** The refusal a private or reserved resolution deserves: what, why, and the way out. */
+function privateResolution(hostname, address) {
+    return new WebdavUrlError('webdav_private_resolution', `WebDAV 域名 ${hostname} 解析到私有或保留地址 ${address}，市场不会连过去。如果你在用 fake-ip 模式的代理（Clash/Mihomo 默认如此，任何域名都答成 198.18.x.x），请把这个域名加入代理的 fake-ip-filter 列表，或改用它的真实地址，然后重试。 / The WebDAV host ${hostname} resolved to ${address}, a private or reserved address, so the market did not connect. If you use a proxy in fake-ip mode (Clash/Mihomo answers 198.18.x.x for every proxied name), add this host to its fake-ip-filter list or use its real address, then try again.`, address);
+}
 export async function downloadWebdav(url, username, password) {
     // Some providers answer a WebDAV GET with 302 to a time-limited signed CDN
     // link while accepting PUT directly on the same path (#480 by @zhyx1996,
@@ -569,4 +651,38 @@ export function mergeRestoreManifest(backupManifest, current, selection) {
     const dshMerged = { ...(backupDsh ?? {}), ...(currentDsh ?? {}), profile: profileMerged };
     merged.dsh = dshMerged;
     return merged;
+}
+/**
+ * Dependencies a restore must leave at the spec the target already has — the
+ * market itself, while it is the package running the restore.
+ *
+ * A restore applies the backup's manifest through `pnpm install`, which
+ * rewrites whatever that manifest pins. When the backup was written by a
+ * different market version, that install replaces THIS package's files under
+ * the live module: the mixed state the update route refuses (#608), made
+ * worse here because the code answering the restore request is the code being
+ * swapped out. The running spec therefore wins, and the backup's spec is
+ * returned so the caller can report it — the update flow can apply it later,
+ * with its restart and rollback machinery.
+ *
+ * Only string specs take part: anything else is not a pin this can compare.
+ */
+export function pinRunningDeps(merged, current, names) {
+    const mergedDeps = merged.dependencies === null || typeof merged.dependencies !== 'object' || Array.isArray(merged.dependencies)
+        ? {}
+        : merged.dependencies;
+    const currentDeps = current.dependencies === null || typeof current.dependencies !== 'object' || Array.isArray(current.dependencies)
+        ? {}
+        : current.dependencies;
+    const dependencies = { ...mergedDeps };
+    const pinned = [];
+    for (const name of names) {
+        const wanted = mergedDeps[name];
+        const running = currentDeps[name];
+        if (typeof wanted !== 'string' || typeof running !== 'string' || wanted === running)
+            continue;
+        dependencies[name] = running;
+        pinned.push({ name, from: wanted, to: running });
+    }
+    return { dependencies, pinned };
 }

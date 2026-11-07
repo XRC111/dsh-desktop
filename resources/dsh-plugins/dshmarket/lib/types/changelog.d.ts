@@ -13,9 +13,12 @@
  * update check resolved (`current`) marks where "new" begins. A tail that
  * does not contain it means the range is wider than the tail — those are
  * labelled recent commits rather than pretending to be an exact interval.
- * Plugins with neither notes nor commits fall back to npm publish times, and
- * a plugin nothing answers for gets a neutral "no notes" — absence of release
- * notes is the ordinary condition of small plugins, not a defect.
+ * npm installs with neither notes nor commits fall back to npm publish times,
+ * and a plugin nothing answers for gets a neutral "no notes" — absence of
+ * release notes is the ordinary condition of small plugins, not a defect.
+ * A plugin installed from any other source the notes hold nothing for gets
+ * `source` instead: its history is where it came from, and the market says
+ * it has none on hand rather than that the plugin publishes none (#819).
  */
 export interface ReleaseNotes {
     tag: string | null;
@@ -60,8 +63,25 @@ export declare function sliceCommitsAt(items: CommitNote[], installed: string | 
     items: CommitNote[];
     found: boolean;
 };
+/**
+ * The version a release tag names, when it names one.
+ *
+ * Tags come as `v1.2.3`, `1.2.3`, `@scope/pkg@1.2.3` or `pkg-v1.2.3`; the
+ * FIRST semver-shaped run is the version in all of them. A tag that names no
+ * version (`nightly`) returns null, and callers must treat "unknown" as "do
+ * not judge" rather than "older".
+ */
+export declare function releaseVersionOf(tag: string | null): string | null;
 /** The repo url key an entry's update notes live under, or null. */
 export declare function repoKeyOf(spec: string): string | null;
+/**
+ * The web page of the repository a git spec installs from, or null.
+ *
+ * What the dialog can point at when the market cannot read a source's notes
+ * itself. The owner/repo casing is kept: not every host matches paths
+ * case-insensitively the way GitHub does.
+ */
+export declare function sourceWebUrl(spec: string): string | null;
 /**
  * Look an entry up by its catalog url.
  *
@@ -77,7 +97,7 @@ export declare function npmPublishTimes(name: string): Promise<{
 }[]>;
 /** Everything the dialog renders for one plugin, already resolved. */
 export interface UpdateNotes {
-    kind: 'release' | 'commits' | 'npm' | 'none';
+    kind: 'release' | 'commits' | 'npm' | 'source' | 'none';
     /** Present for `release`: the author's own notes for the latest release. */
     release?: ReleaseNotes;
     /** Present for `commits`: the tail, sliced when the boundary was found. */
@@ -90,6 +110,15 @@ export interface UpdateNotes {
         version: string;
         date: string;
     }[];
+    /** Present for `source`: the repository page to read changes on, or null. */
+    sourceUrl?: string | null;
+    /**
+     * Present for `source`: `missing` when the notes loaded without this
+     * plugin, `unavailable` when they could not be loaded at all — a passing
+     * failure, not a fact about the plugin — and `unreadable` when the source is
+     * one the market can never read, so waiting will not help (#819).
+     */
+    reason?: 'missing' | 'unavailable' | 'unreadable';
 }
 /**
  * Resolve the notes for one installed plugin, or `{ kind: 'none' }`.

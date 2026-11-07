@@ -4,14 +4,37 @@
  * the loader, and keeping exactly one theme active with the choice
  * persisted across restarts.
  */
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { loadRegistry, pluginCategories } from './registry.js';
 import { hotMount, hotUnmount, listHotMounts, writeDisabled } from './hot.js';
 import { logEvent } from './log.js';
-import { LifecycleWaitError, waitForLifecycle } from './lifecycle.js';
+import { loaderEntryId } from './patch.js';
+import { LifecyclePendingError, LifecycleWaitError, waitForLifecycle } from './lifecycle.js';
 import { nameMatchesPackage } from './entry-identity.js';
 import { bundlePatchInsertedIds, profileDir, readInstalled } from './profile.js';
-import { repoOf } from './sources.js';
+import { parseSourceUrl, repoOfTarget } from './sources.js';
+/**
+ * Whether an installed package declares itself a skin.
+ *
+ * The market's own criterion for "this is a theme" is the catalog, and the
+ * catalog does not list every skin a monorepo ships: the reporter's second
+ * skin is absent from it entirely, while the MANAGER that ships with them is
+ * a package from the same repo. Judging by repo alone made the manager a
+ * theme, so activating any other theme switched it off — and with it the
+ * user's own skin-management UI (#519). Both skins ship `skin.json` at their
+ * root (it names the package and its wiring); the manager ships none, which
+ * is the distinction the reporter pointed at.
+ */
+function hasSkinManifest(profileDirectory, name) {
+    try {
+        const manifest = JSON.parse(readFileSync(join(profileDirectory, 'node_modules', name, 'skin.json'), 'utf8'));
+        return typeof manifest.id === 'string' && manifest.id !== '';
+    }
+    catch {
+        return false;
+    }
+}
 /**
  * Whether a loader entry belongs to `packageName`.
  *
@@ -28,12 +51,35 @@ import { repoOf } from './sources.js';
  *    relation at all, so this falls back to the entry id the package's own
  *    patch inserts — the rule `carriedRowLive()` uses (#156).
  */
+/**
+ * The bare package a loader entry's own name points at.
+ *
+ * `dsh-taiwind` and `aegis/extensions/dsh/index.js` both name a package;
+ * relative paths, absolute paths, URLs and cordis builtins name none. Unlike
+ * `packageOfEntryName()` this keeps a lone bare name, which is exactly the
+ * shape #1089 is about.
+ */
+function namedPackage(entryName) {
+    if (typeof entryName !== 'string' || entryName === '')
+        return null;
+    if (entryName.startsWith('.') || entryName.startsWith('/') || entryName.startsWith('cordis:'))
+        return null;
+    if (entryName.includes('://'))
+        return null;
+    const parts = entryName.split('/');
+    // A scoped name needs `@scope/pkg` to be a package at all.
+    if (parts[0].startsWith('@'))
+        return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : null;
+    return parts[0];
+}
 function ownsLoaderEntry(entry, packageName, ownedIds) {
     const entryName = entry.options.name;
     if (nameMatchesPackage(entryName, packageName))
         return true;
-    const id = entry.options.id;
-    if (id === undefined || id === '')
+    // A YAML `id: 1` reaches the loader as a NUMBER (#1071); `.split` on it
+    // threw and took the caller down.
+    const id = loaderEntryId(entry);
+    if (id === '')
         return false;
     // Loader ids may carry an include prefix (`include:<key>:<id>`); the bare
     // id is what a bundle patch declares.
@@ -53,15 +99,47 @@ export function createThemeManager(host, profile, disabledThemes, explicitDir) {
             const registry = await loadRegistry();
             const themeEntries = registry.plugins.filter(p => pluginCategories(p).includes('theme'));
             const themeNames = new Set(themeEntries.map(p => p.name));
-            const themeRepos = new Set(themeEntries.map(p => repoOf(p.url)).filter((r) => r !== null).map(r => r.toLowerCase()));
+            // Repo → the subdirectories its catalog entries point at, plus whether
+            // any entry is the repo itself. One repository can ship several PACKAGES
+            // — a skin manager and its skins — and matching by repo alone made every
+            // one of them a theme, so activating another theme switched the manager
+            // off too, taking the user's own management UI with it (#519).
+            const themeRepos = new Map();
+            for (const entry of themeEntries) {
+                const parsed = parseSourceUrl(entry.url);
+                if (parsed === null)
+                    continue;
+                const key = parsed.repo.toLowerCase();
+                const record = themeRepos.get(key) ?? { root: false, subpaths: new Set() };
+                if (parsed.subpath === null)
+                    record.root = true;
+                else
+                    record.subpaths.add(parsed.subpath.toLowerCase());
+                themeRepos.set(key, record);
+            }
             for (const [name, spec] of Object.entries(readInstalled(profile, activeProfileDir))) {
                 if (themeNames.has(name)) {
                     names.add(name);
                     continue;
                 }
-                const match = /github:([^#\s]+)/.exec(String(spec).toLowerCase());
-                if (match !== null && themeRepos.has(match[1]))
-                    names.add(name);
+                const identity = repoOfTarget(String(spec).toLowerCase());
+                if (identity === null)
+                    continue;
+                const at = identity.indexOf('#path:/');
+                const repo = at === -1 ? identity : identity.slice(0, at);
+                const subpath = at === -1 ? null : identity.slice(at + '#path:/'.length);
+                const record = themeRepos.get(repo);
+                if (record === undefined)
+                    continue;
+                // Only a repo whose themes ALL live in subdirectories can be told
+                // apart this way. A catalog entry at the repo root says nothing about
+                // subdirectories, so that shape keeps the permissive match it had —
+                // which is also what keeps a monorepo skin working when the entry
+                // points at the repo.
+                if (subpath !== null && !record.root && record.subpaths.size > 0
+                    && !record.subpaths.has(subpath) && !hasSkinManifest(activeProfileDir, name))
+                    continue;
+                names.add(name);
             }
         }
         catch { /* registry unavailable — nothing classifies as a theme */ }
@@ -76,7 +154,22 @@ export function createThemeManager(host, profile, disabledThemes, explicitDir) {
     /** Every loader entry that belongs to this package (its own rows and names). */
     function matchingEntries(name) {
         const ownedIds = new Set(bundlePatchInsertedIds(join(activeProfileDir, 'node_modules', name)));
-        return [...host.loader.entries()].filter(entry => ownsLoaderEntry(entry, name, ownedIds));
+        let installed = null;
+        return [...host.loader.entries()].filter(entry => {
+            if (!ownsLoaderEntry(entry, name, ownedIds))
+                return false;
+            // An entry whose name IS another installed package belongs to that
+            // package, even when this package's patch also declares its id
+            // (#1089: `dsh-tauri-pet` re-declared `dsh-taiwind`, so switching the
+            // pet off took tailwind's stylesheet down on every boot). The id
+            // fallback stays for CARRIER bundles (#619), whose carried packages are
+            // dependencies — the profile's own rows do not list them.
+            const owner = namedPackage(entry.options.name);
+            if (owner === null || owner === name)
+                return true;
+            installed ??= new Set(Object.keys(readInstalled(profile, activeProfileDir)));
+            return !installed.has(owner);
+        });
     }
     /**
      * Entries whose last update did not settle.
@@ -115,12 +208,25 @@ export function createThemeManager(host, profile, disabledThemes, explicitDir) {
         const previous = [];
         try {
             let found = false;
+            // Whether ANY loader entry was selected, as opposed to whether an update
+            // landed. The log conflated the two (#788): `found` only turns true after
+            // a successful update, so an entry that WAS matched but whose update threw
+            // was reported as "no loader entry matched" — which sent the reporter
+            // looking for a naming bug (#619's shape) in a profile where the match
+            // was fine and the runtime was simply still busy.
+            let matched = false;
             for (const entry of matchingEntries(name)) {
+                matched = true;
                 if (!disabledFlag && uncertainEntries.has(entry)) {
                     throw new LifecycleWaitError('loader entry: runtime state is uncertain; retry disabling before enabling');
                 }
                 if (requireLive)
                     previous.push({ entry, disabled: entry.options.disabled, live: entry.fiber !== undefined });
+                // Whether THIS entry's update landed, so the "-> off/on" line below is
+                // only written for a change that happened. It used to be written after
+                // a thrown update too, reading "off: fiber=true" for an entry that was
+                // still running.
+                let landed = false;
                 // A disable can land while the entry's init is still in flight: the
                 // options flip but the finishing init brings the fiber up anyway, and a
                 // plain re-update no-ops on the empty diff. Force the update and verify
@@ -129,13 +235,21 @@ export function createThemeManager(host, profile, disabledThemes, explicitDir) {
                     try {
                         await updateEntry(entry, disabledFlag ? true : null);
                         found = true;
+                        landed = true;
                     }
                     catch (error) {
                         // A strict caller cannot accept an update that did not settle; a
                         // pending one is also fatal for a caller that asked to be told.
                         if (requireLive || (rejectPending && error instanceof LifecycleWaitError))
                             throw error;
-                        logEvent('warn', 'toggle', `${name}: entry update failed — ${error instanceof Error ? error.message : String(error)}`);
+                        // "Still pending" is the SAME update that already timed out, not a
+                        // new failure: the first `did not settle within 10s` stays in the
+                        // log, and every retry that merely bumps into it would otherwise
+                        // add a line that reads as one more thing going wrong (#788 — 25 of
+                        // them across restarts for one stuck entry).
+                        if (!(error instanceof LifecyclePendingError)) {
+                            logEvent('warn', 'toggle', `${name}: entry update failed — ${error instanceof Error ? error.message : String(error)}`);
+                        }
                         break;
                     }
                     const live = entry.fiber !== undefined;
@@ -146,9 +260,11 @@ export function createThemeManager(host, profile, disabledThemes, explicitDir) {
                 if (requireLive && (entry.fiber !== undefined) === disabledFlag) {
                     throw new Error(`${name}: loader entry ${disabledFlag ? 'did not stop' : 'did not become live'}`);
                 }
-                logEvent('info', 'toggle', `${name} -> ${disabledFlag ? 'off' : 'on'}: fiber=${String(entry.fiber !== undefined)}`);
+                if (landed) {
+                    logEvent('info', 'toggle', `${name} -> ${disabledFlag ? 'off' : 'on'}: fiber=${String(entry.fiber !== undefined)}`);
+                }
             }
-            if (!found)
+            if (!matched)
                 logEvent('info', 'toggle', `${name}: no loader entry matched`);
             return found;
         }

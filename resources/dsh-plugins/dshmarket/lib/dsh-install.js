@@ -45,11 +45,33 @@ function entryDirectories(entry) {
     }
     return directories;
 }
+/**
+ * Where an official Desktop build's runtime can live under Electron's
+ * resources directory.
+ *
+ * Each application root is offered twice: itself, and with one more `dsh/`
+ * level. 0.2.0-rc.2 embeds the whole runtime in a `dsh/` subdirectory INSIDE
+ * `app.asar` — `app.asar/dsh/node_modules/@deepseek-ai/dsh` — while the asar's
+ * own `node_modules/@deepseek-ai/` holds only eight shared libraries. Probing
+ * the root alone therefore found neither the host package nor the in-box
+ * bundles, and every consumer read "no host" (#778): the exported log said
+ * `dsh host: not locatable`, `hostVersion` was null, and "update to a
+ * compatible version" could not pick anything.
+ *
+ * The nested candidate follows its root, so every layout that worked before is
+ * still tried first and still wins. A candidate that does not exist costs one
+ * failed manifest read, and the identity checks downstream
+ * (`readDshManifest`, `flatDesktopHost`) are what decide whether a directory is
+ * a host at all — the nested level adds places to look, not things to trust.
+ */
 function desktopDirectories() {
     const { resourcesPath } = process;
     if (typeof resourcesPath !== 'string' || resourcesPath.length === 0)
         return [];
-    return APPLICATION_ROOTS.map(root => join(resourcesPath, root));
+    return APPLICATION_ROOTS.flatMap(root => {
+        const base = join(resourcesPath, root);
+        return [base, join(base, 'dsh')];
+    });
 }
 /**
  * Directories that can hold the DSH installation's OWN bundle layer — the
@@ -124,6 +146,55 @@ function flatDesktopHost(directory) {
     return { directory, version: corroborated ? version : 'unknown' };
 }
 /**
+ * The install anchor a launcher published for this process — usually the
+ * `dsh` package's own `package.json` (the core's `INSTALL_ANCHOR`, handed to
+ * plugins as `profileContext.installAnchor`; `ProfileContextLike` in
+ * src/index.ts).
+ *
+ * Read through a live source rather than copied at mount, for the same reason
+ * the launcher's other services are: some launchers publish `profileContext`
+ * after the market mounts, and a frozen copy would answer "unknown" for the
+ * whole session. The default source answers nothing, so every layout
+ * {@link dshHostInfo} already locates keeps the exact probes it always had.
+ */
+let launcherInstallAnchorSource = () => null;
+/**
+ * Point host detection at the install anchor the launcher published.
+ * @param source - live source of `profileContext.installAnchor`, re-read on
+ * every lookup; it answers null when the host publishes no anchor.
+ * @returns the previous source, so a caller can restore it on teardown.
+ */
+export function setLauncherInstallAnchorSource(source) {
+    const previous = launcherInstallAnchorSource;
+    launcherInstallAnchorSource = source;
+    return previous;
+}
+/**
+ * Host info read from the anchor a launcher published.
+ *
+ * An embedded host — a packaged app that boots the dsh core tree in-process
+ * instead of exec'ing the CLI — is neither layout {@link dshHostInfo} probes:
+ * `process.argv[1]` is the app's own entry point, and there is no Electron
+ * resources directory. Its launcher still knows where the runtime lives and
+ * publishes that as `profileContext.installAnchor`, normally the dsh
+ * package's own `package.json` — the very file the CLI probe would have read.
+ * The same identity check applies, and an anchor that names a flat Desktop
+ * root still has to corroborate its version with the in-box runtime: an
+ * anchor is a place to look, not a thing to trust.
+ *
+ * @param anchor - the published anchor path, or null/undefined when none was.
+ * @returns the host info, or null when the anchor names no dsh host.
+ */
+export function hostInfoFromAnchor(anchor) {
+    if (typeof anchor !== 'string' || !isAbsolute(anchor))
+        return null;
+    const directory = dirname(anchor);
+    const manifest = readDshManifest(directory);
+    if (manifest !== null)
+        return { directory, version: declaredVersion(manifest) };
+    return flatDesktopHost(directory);
+}
+/**
  * The version of the DSH host this market is running inside.
  *
  * CLI versions come from the host manifest. Flat Desktop shells additionally
@@ -139,6 +210,8 @@ function flatDesktopHost(directory) {
  * of the answer: a path under Electron's resources is a Desktop-bundled host,
  * which #139 established can be older than whatever `npm ls` would report.
  * Asking the user is not a substitute — that is the number they do not have.
+ * When both layouts miss — an embedded host has neither — the launcher's
+ * published install anchor is tried last ({@link hostInfoFromAnchor}).
  * @returns the host version and the directory it was read from, or null when
  * no host package is locatable (a plain `dsh web` from a global install can
  * legitimately land here).
@@ -157,7 +230,9 @@ export function dshHostInfo(entry = process.argv[1]) {
         if (host !== null)
             return host;
     }
-    return null;
+    // Embedded hosts last: the packaged layouts above keep winning, and a host
+    // whose launcher published no anchor still answers null, exactly as before.
+    return hostInfoFromAnchor(launcherInstallAnchorSource());
 }
 /**
  * Walk up from the CLI entry first, then inspect Electron's authoritative

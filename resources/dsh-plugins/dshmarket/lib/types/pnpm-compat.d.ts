@@ -33,7 +33,7 @@ export declare function pluginArgsFor(profileDir: string, pluginArgs: string[]):
  */
 export declare const HOST_NAMESPACE_RE: RegExp;
 export interface PnpmFailure {
-    code: 'adding-to-root' | 'not-a-workspace' | 'hoist-pattern-diff' | 'pnpm-missing' | 'release-age-violation' | 'ignored-builds' | 'git-prepare-not-allowed' | 'git-prepare-failed' | 'tarball-url-mismatch' | 'fetch-404' | 'no-matching-version' | 'transient-network' | 'fetch-timeout' | 'unexpected-store' | 'patch-failed' | 'unused-patch' | 'missing-tarball-integrity' | 'windows-file-locked' | 'pnpm-unusable' | 'missing-local-dependency' | 'unparseable-build-key' | 'native-oom' | 'ssh-auth-failed';
+    code: 'adding-to-root' | 'not-a-workspace' | 'hoist-pattern-diff' | 'pnpm-missing' | 'release-age-violation' | 'ignored-builds' | 'git-prepare-not-allowed' | 'git-prepare-failed' | 'tarball-url-mismatch' | 'fetch-404' | 'no-matching-version' | 'exact-version-missing' | 'transient-network' | 'fetch-timeout' | 'unexpected-store' | 'patch-failed' | 'unused-patch' | 'missing-tarball-integrity' | 'windows-file-locked' | 'profile-file-locked' | 'pnpm-unusable' | 'missing-local-dependency' | 'unparseable-build-key' | 'native-oom' | 'ssh-auth-failed' | 'host-incompatible-install' | 'lockfile-broken' | 'lockfile-outdated' | 'pnpm-stalled' | 'profile-write-lock';
     /** Bilingual, actionable message shown to the user instead of the raw wall of text. */
     message: string;
     /** True when re-running `pnpm install` in the profile is the documented recovery. */
@@ -90,4 +90,13 @@ export declare function isFetchTimeoutFailure(output: string): boolean;
  *   is recognized from what pnpm said.
  * @returns the classified failure, or null when unrecognized (raw output is then shown as-is).
  */
-export declare function classifyPnpmFailure(output: string, exitCode?: number | null): PnpmFailure | null;
+/**
+ * What the caller knows about the profile a command ran against.
+ *
+ * Only the diagnose-the-store branch uses it today: the recorded pnpm version
+ * and store live in that profile's own `node_modules/.modules.yaml` (#1100).
+ */
+export interface PnpmFailureContext {
+    profileDirectory?: string;
+}
+export declare function classifyPnpmFailure(output: string, exitCode?: number | null, context?: PnpmFailureContext): PnpmFailure | null;

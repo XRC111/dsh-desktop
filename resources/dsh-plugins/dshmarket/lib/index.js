@@ -6,10 +6,22 @@ import { dirname, isAbsolute } from 'node:path';
 import { createDesktopPluginRuntime, setHostPackageManager } from './dsh-cli.js';
 import { createOfficialDesktopRuntime } from './official-desktop.js';
 import { isDshProfileName } from './profile.js';
-import { setTrustedHostsSource } from './http.js';
+import { setRequestGateSource, setTrustedHostsSource } from './http.js';
+import { setLauncherInstallAnchorSource } from './dsh-install.js';
 import { mountMarketRoutes } from './routes.js';
 import { installDesktopMarketSettings, installMarketSettings } from './settings.js';
+import { MAX_AUTO_REPAIR_ATTEMPTS } from './pending-updates.js';
 export const name = 'dsh-market';
+/**
+ * How long after the market mounts an interrupted update is repaired.
+ *
+ * The market mounts while the composition is still starting its entries, and
+ * an install at that moment would reconcile the profile underneath the boot.
+ * The desktop host's own replay wait is the same order of magnitude (8 s), so
+ * this waits that long once, then fixes what a previous start left behind
+ * (#928). Nothing happens when the journal is empty, which is the normal case.
+ */
+const PENDING_UPDATE_REPAIR_DELAY_MS = 8_000;
 /**
  * Register the market against the host context.
  * @param ctx - Host context that may acquire webServer and shell services.
@@ -50,6 +62,22 @@ function launchedProfile(context) {
     if (!isDshProfileName(name) || dir === '')
         return undefined;
     return { name, dir };
+}
+/**
+ * The launcher's `profileContext` in one line, for the exported log (#744).
+ *
+ * Only the facts that decide the branch: whether the service is there, and
+ * whether its shape is one `launchedProfile` accepts. Never the directory
+ * itself — the log already carries the profile path where it is needed.
+ */
+export function describeProfileContext(value) {
+    if (value === undefined || value === null)
+        return 'absent';
+    const launched = launchedProfile(value);
+    if (launched !== undefined)
+        return `present (name ${launched.name})`;
+    const shape = value;
+    return `present but unusable (name: ${typeof shape.name}, dir: ${typeof shape.dir})`;
 }
 /**
  * The package manager the launcher published for this profile, if any.
@@ -129,13 +157,57 @@ export function useTrustedHosts(ctx) {
             ? connection.trustedHosts.filter((entry) => typeof entry === 'string')
             : [];
     });
+    // The same service carries the host's request gate (#603): its fence plus
+    // its browser login, the check its own API runs. Read per request for the
+    // same reason as the authorities above.
+    const previousGate = setRequestGateSource(() => {
+        const connection = ctx.get('connection');
+        const gate = connection?.requestRejection;
+        return typeof gate === 'function'
+            ? (request => gate.call(connection, request))
+            : undefined;
+    });
     // The setter returns the PREVIOUS source, not a restore closure — the same
     // contract as setBuildEnvSource in dsh-cli.ts.
-    return () => { setTrustedHostsSource(previous); };
+    return () => {
+        setTrustedHostsSource(previous);
+        setRequestGateSource(previousGate);
+    };
+}
+/**
+ * Feed host detection the install anchor the launcher published.
+ *
+ * The CLI is located by walking `process.argv[1]` up to its package, and the
+ * official Desktop by Electron's resources directory. An embedded host — a
+ * packaged app that boots the dsh core tree in-process — has neither, so
+ * `dshHostInfo()` answered null there and every host-version surface read
+ * "unknown": Discover's compatibility filter (#473), the pre-install refusal
+ * (#404), and the exported log's `dsh host:` line (#426). The launcher does
+ * publish where its runtime is (`profileContext.installAnchor`), so hand
+ * that to detection. Read through a live source, not a mount-time copy:
+ * launchers may provide `profileContext` after the market mounts (the same
+ * timing problem the origins above handle), and a frozen value would answer
+ * "unknown" for the whole session on exactly those hosts.
+ *
+ * Exported for the specs that cover this wiring.
+ * @returns a restore function for the effect that installed it.
+ */
+export function useLauncherInstallAnchor(ctx) {
+    const previous = setLauncherInstallAnchorSource(() => {
+        const profileContext = ctx.get('profileContext');
+        const anchor = profileContext?.installAnchor;
+        return typeof anchor === 'string' ? anchor : null;
+    });
+    return () => {
+        setLauncherInstallAnchorSource(previous);
+    };
 }
 export function apply(ctx, config) {
     ctx.inject(['webServer', 'loader'], (hostCtx) => {
         const host = hostCtx;
+        // Before any branch mounts: every host-version surface reads detection
+        // through the anchor, so it has to be in place before those exist.
+        host.effect(() => useLauncherInstallAnchor(ctx), 'dsh-market: launcher install anchor');
         const desktopProfiles = ctx.get('desktopProfiles');
         if (desktopProfiles === undefined) {
             // An explicit `profile:` in cordis.yml is the operator speaking and
@@ -144,14 +216,18 @@ export function apply(ctx, config) {
             // its name, and never with somebody else's.
             const profileContext = ctx.get('profileContext');
             const launched = launchedProfile(profileContext);
-            // The official Electron app owns this profile. Its CLI explicitly
-            // refuses `--profile desktop`; use the app's pluginManager service.
+            // The official Electron app owns this profile. Its CLI refuses
+            // `--profile desktop` (outright up to dsh 0.2.0-rc.1; from rc.2 it
+            // admits only Desktop's own carrier, and only with Desktop fully quit —
+            // never from inside the running app this market lives in), so use the
+            // app's pluginManager service.
             // Looking it up at request time lets the market mount before the
             // service while still failing closed if it never becomes available.
             // The dsh CLI refuses a profile by NAME — `profile.toLowerCase() ===
-            // "desktop"` (@deepseek-ai/dsh 0.1.7-alpha.2) — so a launched profile
-            // with that name can never be changed through `dsh plugin`, whatever
-            // the install layout. Detection follows the same rule rather than the
+            // "desktop"` (@deepseek-ai/dsh 0.1.7-alpha.2; from 0.2.0-rc.2 it lets
+            // only Desktop's own carrier through, with the app quit) — so from
+            // inside a running Desktop a launched profile with that name can never
+            // be changed through `dsh plugin`, whatever the install layout. Detection follows the same rule rather than the
             // app.asar anchor shape an earlier draft keyed on: the official desktop
             // host is not published, its layout could not be checked, and a host
             // that missed the anchor test fell straight back to the CLI and failed
@@ -162,7 +238,8 @@ export function apply(ctx, config) {
             const configuredDesktop = configured !== undefined && configured.toLowerCase() === 'desktop';
             const officialElectron = launched !== undefined && launched.name.toLowerCase() === 'desktop';
             // An explicitly configured `profile: desktop` takes this branch too. The
-            // CLI refuses that profile by NAME, so routing it there — which is what
+            // CLI refuses that profile by NAME (see above — from inside the running
+            // app on every version), so routing it there — which is what
             // an operator's own workaround for a host that hides `profileContext`
             // does (#744) — makes every install fail for certain. The configuration
             // still wins over the launcher for the name; it just cannot win a branch
@@ -174,10 +251,19 @@ export function apply(ctx, config) {
                 const profileDirectory = launched !== undefined && launched.name.toLowerCase() === profileName.toLowerCase()
                     ? launched.dir
                     : undefined;
-                const runtime = createOfficialDesktopRuntime(() => hostCtx.get('pluginManager'), profileName, profileDirectory);
+                const runtime = createOfficialDesktopRuntime(() => hostCtx.get('pluginManager'), profileName, profileDirectory, 
+                // Hand the invocation to the runtime only. Do not register it
+                // globally: other official-desktop installs still go through the
+                // manager (#702). The market itself is the one exception (#982).
+                hostPackageManagerOf(profileContext));
                 const resolved = {
                     profile: profileName,
                     ...(profileDirectory === undefined ? {} : { profileDirectory }),
+                    origin: {
+                        profileSource: configured !== undefined ? 'configured (cordis.yml), official desktop branch' : 'launcher profileContext, official desktop branch',
+                        launcherAtStart: describeProfileContext(profileContext),
+                        launcherNow: () => describeProfileContext(ctx.get('profileContext')),
+                    },
                     desktopHost: true,
                     allowRestart: false,
                     maxSnapshots: config?.maxSnapshots,
@@ -193,7 +279,19 @@ export function apply(ctx, config) {
                 host.effect(() => {
                     const restoreTrustedHosts = useTrustedHosts(ctx);
                     const disposeRoutes = mountMarketRoutes(host, resolved, runtime, agentsLookupOf(ctx));
+                    const repairTimer = setTimeout(() => {
+                        void runtime.repairPendingUpdates().then(report => {
+                            if (report.reinstalled.length === 0 && report.failed.length === 0)
+                                return;
+                            const abandoned = report.abandoned.length === 0
+                                ? ''
+                                : `, ${String(report.abandoned.length)} given up on after ${String(MAX_AUTO_REPAIR_ATTEMPTS)} starts — reinstall from Settings → Plugins: ${report.abandoned.join(', ')}`;
+                            console.warn(`dsh-market: ${String(report.reinstalled.length)} interrupted update(s) reinstalled, ${String(report.failed.length)} still pending${abandoned}`);
+                        });
+                    }, PENDING_UPDATE_REPAIR_DELAY_MS);
+                    repairTimer.unref?.();
                     return async () => {
+                        clearTimeout(repairTimer);
                         disposeRoutes();
                         restoreTrustedHosts();
                         await runtime.dispose();
@@ -209,6 +307,14 @@ export function apply(ctx, config) {
             const resolved = {
                 profile: config?.profile ?? launched?.name ?? argvProfile() ?? 'web',
                 ...(useLaunchedDir ? { profileDirectory: launched.dir } : {}),
+                origin: {
+                    profileSource: config?.profile !== undefined ? 'configured (cordis.yml)'
+                        : launched !== undefined ? 'launcher profileContext'
+                            : argvProfile() !== undefined ? '--profile flag'
+                                : 'default (no configured profile, no launcher profileContext, no --profile flag)',
+                    launcherAtStart: describeProfileContext(profileContext),
+                    launcherNow: () => describeProfileContext(ctx.get('profileContext')),
+                },
                 // Left UNDEFINED when unconfigured, deliberately: `?? true` here
                 // would turn "the operator said nothing" into "the operator said
                 // yes", and restartAllowed() could no longer tell them apart — which
@@ -244,10 +350,18 @@ export function apply(ctx, config) {
             const resolved = {
                 profile: current.name,
                 profileDirectory: current.dir,
+                origin: {
+                    profileSource: 'desktop shell (desktopProfiles)',
+                    launcherAtStart: describeProfileContext(ctx.get('profileContext')),
+                    launcherNow: () => describeProfileContext(ctx.get('profileContext')),
+                },
                 // The shell owns the window and the process lifecycle here; the
                 // capability bits report that, and an explicit profile directory no
                 // longer implies it (#639).
                 desktopHost: true,
+                // A shell that cannot be asked to replay still replays on its own,
+                // shortly after the install lands (#814): wait for it and adopt.
+                ...(desktopProfiles.pluginActivation === undefined ? { hostReplayWaitMs: 8000 } : {}),
                 // Relaunching a raw Electron process would bypass Desktop's launcher
                 // lifecycle. The shell remains responsible for restart in this mode.
                 allowRestart: false,
@@ -259,12 +373,19 @@ export function apply(ctx, config) {
             const desktopHost = desktopCtx;
             installDesktopMarketSettings(desktopCtx);
             desktopHost.effect(() => {
+                // Same authority source as the other two branches (#960): this is the
+                // branch Desktop actually takes, and without it the fence only ever
+                // accepted loopback — every mutating route answered 403 untrusted
+                // origin on a LAN, Tailscale or hostname deployment the host itself
+                // had declared.
+                const restoreTrustedHosts = useTrustedHosts(ctx);
                 // The host that publishes `desktopProfiles` is the one that may own
                 // activation (#551): hand it the bridge it published, if any, so the
                 // market can ask for a replay instead of mounting a second entry.
                 const disposeRoutes = mountMarketRoutes(host, resolved, runtime, agentsLookupOf(ctx), desktopProfiles.pluginActivation);
                 return async () => {
                     disposeRoutes();
+                    restoreTrustedHosts();
                     await runtime.dispose();
                 };
             }, 'dsh-market: Desktop http routes and package operations');

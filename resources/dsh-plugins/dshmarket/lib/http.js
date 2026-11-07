@@ -32,11 +32,60 @@ export function sendJson(response, status, payload) {
  * undeclared name is still refused.
  */
 let trustedHostsSource = () => [];
+let requestGateSource = () => undefined;
+/** Point the market at the host's request gate. Returns the previous source. */
+export function setRequestGateSource(source) {
+    const previous = requestGateSource;
+    requestGateSource = source;
+    return previous;
+}
+/**
+ * Answer the request with the host's rejection, if it has one.
+ * @returns true when the request was refused and answered here.
+ */
+export function refuseUnadmitted(request, response) {
+    const gate = requestGateSource();
+    if (gate === undefined)
+        return false;
+    let status;
+    try {
+        status = gate(request);
+    }
+    catch {
+        // A gate that throws has not admitted anything. Failing open here would
+        // turn a host bug into the exposure this exists to close.
+        status = 403;
+    }
+    if (status === undefined)
+        return false;
+    sendJson(response, status, {
+        error: status === 401
+            ? '需要先登录 DSH：请重新打开 dsh web 启动时打印的那个网址。 / DSH login required: reopen the URL dsh web printed at startup.'
+            : '这个请求来自不受信任的地址，已拒绝。 / This request came from an untrusted origin and was refused.',
+    });
+    return true;
+}
 /** Point the fence at the host's declared authorities. Returns the previous source. */
 export function setTrustedHostsSource(source) {
     const previous = trustedHostsSource;
     trustedHostsSource = source;
     return previous;
+}
+/**
+ * The authorities this deployment declared, as the fence reads them right now.
+ *
+ * `sameOrigin` consults them through the private source above. The privileged
+ * routes (the backup export, the self-uninstall, the one-click restart) need
+ * the same list, and a second private copy of it would be a second thing to
+ * keep in step — the fence that guards the market's ordinary routes and the
+ * fence that guards its privileged ones have to agree about what this
+ * deployment serves.
+ *
+ * Read per request, exactly as the source itself is: a deployment that
+ * declares an authority later is honoured from that request on.
+ */
+export function declaredTrustedHosts() {
+    return trustedHostsSource();
 }
 /**
  * Parse a bare `host[:port]` authority, or null when the value is not one.
@@ -98,7 +147,10 @@ export function trustedAuthority(host, trustedHosts) {
  * - a cross-site page is refused — its Origin is present and different;
  * - `Origin: null` (a sandboxed iframe, a `data:` document) is refused, because
  *   `null` is a present-but-unparseable origin, not an absent one;
- * - a same-host-but-different-port request is refused;
+ * - a same-host-but-different-port request is refused, except that a loopback
+ *   Host accepts a port-less same-hostname Origin (#1031: Chrome 151+ omits
+ *   the port on loopback Origins, and the dsh core fence follows the same
+ *   rule);
  * - an EMPTY Origin is refused too: the header being present and unparseable
  *   is not the same statement as its being absent, and only absence is what
  *   a stripping proxy produces.
@@ -153,6 +205,16 @@ export function sameOrigin(request) {
     // equality cannot: a cross-site request whose Origin happens to match.
     if (request.headers['sec-fetch-site'] === 'cross-site')
         return false;
+    // Chrome 151+ serializes a loopback Origin WITHOUT its explicit port
+    // (#1031): the page at `http://127.0.0.1:3080` now states `Origin:
+    // http://127.0.0.1` on its same-origin POSTs, so the strict `host` equality
+    // below refuses installs and updates from the newest browsers. Mirror the
+    // dsh core rule (`isSameAuthorityOrigin`): the hostname must match, and the
+    // omitted port is honoured only on the loopback fence — `loopbackAuthority`
+    // above has already decided the Host names loopback, a cross-site page still
+    // fails the hostname test, and a rebinding page still cannot get its own
+    // name through both. Declared LAN names and proxies keep needing the exact
+    // port, as before.
     const origin = request.headers.origin;
     // A missing Origin is not a cross-site request: browsers send it on every
     // POST, same-origin included, so its absence means the caller is not a
@@ -162,7 +224,14 @@ export function sameOrigin(request) {
     if (origin === undefined)
         return true;
     try {
-        return new URL(origin).host === host;
+        const originUrl = new URL(origin);
+        if (originUrl.host === host)
+            return true;
+        if (originUrl.port === '' && host !== undefined && loopbackAuthority(host)) {
+            const hostUrl = parseAuthority(host);
+            return hostUrl !== null && originUrl.hostname === hostUrl.hostname;
+        }
+        return false;
     }
     catch {
         return false;

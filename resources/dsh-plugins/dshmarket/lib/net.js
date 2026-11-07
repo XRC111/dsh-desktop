@@ -31,6 +31,36 @@
  */
 import { Agent, EnvHttpProxyAgent, fetch as undiciFetch } from 'undici';
 /**
+ * Hand the host's own undici the dispatcher our import took (#861).
+ *
+ * undici's `lib/global.js` runs at import time, and when its symbol is unset
+ * it installs an Agent on BOTH global dispatcher symbols: `.1`, which Node's
+ * built-in fetch reads, and `.2`, which undici 8's `getGlobalDispatcher()`
+ * reads. `setGlobalDispatcher` defines them non-configurable, so the value
+ * cannot be taken back — but it is writable, and undici 8 only ever READS
+ * `.2`, so hiding ours there is enough for it to install its own dispatcher
+ * and wrap it onto `.1` for the legacy consumers.
+ *
+ * Measured on Node 24.20 and 25.6 (undici 7.29 as the market's copy, 8.12 as
+ * the host's): with this, a host importing undici 8 after the market gets
+ * `getGlobalDispatcher() instanceof its own Agent` — without it, it is handed
+ * the market's undici 7 Agent (`instanceof` its own Agent: false) and never
+ * installs one, which is the state #861 reports as the host's own LLM and
+ * model-list requests failing once the market is loaded.
+ *
+ * `.1` is deliberately left alone: Node's built-in fetch reads it and asserts
+ * it is set, so clearing it breaks global fetch outright (measured: the same
+ * probe that makes `.2` undefined fails `assert(dispatcher)` when `.1` is
+ * cleared too). Our own requests are unaffected either way — every one of
+ * them carries a dispatcher this module created.
+ */
+export function releaseHostUndiciDispatcher(global = globalThis, ownAgent = Agent) {
+    const symbol = Symbol.for('undici.globalDispatcher.2');
+    if (global[symbol] instanceof ownAgent)
+        global[symbol] = undefined;
+}
+releaseHostUndiciDispatcher();
+/**
  * The proxy this process would use for the catalog, if any.
  *
  * The standard variables mirror `EnvHttpProxyAgent`'s own resolution
@@ -106,5 +136,39 @@ export async function marketFetch(url, init) {
         httpProxy: http ?? undefined,
         httpsProxy: https ?? undefined,
     });
-    return await undiciFetch(url, { ...init, dispatcher: proxyAgent });
+    const proxy = https ?? http;
+    try {
+        return await undiciFetch(url, { ...init, dispatcher: proxyAgent });
+    }
+    catch (error) {
+        // A LOOPBACK proxy that refused this host is usually not this user's
+        // (#1042): the Desktop host runs one on 127.0.0.1 for its own child
+        // processes, changes its port every session, and answers 403 to any
+        // CONNECT for a host outside its allowlist — so every catalog fetch died
+        // there while `curl` straight to the origin worked. Nothing is leaked by
+        // trying the same request directly: a proxy on loopback is on this
+        // machine. A proxy anywhere else is left to fail as it would have: it was
+        // configured on purpose, and going around it could put the request
+        // outside the network that person is supposed to be on.
+        if (!isLoopbackProxy(proxy) || init?.signal?.aborted === true)
+            throw error;
+        directAgent ??= new Agent();
+        return await undiciFetch(url, { ...init, dispatcher: directAgent });
+    }
+}
+/**
+ * Whether a proxy URL points at this machine.
+ *
+ * @param proxy - the resolved proxy URL, or null when there is none.
+ */
+function isLoopbackProxy(proxy) {
+    if (proxy === null)
+        return false;
+    try {
+        const host = new URL(proxy).hostname.replace(/^\[|\]$/gu, '');
+        return host === '127.0.0.1' || host === 'localhost' || host === '::1';
+    }
+    catch {
+        return false;
+    }
 }

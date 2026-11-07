@@ -7,12 +7,13 @@
  * the agent's sandboxed executor and denies writes to the profile directory.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { logEvent } from './log.js';
 import { createProgressTracker } from './ndjson.js';
 import { pluginArgsFor } from './pnpm-compat.js';
+import { createOutputBuffer } from './proc-text.js';
 import { isDshProfileName, profileDir } from './profile.js';
 import { activeRegion, DEFAULT_NPM_REGISTRY, routesFor } from './regions.js';
 import { NPM_NAME_RE } from './sources.js';
@@ -136,12 +137,23 @@ export function proxyEnvForPnpm(env = process.env, region = 'global') {
     // statement about where packages come from, and a region setting must not
     // overrule it. Same rule the proxy translation above follows, for the same
     // reason — this function's job is to fill silence, not to overwrite speech.
+    //
+    // Written in BOTH vocabularies (#865). pnpm reads `pnpm_config_*` /
+    // `PNPM_CONFIG_*` and does not read `npm_config_registry` at all — measured
+    // on 11.7.0, where the npm spelling is ignored and whatever `.npmrc` names
+    // stands. So the region setting used to move the market's own requests
+    // (checks, catalog, changelog) while every install still fetched from the
+    // user's configured registry, which is how a mirror lagging behind the
+    // catalog reads as "this version was never published" (#862). npm's own
+    // spelling stays because other things in the install path read it, and it
+    // is the name the value has always had.
     const mirror = routesFor(region).npmRegistry;
-    if (mirror !== DEFAULT_NPM_REGISTRY && !has('npm_config_registry')) {
+    if (mirror !== DEFAULT_NPM_REGISTRY && !has('npm_config_registry') && !has('PNPM_CONFIG_REGISTRY')) {
         // npm's own config convention terminates the registry with a slash;
         // pnpm accepts either, but writing it the conventional way keeps the
         // value recognizable to anyone reading the spawned process's env.
         out.npm_config_registry = `${mirror}/`;
+        out.PNPM_CONFIG_REGISTRY = `${mirror}/`;
     }
     return out;
 }
@@ -339,7 +351,7 @@ export function setBuildEnvSource(source) {
     buildEnvSource = source;
     return previous;
 }
-function spawnEnv() {
+function spawnEnv(invocation = hostPackageManager) {
     // pnpm v10+ blocks forever on a silent interactive prompt without a TTY;
     // CI mode forces it to act or fail instead of asking.
     const separator = process.platform === 'win32' ? ';' : ':';
@@ -348,7 +360,7 @@ function spawnEnv() {
     // goes FIRST so its bundled Node wins on a machine where nothing else is
     // on the process PATH — and it reaches every child, including the
     // `dsh plugin` forwarder, which is the only way an install can run there.
-    const hostEnv = hostPackageManager?.env ?? {};
+    const hostEnv = invocation?.env ?? {};
     const parts = `${hostEnv.PATH ?? ''}${separator}${process.env.PATH ?? ''}`
         .split(separator).filter(part => part !== '');
     for (const bin of toolSearchDirs()) {
@@ -453,13 +465,21 @@ function spawnShim(file, args, options) {
  */
 export function dshArgv() {
     const entry = process.argv[1];
-    if (entry !== undefined && /[\\/](?:bin\.(?:js|ts)|dsh)$/.test(entry)) {
+    // Desktop's installed `dsh web` uses this CLI carrier too. Keep
+    // that installation's dispatcher instead of silently selecting a different
+    // dsh from PATH. Do not accept arbitrary applications named cli.js.
+    const desktopCli = entry !== undefined
+        && /[\\/]node_modules[\\/]@deepseek-ai[\\/]dsh-desktop-host[\\/]lib[\\/]cli\.js$/.test(entry);
+    if (entry !== undefined && (desktopCli || /[\\/](?:bin\.(?:js|ts)|dsh)$/.test(entry))) {
         // Absolute paths are required: source launches (`pnpm dsh`) pass a
         // relative entry, which the child resolves against its OWN cwd and dies
         // with MODULE_NOT_FOUND (#13). cwd near the entry keeps execArgv imports
         // (tsx/esm) resolvable on source launches.
         const abs = resolve(entry);
-        return { file: nodeExecutable(), args: [...process.execArgv, abs], cwd: dirname(abs), viaShell: false };
+        // The official bundled CLI inherits the launcher's cwd. Its entry can
+        // live inside app.asar: Electron can read it, but the OS cannot chdir there.
+        // Do not probe that directory through Electron's virtual filesystem.
+        return { file: nodeExecutable(), args: [...process.execArgv, abs], cwd: desktopCli ? undefined : dirname(abs), viaShell: false };
     }
     // Bare `dsh` is a .cmd shim on Windows that only a shell can start (#13).
     return { file: 'dsh', args: [], cwd: undefined, viaShell: winCmdShim };
@@ -539,6 +559,37 @@ export function killChild(child) {
 /** The child of the operation currently running, for /dsh-market/cancel. */
 let activeChild = null;
 let cancelRequested = false;
+/**
+ * Remove the profile's `package.json.lock` when it is provably ours (#914).
+ *
+ * The dsh CLI writes that lock through the host's atomic-write, whose
+ * `finally` releases it. A timeout kills the whole tree with `taskkill /F`,
+ * so that release never runs and the file outlives the child — and on
+ * Windows the host cannot reliably tell a dead PID from a live one, so every
+ * later change waits the full lock timeout and fails.
+ *
+ * Only a lock naming OUR killed child is removed: that PID is provably dead
+ * because we just killed its whole tree, and it cannot belong to another
+ * operation. A lock naming anything else is left for the classifier to name
+ * (#914), because deleting a live operation's lock would race it.
+ */
+export function clearOwnedProfileLock(profile, pid) {
+    if (pid === undefined)
+        return false;
+    try {
+        const lock = join(profileDir(profile), 'package.json.lock');
+        const recorded = Number(readFileSync(lock, 'utf8').trim());
+        if (!Number.isInteger(recorded) || recorded !== pid)
+            return false;
+        rmSync(lock, { force: true });
+        logEvent('warn', 'install', `the timed-out operation left ${lock} behind (pid ${pid}, already killed with its tree) — removed it so the next change is not blocked (#914)`);
+        return true;
+    }
+    catch {
+        // Absent, unreadable, or removed by the child on its way out: nothing to do.
+        return false;
+    }
+}
 let activeDesktopOperation = null;
 /**
  * Kill a child and its whole tree, gracefully where the platform allows:
@@ -660,8 +711,8 @@ function probeHostPackageManager() {
         const child = spawnShim(invocation.command, [...invocation.args, '--version'], {
             stdio: ['ignore', 'pipe', 'pipe'], viaShell: winCmdShim, env: spawnEnv(),
         });
-        let output = '';
-        const collect = (chunk) => { output = (output + chunk.toString()).slice(-2000); };
+        const output = createOutputBuffer(2000);
+        const collect = (chunk) => { output.push(chunk); };
         child.stdout?.on('data', collect);
         child.stderr?.on('data', collect);
         child.on('error', (error) => {
@@ -670,7 +721,7 @@ function probeHostPackageManager() {
         });
         child.on('close', (code) => {
             hostPnpmReady = code === 0;
-            hostProbeFailure = hostPnpmReady ? null : { command: invocation.command, output: output.trim() };
+            hostProbeFailure = hostPnpmReady ? null : { command: invocation.command, output: output.text().trim() };
             resolvePromise(hostPnpmReady);
         });
     });
@@ -703,8 +754,8 @@ function probePnpmOnPath() {
         // IS the explanation, and throwing it away is what left #228 with a
         // failure nobody could act on.
         const child = spawnShim('pnpm', ['--version'], { stdio: ['ignore', 'pipe', 'pipe'], viaShell: winCmdShim, env: spawnEnv() });
-        let output = '';
-        const collect = (chunk) => { output = (output + chunk.toString()).slice(-2000); };
+        const output = createOutputBuffer(2000);
+        const collect = (chunk) => { output.push(chunk); };
         child.stdout?.on('data', collect);
         child.stderr?.on('data', collect);
         child.on('error', (error) => {
@@ -713,7 +764,7 @@ function probePnpmOnPath() {
         });
         child.on('close', (code) => {
             pnpmReady = code === 0;
-            pnpmProbeFailure = pnpmReady ? null : { kind: 'failed', output: output.trim() };
+            pnpmProbeFailure = pnpmReady ? null : { kind: 'failed', output: output.text().trim() };
             resolvePromise(pnpmReady);
         });
     });
@@ -725,13 +776,13 @@ function runQuiet(file, args, timeoutMs) {
             stdio: ['ignore', 'pipe', 'pipe'],
             viaShell: winCmdShim,
         });
-        let output = '';
+        const output = createOutputBuffer(8 * 1024);
         const timer = setTimeout(() => killChild(child), timeoutMs);
-        const collect = (chunk) => { output = (output + chunk.toString()).slice(-8 * 1024); };
+        const collect = (chunk) => { output.push(chunk); };
         child.stdout?.on('data', collect);
         child.stderr?.on('data', collect);
         child.on('error', (error) => { clearTimeout(timer); resolvePromise({ code: 127, output: error.message }); });
-        child.on('close', (code) => { clearTimeout(timer); resolvePromise({ code, output }); });
+        child.on('close', (code) => { clearTimeout(timer); resolvePromise({ code, output: output.text() }); });
     });
 }
 /**
@@ -976,6 +1027,76 @@ function makeProgressFeeder(tracker) {
         }
     };
 }
+/**
+ * Run the host-supplied package manager in a profile directory.
+ *
+ * Official Desktop publishes this invocation on `profileContext` and uses it
+ * for every managed install. The market's official branch must not send
+ * `dsh plugin --profile desktop`, and must not go through the manager for the
+ * market's own package (#900). This is that remaining door: `pnpm add` (or
+ * whatever argv the caller names) against the bundled Node, with the
+ * invocation's own env. Callers must not add `--config.minimum-release-age=0`
+ * here — that is the #944 lockfile write.
+ */
+export function runHostPnpm(invocation, cwd, args) {
+    if (invocation.command.trim() === '') {
+        return Promise.resolve({
+            exitCode: 127, timedOut: false, stdout: '', stderr: 'host package manager has no command', cancelled: false,
+        });
+    }
+    const tracker = beginProgress(args[args.length - 1] ?? '');
+    const feed = makeProgressFeeder(tracker);
+    return new Promise((resolvePromise) => {
+        const child = spawnShim(invocation.command, [...invocation.args, ...args], {
+            cwd,
+            env: { ...spawnEnv(invocation), ...pnpmConfigEnvForArgs(args) },
+            stdio: ['ignore', 'pipe', 'pipe'],
+            viaShell: winCmdShim && /\.cmd$/i.test(invocation.command),
+            detached: process.platform !== 'win32',
+        });
+        activeChild = child;
+        cancelRequested = false;
+        const stdoutBytes = createOutputBuffer(256 * 1024);
+        const stderrBytes = createOutputBuffer(64 * 1024);
+        let timedOut = false;
+        const timer = setTimeout(() => {
+            timedOut = true;
+            killTree(child);
+        }, INSTALL_TIMEOUT_MS);
+        child.stdout?.on('data', (chunk) => {
+            stdoutBytes.push(chunk);
+            feed(chunk.toString());
+            syncProgress(tracker);
+        });
+        child.stderr?.on('data', (chunk) => {
+            stderrBytes.push(chunk);
+            feed(chunk.toString());
+            syncProgress(tracker);
+        });
+        child.on('error', (error) => {
+            clearTimeout(timer);
+            progress.active = false;
+            progress.cancelling = false;
+            if (activeChild === child)
+                activeChild = null;
+            resolvePromise({ exitCode: 127, timedOut: false, stdout: stdoutBytes.text(), stderr: `${stderrBytes.text()}\n${error.message}`.trim(), cancelled: false });
+        });
+        child.on('close', (code) => {
+            clearTimeout(timer);
+            progress.active = false;
+            progress.cancelling = false;
+            if (activeChild === child)
+                activeChild = null;
+            resolvePromise({
+                exitCode: code,
+                timedOut,
+                stdout: stdoutBytes.text(),
+                stderr: stderrBytes.text(),
+                cancelled: cancelRequested,
+            });
+        });
+    });
+}
 /** Run one `dsh plugin --profile <p> …` command with timeout and progress tracking. */
 export function runDshPlugin(profile, pluginArgs) {
     const { file, args, cwd, viaShell } = dshArgv();
@@ -1007,23 +1128,21 @@ export function runDshPlugin(profile, pluginArgs) {
         });
         activeChild = child;
         cancelRequested = false;
-        let stdout = '';
-        let stderr = '';
+        const stdoutBytes = createOutputBuffer(256 * 1024);
+        const stderrBytes = createOutputBuffer(64 * 1024);
         let timedOut = false;
         const timer = setTimeout(() => {
             timedOut = true;
             killTree(child);
         }, INSTALL_TIMEOUT_MS);
         child.stdout?.on('data', (chunk) => {
-            const text = chunk.toString();
-            stdout = (stdout + text).slice(-256 * 1024);
-            feed(text);
+            stdoutBytes.push(chunk);
+            feed(chunk.toString());
             syncProgress(tracker);
         });
         child.stderr?.on('data', (chunk) => {
-            const text = chunk.toString();
-            stderr = (stderr + text).slice(-64 * 1024);
-            feed(text);
+            stderrBytes.push(chunk);
+            feed(chunk.toString());
             syncProgress(tracker);
         });
         child.on('error', (error) => {
@@ -1032,10 +1151,14 @@ export function runDshPlugin(profile, pluginArgs) {
             progress.cancelling = false;
             if (activeChild === child)
                 activeChild = null;
-            resolvePromise({ exitCode: 127, timedOut: false, stdout, stderr: `${stderr}\n${error.message}`, cancelled: false });
+            resolvePromise({ exitCode: 127, timedOut: false, stdout: stdoutBytes.text(), stderr: `${stderrBytes.text()}\n${error.message}`, cancelled: false });
         });
         child.on('close', (code) => {
             clearTimeout(timer);
+            // A timed-out run was killed hard, so the host's lock release in the
+            // child's `finally` never ran. Clear only OUR child's lock (#914).
+            if (timedOut)
+                clearOwnedProfileLock(profile, child.pid);
             progress.active = false;
             progress.cancelling = false;
             if (activeChild === child)
@@ -1048,8 +1171,8 @@ export function runDshPlugin(profile, pluginArgs) {
             resolvePromise({
                 exitCode: code,
                 timedOut,
-                stdout,
-                stderr,
+                stdout: stdoutBytes.text(),
+                stderr: stderrBytes.text(),
                 cancelled: cancelRequested,
                 ...(pnpmError !== null ? { pnpmError } : {}),
                 ...(pnpmErrorCode !== null ? { pnpmErrorCode } : {}),
@@ -1128,19 +1251,17 @@ export function createDesktopPluginRuntime(service, activeProfileDir, invokingDi
         }
         const tracker = beginProgress(prepared.target);
         const feed = makeProgressFeeder(tracker);
-        let stdout = '';
-        let stderr = '';
+        const stdoutBytes = createOutputBuffer(256 * 1024);
+        const stderrBytes = createOutputBuffer(64 * 1024);
         let timedOut = false;
         const collectStdout = (chunk) => {
-            const text = chunk.toString();
-            stdout = (stdout + text).slice(-256 * 1024);
-            feed(text);
+            stdoutBytes.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+            feed(chunk.toString());
             syncProgress(tracker);
         };
         const collectStderr = (chunk) => {
-            const text = chunk.toString();
-            stderr = (stderr + text).slice(-64 * 1024);
-            feed(text);
+            stderrBytes.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+            feed(chunk.toString());
             syncProgress(tracker);
         };
         handle.stdout.on('data', collectStdout);
@@ -1158,8 +1279,8 @@ export function createDesktopPluginRuntime(service, activeProfileDir, invokingDi
                 return {
                     exitCode: outcome.exitCode,
                     timedOut,
-                    stdout,
-                    stderr,
+                    stdout: stdoutBytes.text(),
+                    stderr: stderrBytes.text(),
                     cancelled: active.userCancelled,
                     ...(ignoredBuilds.length > 0 ? { ignoredBuilds } : {}),
                     ...(pnpmError !== null ? { pnpmError } : {}),
@@ -1170,11 +1291,12 @@ export function createDesktopPluginRuntime(service, activeProfileDir, invokingDi
             catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
                 progress.error = tracker.snapshot.error;
-                const detail = `${stderr}${stderr === '' ? '' : '\n'}${message}`;
+                const stderrText = stderrBytes.text();
+                const detail = `${stderrText}${stderrText === '' ? '' : '\n'}${message}`;
                 return {
                     exitCode: 127,
                     timedOut,
-                    stdout,
+                    stdout: stdoutBytes.text(),
                     stderr: boundaryRefusesTarget ? `${detail}\n${NPM_ONLY_HOST_NOTE}` : detail,
                     cancelled: active.userCancelled,
                     ...(resolvedNpmVersion !== undefined ? { resolvedNpmVersion } : {}),

@@ -3,9 +3,12 @@
  * fresh on every request. See `loadRegistry` for why there is nothing
  * behind it any more.
  */
+import { BODY_STALL_TIMEOUT_MS, HEADERS_TIMEOUT_MS, readBodyWhileProgressing } from './body-progress.js';
+import { logEvent } from './log.js';
 import { configuredProxy, marketFetch } from './net.js';
 import { catalogFromPackage } from './catalog-npm.js';
-import { activeRegion, routesFor } from './regions.js';
+import { activeRegion, catalogSourcesFor, routesFor } from './regions.js';
+import { NPM_NAME_RE } from './sources.js';
 /**
  * Category ids for one catalog entry, de-duplicated in declaration order.
  *
@@ -25,6 +28,36 @@ export function pluginCategories(plugin) {
     return categories;
 }
 /**
+ * Former npm names for one catalog entry, normalized (#1012).
+ *
+ * Catalog JSON is external input, so a malformed declaration is dropped
+ * rather than trusted: only syntactically valid npm names survive, an entry
+ * may not list itself (its own `npm` or `name`), and duplicates collapse in
+ * declaration order. Cross-entry rules — a former name that is still live
+ * elsewhere, or two entries claiming one former name — cannot be judged per
+ * entry; the validator enforces them for the catalog, and
+ * `findCatalogRename` fails closed on ambiguity at runtime.
+ */
+export function pluginPreviousNpm(plugin) {
+    const declared = plugin.previousNpm;
+    const values = Array.isArray(declared) ? declared : declared === undefined || declared === null ? [] : [declared];
+    const own = new Set([plugin.name.toLowerCase()]);
+    if (typeof plugin.npm === 'string' && plugin.npm !== '')
+        own.add(plugin.npm.toLowerCase());
+    const names = [];
+    const seen = new Set();
+    for (const value of values) {
+        if (typeof value !== 'string' || value === '' || !NPM_NAME_RE.test(value))
+            continue;
+        const key = value.toLowerCase();
+        if (own.has(key) || seen.has(key))
+            continue;
+        seen.add(key);
+        names.push(value);
+    }
+    return names;
+}
+/**
  * Where the curated list comes from now lives in the region routing table
  * (src/regions.ts), because it is one of several addresses that move
  * together when a user changes download region.
@@ -40,46 +73,6 @@ export function pluginCategories(plugin) {
  * this process's environment already controls the process. What the override
  * changes is WHICH list is curated, never WHETHER the check runs.
  */
-/**
- * How long to wait for the catalog to START answering.
- *
- * Headers arrive in one burst or not at all, so a fixed budget still fits
- * them. This used to cover the whole fetch, which was fine at 282KB and is
- * wrong now that the catalog runs past a megabyte: on a lossy proxied link
- * the body keeps trickling long after 15s, and a total timer cuts off a
- * download that was still moving and would have finished (measured: killed
- * at 15s on both attempts, 89.9s end-to-end when allowed to run). The body
- * is read under a stall watchdog instead — see readBodyWhileProgressing.
- */
-const HEADERS_TIMEOUT_MS = 15_000;
-/**
- * How long the body may stay SILENT before we give up on it.
- *
- * Deliberately not a total budget. As long as bytes keep arriving, however
- * slowly, the read continues; the watchdog only fires on a download that has
- * actually stopped, which is the one failure a slow link cannot fake.
- */
-const BODY_STALL_TIMEOUT_MS = 15_000;
-/**
- * How long the whole body may take, however much progress it keeps making.
- *
- * The stall watchdog can only act on a pause, so a mirror that sends one
- * byte inside every 15s window would hold the read open forever. 10 minutes
- * is ~7x the slowest measured full download (89.9s); a body still going
- * after that is broken, not slow, and the byte count in the message says
- * which of the two it was.
- */
-const BODY_TOTAL_CEILING_MS = 600_000;
-/**
- * The most body bytes to accept before declaring the response not a catalog.
- *
- * The catalog passed 5 MB in September 2026; 256 MB is ~48x that — years of
- * headroom — and still a hard bound on memory, because the whole body is
- * buffered before parsing and a mirror streaming garbage at line speed
- * would otherwise grow that buffer until the process dies. backup.ts and
- * gist.ts cap their downloads for the same reason.
- */
-const MAX_CATALOG_BODY_BYTES = 256 * 1024 * 1024;
 /**
  * The catalog we were last served, with the validator identifying it.
  *
@@ -114,7 +107,14 @@ function asRegistry(value) {
         const category = pluginCategories(plugin);
         if (category.length === 0)
             throw new Error(`catalog plugin ${String(index)} carries no usable category`);
-        return { ...plugin, category };
+        const previousNpm = pluginPreviousNpm(plugin);
+        // An entry with nothing usable to declare looks exactly like one that
+        // declared nothing, so the field stays absent rather than becoming [].
+        if (previousNpm.length === 0) {
+            const { previousNpm: _declared, ...rest } = plugin;
+            return { ...rest, category };
+        }
+        return { ...plugin, category, previousNpm };
     });
     return { ...data, plugins };
 }
@@ -166,8 +166,23 @@ export async function loadRegistry(region = activeRegion()) {
     // the FIRST request the market makes, so a mirror that has gone down must
     // mean a slow market rather than an empty one — the list ends at the
     // address that has always worked.
-    for (const source of routesFor(region).catalog) {
+    //
+    // The list runs one entry past the region's own sources on purpose (#891):
+    // the region probe measures the npm registry, so it cannot see a network
+    // where npm is fast and the catalog's host is blocked — and the region is
+    // decided once and persisted. The catalog's published package, on the
+    // registry the probe just proved reachable, is the repair that needs
+    // neither the probe nor the decision to change.
+    const ownSources = routesFor(region).catalog.length;
+    const catalogSources = catalogSourcesFor(region);
+    for (const [sourceIndex, source] of catalogSources.entries()) {
         const key = sourceKey(source);
+        const servedBy = (data) => {
+            if (sourceIndex >= ownSources) {
+                logEvent('warn', 'registry', `catalog: the ${region} sources did not answer; read the catalog package from ${key} instead (#891)`);
+            }
+            return data;
+        };
         // Two attempts each. A catalog fetch crossing a long, lossy path fails
         // transiently often enough that one retry is worth more than the second
         // or two it costs — and with nothing behind this call any more, a
@@ -183,12 +198,12 @@ export async function loadRegistry(region = activeRegion()) {
                     const { version, data } = await catalogFromPackage(source.registry, source.pkg, reusable?.version ?? undefined);
                     // `data === null` means the published version is the one in hand.
                     if (data === null && reusable !== null)
-                        return reusable.data;
+                        return servedBy(reusable.data);
                     if (data === null)
                         throw new Error('the catalog package reported no change with nothing to reuse');
                     const parsed = asRegistry(data);
                     served = { key, etag: null, modified: null, version, data: parsed };
-                    return parsed;
+                    return servedBy(parsed);
                 }
                 // ETag first: it is exact, while a date has one-second resolution and
                 // a catalog republished twice within the same second would validate
@@ -221,7 +236,7 @@ export async function loadRegistry(region = activeRegion()) {
                     // otherwise surface as a confusing parse error on an empty body.
                     if (reusable === null)
                         throw new Error('the catalog answered "not modified" with nothing to revalidate');
-                    return reusable.data;
+                    return servedBy(reusable.data);
                 }
                 if (!res.ok)
                     throw new Error(`HTTP ${String(res.status)}`);
@@ -229,7 +244,7 @@ export async function loadRegistry(region = activeRegion()) {
                 served = {
                     key, etag: res.headers.get('etag'), modified: res.headers.get('last-modified'), version: null, data,
                 };
-                return data;
+                return servedBy(data);
             }
             catch (error) {
                 last = error;
@@ -238,6 +253,15 @@ export async function loadRegistry(region = activeRegion()) {
                     reason: error instanceof Error ? error.message : String(error),
                 });
             }
+        }
+        // Every source here is a fallback for the one before it, so this failure
+        // may never reach the screen: the market reads the catalog from the next
+        // source and looks fine, while a mirror this person configured and cannot
+        // see failing stays broken (#1117). One line per source per load — the
+        // full list is still in the thrown message when everything fails.
+        const ownFailure = failures.findLast(failure => failure.source === key);
+        if (ownFailure !== undefined && sourceIndex + 1 < catalogSources.length) {
+            logEvent('warn', 'registry', `catalog: ${key} failed, reading from a later source — ${ownFailure.reason.slice(0, 200)}`);
         }
     }
     throw new Error(describeFetchFailure(last, Date.now() - started, attempts, failures));
@@ -269,94 +293,4 @@ export function describeFetchFailure(error, elapsedMs, attempts = 2, failures = 
         parts.push(`earlier: ${earlier.map(entry => `${entry.source} — ${entry.reason.slice(0, 160)}`).join(' · ')}`);
     }
     return parts.join(' · ');
-}
-/**
- * Read a catalog body under a stall watchdog instead of a total budget.
- *
- * One timer for the whole fetch was the mistake both before and after #188:
- * at 4s it hid slowness behind a stale snapshot, at 15s it kills downloads
- * that are still moving. On a lossy proxied link the catalog body trickles
- * for far longer than 15s while never once going silent — measured 89.9s
- * end-to-end for a body the 15s cutoff had declared dead twice. This reader
- * lets a moving body run as long as it keeps moving, in either direction's
- * sense of "slow", and ends one that goes quiet for `stallMs` with a message
- * that says what actually happened and how much had arrived.
- *
- * The rejection comes from here, not from an abort: undici's abort message
- * ("This operation was aborted") cannot tell a user anything actionable, and
- * a bug report containing this string will contain the byte count too.
- *
- * Two backstops keep "still moving" from meaning "forever", because the
- * watchdog can only see pauses: a total ceiling for a body that trickles
- * without ever pausing, and a size cap for one that outruns any catalog.
- */
-function readBodyWhileProgressing(res, stallMs) {
-    // The stand-in closes at once, so an absent body reads as "no body"
-    // below instead of parking this reader on a stream that never ends.
-    const reader = (res.body ?? new ReadableStream({ start(controller) { controller.close(); } })).getReader();
-    return new Promise((resolve, reject) => {
-        const chunks = [];
-        let received = 0;
-        let settled = false;
-        let timer;
-        const finish = (error) => {
-            if (settled)
-                return;
-            settled = true;
-            if (timer !== undefined)
-                clearTimeout(timer);
-            clearTimeout(ceiling);
-            // Tell the origin we are done with the socket; its refusal is not ours to report.
-            reader.cancel().catch(() => { });
-            if (error !== undefined)
-                reject(error);
-            // An empty body otherwise surfaces as a JSON parse error, which tells
-            // the user nothing about the network that caused it.
-            else if (received === 0)
-                reject(new Error('the catalog response carried no body'));
-            else
-                resolve(concatBytes(chunks));
-        };
-        const ceiling = setTimeout(() => {
-            finish(new DOMException(`the catalog download did not finish within ${String(Math.round(BODY_TOTAL_CEILING_MS / 1000))}s (received ${String(received)} bytes)`, 'TimeoutError'));
-        }, BODY_TOTAL_CEILING_MS);
-        const arm = () => {
-            if (timer !== undefined)
-                clearTimeout(timer);
-            timer = setTimeout(() => {
-                finish(new DOMException(`no new data for ${String(Math.round(stallMs / 1000))}s while downloading the catalog (received ${String(received)} bytes)`, 'TimeoutError'));
-            }, stallMs);
-        };
-        const step = () => {
-            reader.read().then((r) => {
-                if (settled)
-                    return;
-                if (r.done || r.value === undefined) {
-                    finish();
-                    return;
-                }
-                chunks.push(r.value);
-                received += r.value.byteLength;
-                if (received > MAX_CATALOG_BODY_BYTES) {
-                    finish(new Error(`the catalog response grew past ${String(MAX_CATALOG_BODY_BYTES / 1024 / 1024)} MB without ending (received ${String(received)} bytes)`));
-                    return;
-                }
-                arm();
-                step();
-            }, (error) => {
-                finish(error instanceof Error ? error : new Error(String(error)));
-            });
-        };
-        arm();
-        step();
-    });
-}
-function concatBytes(chunks) {
-    const all = new Uint8Array(chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0));
-    let at = 0;
-    for (const chunk of chunks) {
-        all.set(chunk, at);
-        at += chunk.byteLength;
-    }
-    return all;
 }

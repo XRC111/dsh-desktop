@@ -4,10 +4,13 @@
  * functions of the directory contents; no processes, no network.
  */
 import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { JSON_SCHEMA, load } from 'js-yaml';
+import { findDshInstallDir } from './dsh-install.js';
 import { resolveDshHome } from './home-paths.js';
-import { githubRemoteIdentities, githubRepoIdentities, isGitHostedSpec, repoOfTarget } from './sources.js';
+import { githubRemoteIdentities, githubRepoIdentities, hostedRepoKey, isGenerationLink, isGitHostedSpec, repoOfTarget } from './sources.js';
 /**
  * Whether a profile name follows DSH's own directory-name contract.
  *
@@ -65,6 +68,50 @@ export function readInstalled(profile, explicitDir) {
     }
 }
 /**
+ * Packages this profile's desktop host manages as generations (#874).
+ *
+ * DSH Desktop materialises such a plugin under
+ * `profiles/.generations/live/<name>+<version>+<hash>` and points the profile
+ * at it with a `link:` in `pnpm.overrides`, while `dependencies` keeps the
+ * plain version. Before IT runs pnpm, the host's own installer suspends that
+ * projection — the names leave `dependencies` / `overrides` for the duration
+ * of the run — and the profile's pnpm-lock.yaml therefore NEVER records them.
+ * That is by design, so a lockfile with no entry for the package is not
+ * evidence about its exact source, and reading it as if it were turned a
+ * completed rollback into "automatic rollback is unavailable" with advice the
+ * user cannot carry out (#874).
+ *
+ * Two declarations are accepted because either can stand alone: the
+ * generation link itself (in `dependencies` or in `pnpm.overrides`), and the
+ * host's own projection list (`dsh.desktop.generationProjection.plugins`).
+ */
+export function generationManagedNames(profile, explicitDir) {
+    const names = new Set();
+    const collect = (specs) => {
+        for (const [name, spec] of Object.entries(specs ?? {})) {
+            if (typeof spec === 'string' && isGenerationLink(spec))
+                names.add(name);
+        }
+    };
+    try {
+        const manifest = JSON.parse(readFileSync(join(profileDir(profile, explicitDir), 'package.json'), 'utf8'));
+        collect(manifest.dependencies);
+        collect(manifest.peerDependencies);
+        collect(manifest.pnpm?.overrides);
+        const plugins = manifest.dsh?.desktop?.generationProjection?.plugins;
+        if (Array.isArray(plugins)) {
+            for (const entry of plugins)
+                if (typeof entry === 'string')
+                    names.add(entry);
+        }
+    }
+    catch {
+        // No readable manifest is no generation state: callers use this only to
+        // widen what a lockfile may prove, never to narrow it.
+    }
+    return names;
+}
+/**
  * RAW dependency map of the profile manifest — including the in-box bundles
  * readInstalled() filters out. This is the rollback snapshot (#65): restoring
  * a filtered view would delete @deepseek-ai/dsh-base and friends.
@@ -80,12 +127,16 @@ export function readManifestDeps(profile, explicitDir) {
 }
 /**
  * For each installed package, the OTHER installed package that declares it —
- * as a dependency or a peer dependency — in its own manifest.
+ * as a dependency, an optional dependency, or a peer dependency — in its own
+ * manifest.
  *
  * pnpm's auto-install-peers writes a plugin's peers into the profile manifest
  * as direct dependencies, so a native binding a plugin needs shows up in the
  * installed list looking exactly like a plugin the user chose (#634). What
- * separates them is that somebody else asked for it.
+ * separates them is that somebody else asked for it. Optional dependencies
+ * count for the same reason (#941): a platform-specific binary a plugin lists
+ * under `optionalDependencies` is payload, not a plugin the user chose, even
+ * when pnpm installed that package and the card rendered.
  *
  * Ownership is decided by the first owner in sorted order, so the answer does
  * not depend on the manifest's key order. A package that declares itself is
@@ -94,12 +145,18 @@ export function readManifestDeps(profile, explicitDir) {
 export function readDependencyOwners(profile, names, explicitDir) {
     const installed = new Set(names);
     const owners = {};
-    for (const owner of [...names].sort()) {
+    // Who may be an OWNER is not the same question as who gets a card (#892).
+    // pnpm hoists a transitive dependency's directory to `node_modules/<name>`
+    // as well, so `ws` — a dependency of a plugin, never a profile dependency —
+    // is where `bufferutil` and `utf-8-validate` are declared. Scanning only the
+    // profile's own entries could therefore never answer "who asked for these",
+    // and the two native peers stayed on the list as plugins nobody chose.
+    for (const owner of topLevelPackageNames(profile, names, explicitDir)) {
         const manifest = readInstalledManifest(profile, owner, explicitDir);
         if (typeof manifest !== 'object' || manifest === null)
             continue;
         const declared = manifest;
-        for (const field of [declared.dependencies, declared.peerDependencies]) {
+        for (const field of [declared.dependencies, declared.optionalDependencies, declared.peerDependencies]) {
             if (typeof field !== 'object' || field === null)
                 continue;
             for (const dependency of Object.keys(field)) {
@@ -110,6 +167,48 @@ export function readDependencyOwners(profile, names, explicitDir) {
         }
     }
     return owners;
+}
+/**
+ * Every package that could be an owner, sorted: the profile's own entries
+ * plus every package sitting at the profile's top level.
+ *
+ * The manifest's keys are the floor, not the ceiling — a missing or
+ * unreadable `node_modules` leaves the answer exactly as it was before the
+ * top level was scanned, so this can only ever find MORE owners.
+ *
+ * One manifest read per top-level package, measured at ~30 ms for 300
+ * packages on a warm cache, once per `/installed` request — which already
+ * reads a manifest, a patch file and an entry artifact for every card.
+ */
+function topLevelPackageNames(profile, names, explicitDir) {
+    const found = new Set(names);
+    const root = join(profileDir(profile, explicitDir), 'node_modules');
+    let entries = [];
+    try {
+        entries = readdirSync(root, { withFileTypes: true })
+            // A scope directory is named `@scope`, so the leading `@` belongs here;
+            // the package's own namespace is added below.
+            .filter(dirent => dirent.isDirectory() && /^@?[A-Za-z0-9._~-]+$/.test(dirent.name))
+            .map(dirent => dirent.name);
+    }
+    catch {
+        return [...found].sort();
+    }
+    for (const entry of entries) {
+        if (!entry.startsWith('@')) {
+            found.add(entry);
+            continue;
+        }
+        // A scope directory holds the packages themselves.
+        try {
+            for (const inner of readdirSync(join(root, entry), { withFileTypes: true })) {
+                if (inner.isDirectory() && /^[A-Za-z0-9._~-]+$/.test(inner.name))
+                    found.add(`${entry}/${inner.name}`);
+            }
+        }
+        catch { /* unreadable scope — its packages simply cannot own anything */ }
+    }
+    return [...found].sort();
 }
 function objectRecord(value) {
     return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -132,6 +231,35 @@ export function readProfileManifestSnapshot(profile, explicitDir) {
     catch {
         return { dependencies: {}, profileBundles: { present: false } };
     }
+}
+/**
+ * Packages a package operation took out of `dsh.profile.bundles` while they are
+ * STILL declared in `dependencies` (#720).
+ *
+ * That combination is the quiet one. A package that is gone from both was
+ * uninstalled; a package in both is composed. A package that is still installed
+ * but no longer in the bundle list stays on disk, stays declared, and simply
+ * stops loading — the only trace is a boot warning about a dangling patch row
+ * (`patch: entry "better-sidebar" not found`), often days later.
+ *
+ * Pure and read-only on purpose. It does not put anything back: the bundle list
+ * is also how the official plugin page switches a package off (#696), so
+ * restoring "what was there before" would undo a deliberate removal. It only
+ * names what changed, so the next occurrence arrives with evidence — which
+ * operation, which package — instead of a user noticing the symptom later.
+ *
+ * Packages the operation itself touched (`except`) are excluded: removing one
+ * from the list is part of what that operation does.
+ */
+export function bundlesDroppedFromProfile(before, profile, explicitDir, except = new Set()) {
+    if (!before.profileBundles.present)
+        return [];
+    const now = readProfileManifestSnapshot(profile, explicitDir);
+    const stillListed = new Set(now.profileBundles.present ? bundleNames(now.profileBundles.value) : []);
+    return bundleNames(before.profileBundles.value).filter(name => !stillListed.has(name)
+        && !except.has(name)
+        && !INBOX_BUNDLES.has(name)
+        && now.dependencies[name] !== undefined);
 }
 /** String package names carried by one valid bundle-list value. */
 function bundleNames(value) {
@@ -212,6 +340,41 @@ export function restoreProfileManifest(profile, snapshot, explicitDir) {
     }
     writeManifestAtomic(file, manifest);
     return [...touched];
+}
+/**
+ * Declare one dependency at an exact value, leaving every other manifest field
+ * alone.
+ *
+ * Needed for the duration of a package operation that has to be identifiable
+ * afterwards. DSH's desktop plugin manager names the package a run installed by
+ * diffing the manifest before and after pnpm; an operation whose specifier is
+ * byte-identical before and after leaves that diff empty, and its fallback only
+ * recognises a `name@…` spec — so a floating git re-resolve, which is sent as
+ * the bare remote URL, matches neither and fails as `ambiguous-install` after
+ * pnpm has already re-resolved and built the new commit.
+ *
+ * Declaring the package at the commit already on disk gives the diff exactly
+ * one entry, and pnpm writes the floating specifier back as it re-resolves, so
+ * the durable declaration is unchanged.
+ *
+ * The write is atomic, because it runs immediately before a package operation
+ * that may itself fail.
+ * @returns true when the declaration was written.
+ */
+export function declareProfileDependency(profile, name, value, explicitDir) {
+    const file = join(profileDir(profile, explicitDir), 'package.json');
+    let manifest;
+    try {
+        manifest = JSON.parse(readFileSync(file, 'utf8'));
+    }
+    catch {
+        return false;
+    }
+    if (manifest.dependencies?.[name] === value)
+        return false;
+    manifest.dependencies = { ...manifest.dependencies, [name]: value };
+    writeManifestAtomic(file, manifest);
+    return true;
 }
 /**
  * Remove a package from BOTH manifest lists — dependencies and
@@ -615,9 +778,20 @@ export function readLockCommits(profile, explicitDir) {
  * by pnpm's `path:` selector, so the spec's subpath has to match too — and
  * when the spec names no subpath while several entries of that remote do,
  * there is no answer rather than the first sibling's commit (#632).
+ *
+ * The key on both sides of the comparison is `hostedRepoKey`, the identity
+ * the rest of the market already compares specs by (#851). This function
+ * used to derive its own, and that second spelling lost every install pnpm
+ * writes the shorthand back for: it demanded an `https?://` prefix or a
+ * `.git` suffix, so `github:owner/repo` keyed to nothing at all, and it kept
+ * the `.git` suffix, so the spec side `https://github.com/o/r` could never
+ * equal the lockfile side pnpm writes as `git@github.com:o/r.git`. A floating
+ * shorthand therefore had no commit, and with no commit the update route
+ * refuses to roll back — the market reports "cannot confirm the commit before
+ * the update" for a lockfile that states it plainly.
  */
 export function readGitResolutionCommit(profile, spec, explicitDir) {
-    const want = normalizeGitRepoKey(spec);
+    const want = hostedRepoKey(spec);
     if (want === null)
         return null;
     const wantPath = gitSubpathSelector(spec);
@@ -630,7 +804,7 @@ export function readGitResolutionCommit(profile, spec, explicitDir) {
             const repo = /\brepo:\s*([^\s,}]+)/.exec(body);
             if (commit === null || repo === null)
                 continue;
-            if (normalizeGitRepoKey(repo[1]) !== want)
+            if (hostedRepoKey(repo[1]) !== want)
                 continue;
             const entryPath = /\bpath:\s*([^\s,}]+)/.exec(body)?.[1]?.replace(/^\/+|\/+$/g, '').toLowerCase() ?? null;
             if (wantPath !== null) {
@@ -656,23 +830,6 @@ function gitSubpathSelector(spec) {
         return null;
     const trimmed = selector.replace(/^\/+|\/+$/g, '').toLowerCase();
     return trimmed === '' ? null : trimmed;
-}
-/** Lowercased transport-agnostic key for comparing two git remote spellings. */
-function normalizeGitRepoKey(spec) {
-    let remote = spec.trim().replace(/^git\+/i, '');
-    const scp = /^git@([^:]+):(.+)$/.exec(remote);
-    if (scp !== null)
-        remote = `https://${scp[1]}/${scp[2].replace(/^\/*/, '')}`;
-    const hash = remote.indexOf('#');
-    if (hash !== -1)
-        remote = remote.slice(0, hash);
-    const query = remote.indexOf('?');
-    if (query !== -1)
-        remote = remote.slice(0, query);
-    remote = remote.replace(/\/+$/, '').toLowerCase();
-    if (!/^https?:\/\//.test(remote) && !remote.includes('.git'))
-        return null;
-    return remote;
 }
 /** True when the installed package's manifest declares a dsh plugin surface. */
 export function hasDshManifest(dir) {
@@ -751,11 +908,95 @@ export function bundlePatchInsertedIds(dir) {
     return readBundlePatchRows(dir).insertedIds;
 }
 /**
- * `name:` and `id:` rows of the package's declared bundle patch. Line-wise
- * on purpose: the strict hot-mount parser rejects config/expression rows,
- * but for "what does this bundle bring in" any row counts. `insertedIds` is
- * the subset nested under an `insert:` key (#147).
+ * Row ids a package's OWN patch layer ships switched OFF — its opt-in rows.
+ *
+ * A bundle may ship rows `disabled: true` on purpose, and say so in a comment
+ * right there: dsh-mnemon's four `mnemon-strategy-*` rows are "opt-in" and
+ * "stay off until selected". A user patch layer repeating that same
+ * `disabled: true` therefore changes nothing about the package — but counting
+ * it as "the user turned this off" put 「已停用 / 重启后保持关闭」 on a card
+ * whose plugin was demonstrably running (#876). Layer order is the whole
+ * reason: the bundle's own default is the floor, and the market has to ask
+ * what the user did ABOVE it.
+ *
+ * Reads both patch sources like the other readers here — the declared
+ * `dsh.bundle.patch` (one file, or an ordered LIST, #792) and the
+ * conventional root cordis.patch.yml a package may ship instead.
  */
+export function bundleOptOutRowIds(dir) {
+    return declaredPatchRowIds(dir, 'disabledIds');
+}
+/**
+ * Row ids a package's own patch sources decide with an EXPRESSION rather
+ * than a literal — `disabled: !!js …` (#1043). The bundle's default for
+ * these rows is whatever the condition evaluates to on the host that
+ * composes the profile, so no literal the market writes above the bundle
+ * layer can stand in for the user: force-writing `disabled: false` switches
+ * on a row the environment keeps off (a TUI row on a Desktop without the TUI
+ * services), which then holds the package pending at activation and fails
+ * the next install's check.
+ *
+ * Reads the same two patch sources as `bundleOptOutRowIds` above.
+ */
+export function bundleExpressionRowIds(dir) {
+    return declaredPatchRowIds(dir, 'expressionIds');
+}
+/**
+ * Row ids a package's own patch sources declare for one role — the loop the
+ * two readers above and below share.
+ *
+ * They read the same two sources: every declared `dsh.bundle.patch` (one file,
+ * or an ordered list of them, #792) and the conventional root
+ * `cordis.patch.yml` a package may ship instead. Keeping that loop in one place
+ * is the point — `bundlePatchInsertedIds` above is declared-files-only, and a
+ * copy of this scan that forgot the root file is exactly how the two sides of
+ * one question drift apart.
+ *
+ * A source that cannot be read contributes nothing rather than throwing: this
+ * answers "what does the package say it ships", and a file that is not there
+ * says nothing. That is the tolerant half of the family by design — the strict
+ * one (`readBundlePatchRows`) refuses the whole declaration, because the host
+ * loads none of a patch it cannot read completely.
+ */
+function declaredPatchRowIds(dir, role) {
+    const ids = new Set();
+    const read = (file) => {
+        try {
+            for (const id of parsePatchRows(readFileSync(file, 'utf8'))[role])
+                ids.add(id);
+        }
+        catch { /* no such patch — nothing declared through it */ }
+    };
+    for (const file of declaredBundlePatchFiles(dir))
+        read(file);
+    read(join(dir, 'cordis.patch.yml'));
+    return [...ids];
+}
+/**
+ * Row ids the installed copy of a package DECLARES it inserts (#1012).
+ *
+ * The evidence half of `rowIdsForPackage`: the same two patch sources (the
+ * declared `dsh.bundle.patch`, one file or an ordered list, and the
+ * conventional root `cordis.patch.yml`), insert rows only, and — unlike that
+ * reader — no live loader rows.
+ *
+ * Live rows are exactly what this cannot use. A rename transaction asks the
+ * question twice: of the old package just before it is removed (whose rows are
+ * still live, but whose patch files are about to be the only copy left) and of
+ * the new package right after its first install (which has never been booted,
+ * so the loader has never heard of it). Only the package's own declaration can
+ * answer for both.
+ *
+ * That is the same question, and the same parser, as `renamePredecessor` asks
+ * on the install path — an install never boots the package either, so it
+ * compares declarations too and the two refusals agree on what "one plugin"
+ * means (#1012). Where they differ is the root `cordis.patch.yml`: see
+ * `declaredPatchRowIds` for why this reader covers it and that gate's
+ * declared-only reader does not.
+ */
+export function shippedInsertedRowIds(dir) {
+    return declaredPatchRowIds(dir, 'insertedIds');
+}
 /**
  * Rows of one patch file. Exported because a package may ship its patch at
  * the conventional path INSTEAD of declaring `dsh.bundle.patch`, and the
@@ -763,32 +1004,200 @@ export function bundlePatchInsertedIds(dir) {
  * scan drifted from this one and re-introduced #147 on that path (it closed
  * the insert block only on `id:` lines, so `- disable:` followed by nested
  * ids claimed the neighbour's rows).
+ *
+ * Line-wise on purpose: the strict hot-mount parser rejects config/expression
+ * rows, but for "what does this bundle bring in" any row counts. `insertedIds`
+ * is the subset under an `insert:` key (#147) — and "under `insert:`" is not
+ * the same as "deeper than it", because a row's `config:` carries its payload
+ * (#841). `expressionIds` (#1043) is the subset whose `disabled` is decided
+ * by an expression rather than a literal — a row the market must never
+ * answer with a literal of its own, because the host re-evaluates the
+ * condition on every compose and no user-layer value can stand in for it.
  */
 export function parsePatchRows(text) {
     const names = [];
     const ids = [];
     const insertedIds = [];
+    const disabledIds = [];
+    const expressionIds = [];
     {
-        // `insert:` opens a nested list; every id below it, at deeper
-        // indentation, is a row this package brings in. A row at or above the
-        // `insert:` indentation closes the block — those target OTHER plugins.
-        let insertIndent = null;
         // CRLF too, for consistency with the hot-mount parser, which a
         // Windows-authored patch genuinely broke. Here it changes no outcome
         // today — every row pattern below is `^`-anchored and a comment line
         // always starts with `#`, so an unstripped comment matches nothing —
         // and it is deliberately NOT covered by a spec, because a test that
         // passes with or without the change tests nothing.
+        const rows = [];
         for (const raw of text.split(/\r?\n/)) {
             const line = raw.replace(/#.*$/, '');
             if (line.trim() === '')
                 continue;
-            const indent = line.length - line.trimStart().length;
+            rows.push({ line, trimmed: line.trim(), indent: line.length - line.trimStart().length });
+        }
+        // `insert:` opens a nested list; every id below it, at deeper
+        // indentation, is a row this package brings in. A row at or above the
+        // `insert:` indentation closes the block — those target OTHER plugins.
+        let insertIndent = null;
+        // Indent of a `config:` key whose value is payload, not more rows.
+        // Everything deeper than it — and a `- ` at its own column, a sequence
+        // YAML lets sit unindented under its key — is data, and its `id:` keys live in another
+        // namespace (#841): a preset row writes `config.plugins[].id` for the
+        // entries it will instantiate, so two bundles that instantiate the same
+        // official plugins read as two bundles inserting the same entry ids —
+        // and the market uninstalled the newcomer over a clash the host does
+        // not have.
+        let payloadIndent = null;
+        const isDash = (index) => /^-(?:\s|$)/u.test(rows[index].trimmed);
+        /**
+         * Column where a line's key text starts: its indent plus any `- ` marker.
+         * A row's keys share this column whether written on the marker line or
+         * below it, however many spaces follow the `-`.
+         */
+        const keyCol = (index) => {
+            // A bare `-` puts the row's keys on the lines below it.
+            if (rows[index].trimmed === '-') {
+                const next = rows[index + 1];
+                return next !== undefined && next.indent > rows[index].indent ? next.indent : rows[index].indent + 2;
+            }
+            const dash = /^-\s+/u.exec(rows[index].trimmed);
+            return rows[index].indent + (dash === null ? 0 : dash[0].length);
+        };
+        /** Index of the `- ` line that opens the row holding `from`, or -1. */
+        const rowStart = (from) => {
+            const col = keyCol(from);
+            for (let j = from; j >= 0; j--) {
+                if (isDash(j) && keyCol(j) === col)
+                    return j;
+                // Shallower than the row's keys: left the row without finding its marker.
+                if (rows[j].indent < col)
+                    return -1;
+            }
+            return -1;
+        };
+        /**
+         * Whether the insert row holding the `config:` at `from` declares
+         * `group: true`. YAML gives a mapping's keys no order, so this reads the
+         * whole row — its own `- ` marker plus the key lines at the row's key
+         * column — rather than only what happened to be written above.
+         */
+        const rowDeclaresGroup = (from) => {
+            const start = rowStart(from);
+            if (start === -1)
+                return false;
+            const markerIndent = rows[start].indent;
+            const col = keyCol(start);
+            for (let j = start; j < rows.length; j++) {
+                const row = rows[j];
+                if (j > start && row.indent <= markerIndent)
+                    break;
+                // Only the row's own keys: a config body, or a list under another
+                // key, is not at the key column or starts with its own `- `.
+                if (j > start && (row.indent !== col || isDash(j)))
+                    continue;
+                if (/^\s*-?\s*group:\s*['"]?true['"]?\s*$/u.test(row.line))
+                    return true;
+            }
+            return false;
+        };
+        /**
+         * Whether the row holding the `id:` at `from` ALSO declares
+         * `disabled: true` — an opt-in row, off unless the user turns it on.
+         *
+         * Same row span as rowDeclaresGroup, and for the same reason: the marker
+         * line and the row's own keys at the key column, never a nested block.
+         * `disabled` may be written before or after `id` (#876's bundle writes
+         * `id`, then `name`, then `disabled`), so this reads the whole row.
+         */
+        const rowDeclaresDisabled = (from) => {
+            const start = rowStart(from);
+            if (start === -1)
+                return false;
+            const markerIndent = rows[start].indent;
+            const col = keyCol(start);
+            for (let j = start; j < rows.length; j++) {
+                const row = rows[j];
+                if (j > start && row.indent <= markerIndent)
+                    break;
+                if (j > start && (row.indent !== col || isDash(j)))
+                    continue;
+                if (/^\s*-?\s*disabled:\s*true\s*$/u.test(row.line))
+                    return true;
+            }
+            return false;
+        };
+        /**
+         * Whether the row holding the `id:` at `from` declares `disabled` with
+         * a value that is not the literal `true` or `false` — an expression such
+         * as `disabled: !!js …`, or anything else the market cannot read (#1043).
+         * The bundle's own default for such a row is decided by the host at
+         * compose time, so a literal written above it never speaks for the user:
+         * force-enabling it switches on a row the environment keeps off. A row
+         * with NO `disabled` key is not decided at all and stays out — its
+         * default is plain "on".
+         *
+         * Same row span as `rowDeclaresDisabled`, and for the same reason: the
+         * marker line and the row's own keys at the key column, never a nested
+         * block.
+         */
+        const rowDeclaresExpressionDisabled = (from) => {
+            const start = rowStart(from);
+            if (start === -1)
+                return false;
+            const markerIndent = rows[start].indent;
+            const col = keyCol(start);
+            for (let j = start; j < rows.length; j++) {
+                const row = rows[j];
+                if (j > start && row.indent <= markerIndent)
+                    break;
+                if (j > start && (row.indent !== col || isDash(j)))
+                    continue;
+                const value = /^\s*-?\s*disabled:\s*(.*)$/u.exec(row.line);
+                if (value !== null && !/^(?:true|false)\s*$/u.test(value[1]))
+                    return true;
+            }
+            return false;
+        };
+        /**
+         * Whether the key at `keyIndent` holds a block sequence. YAML lets that
+         * sequence sit at the key's own column (`config:` then `- id:` without
+         * further indent), so a `- ` there is the value, not a sibling.
+         */
+        const valueIsList = (from, keyIndent) => {
+            const next = from + 1;
+            if (next >= rows.length || rows[next].indent < keyIndent)
+                return false;
+            return isDash(next);
+        };
+        for (let i = 0; i < rows.length; i++) {
+            const { line, trimmed, indent } = rows[i];
+            // A `- ` at the payload key's own column is still that key's value.
+            if (payloadIndent !== null && indent <= payloadIndent && !(indent === payloadIndent && isDash(i))) {
+                payloadIndent = null;
+            }
             if (insertIndent !== null && indent <= insertIndent && !/^\s*-?\s*(id|name|config):/u.test(line)) {
                 insertIndent = null;
             }
             if (/^\s*-?\s*insert:\s*$/u.test(line)) {
                 insertIndent = indent;
+                payloadIndent = null;
+                continue;
+            }
+            // Exactly one block under a row carries loader rows: the `config:` of a
+            // `group: true` row whose config is a LIST, because its children are
+            // entries. That is the rule userPatchPackageReferences has always
+            // applied to this same shape — a plain plugin may use a list of
+            // `{ name: … }` as ordinary options, and those must stay payload. Any
+            // other block-valued key (`config:`, `tags:`, …) holds data too, so the
+            // block is skipped rather than counted.
+            // Inside a payload, a nested key is more payload: it must not move the
+            // payload's edge, or the payload ends early and its ids count.
+            const blockKey = /^\s*-?\s*([A-Za-z_][\w.-]*):\s*$/u.exec(line);
+            if (payloadIndent === null && insertIndent !== null && indent > insertIndent && blockKey !== null) {
+                // The key's own column, not the line's: when the key sits on a `- `
+                // line, the row's later keys share its column and are not payload.
+                const col = keyCol(i);
+                if (!(blockKey[1] === 'config' && rowDeclaresGroup(i) && valueIsList(i, col)))
+                    payloadIndent = col;
                 continue;
             }
             const name = /^\s*-?\s*name:\s*['"]?([^'"\s]+)/.exec(line);
@@ -798,10 +1207,19 @@ export function parsePatchRows(text) {
             if (id !== null) {
                 if (!ids.includes(id[1]))
                     ids.push(id[1]);
+                // A row that ships switched off is not evidence of anything the USER
+                // decided (#876) — see bundleOptOutRowIds. Payload ids (#841) are not
+                // rows and never land here.
+                if (payloadIndent === null && rowDeclaresDisabled(i) && !disabledIds.includes(id[1]))
+                    disabledIds.push(id[1]);
+                // An expression-decided row is the third shape: neither opt-in nor
+                // plain, and the market must not write over it (#1043).
+                if (payloadIndent === null && rowDeclaresExpressionDisabled(i) && !expressionIds.includes(id[1]))
+                    expressionIds.push(id[1]);
                 // A top-level `- id:` row closes any open insert block: it is a
                 // sibling of `- insert:`, not a member of it.
                 if (insertIndent !== null && indent > insertIndent) {
-                    if (!insertedIds.includes(id[1]))
+                    if (payloadIndent === null && !insertedIds.includes(id[1]))
                         insertedIds.push(id[1]);
                 }
                 else if (indent <= (insertIndent ?? -1)) {
@@ -810,44 +1228,62 @@ export function parsePatchRows(text) {
             }
         }
     }
-    return { names, ids, insertedIds };
+    return { names, ids, insertedIds, disabledIds, expressionIds };
 }
-/** Rows of the patch a package DECLARES through `dsh.bundle.patch`. */
 /**
- * Where a package's bundle patch lives, according to the package itself.
+ * Where a package's bundle patches live, according to the package itself.
  *
  * `dsh.bundle.patch` is the package's own declaration and the only place the
- * answer is written down: the path may be a subdirectory (`aegis` declares
- * `./extensions/dsh/cordis.patch.yml`), not just the package root. Callers
- * that assumed the root file made a plugin with a declared patch look like
- * one with none (#646) — so the resolution rule lives here, once.
+ * answer is written down. The host accepts a string (one file) or an ordered
+ * array of files — official dsh-web-app ships five — and composes them in
+ * order (`bundlePatchFiles` in dsh-app-boot). The market's read side hands
+ * down no verdict, so an array contributes its string items in order and an
+ * unreadable manifest or a declaration that is neither string nor array
+ * answers none instead of throwing (#792) — the same tolerance check.ts's
+ * `declaredList` applies to the boot check (#676). The path may name a
+ * subdirectory (`aegis` declares `./extensions/dsh/cordis.patch.yml`), not
+ * just the package root — callers that assumed the root file made a plugin
+ * with a declared patch look like one with none (#646) — so the resolution
+ * rule lives here, once.
  *
  * @param dir - the installed package directory.
- * @returns the declared patch file's path, or null when the manifest names
- *   none (or the manifest cannot be read).
+ * @returns the declared patch files' paths in declaration order, empty when
+ *   the manifest names none (or cannot be read).
  */
-export function declaredBundlePatchFile(dir) {
+export function declaredBundlePatchFiles(dir) {
     try {
         const manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'));
         const declared = manifest.dsh?.bundle?.patch;
-        if (typeof declared !== 'string' || declared === '')
-            return null;
-        return join(dir, declared);
+        let files = [];
+        if (typeof declared === 'string') {
+            files = declared === '' ? [] : [declared];
+        }
+        else if (Array.isArray(declared)) {
+            files = declared.filter((file) => typeof file === 'string');
+        }
+        return files.map(file => join(dir, file));
     }
     catch {
-        return null;
+        return [];
     }
 }
 function readBundlePatchRows(dir) {
-    const empty = { names: [], ids: [], insertedIds: [] };
-    const file = declaredBundlePatchFile(dir);
-    if (file === null)
-        return empty;
     try {
-        return parsePatchRows(readFileSync(file, 'utf8'));
+        const rows = { names: [], ids: [], insertedIds: [] };
+        for (const file of declaredBundlePatchFiles(dir)) {
+            const parsed = parsePatchRows(readFileSync(file, 'utf8'));
+            rows.names.push(...parsed.names);
+            rows.ids.push(...parsed.ids);
+            rows.insertedIds.push(...parsed.insertedIds);
+        }
+        return rows;
     }
     catch {
-        return empty;
+        // All or nothing: one unreadable file voids the whole declaration. The
+        // host's loadOverlayPatches throws on a missing overlay file and
+        // loadProfileDirectory then skips the ENTIRE bundle — a partially
+        // applied list would judge a package the host never loads.
+        return { names: [], ids: [], insertedIds: [] };
     }
 }
 /** The profile manifest's `dsh.profile.bundles` — what the CLI reconciled. */
@@ -966,7 +1402,7 @@ export function conflictingEntryIds(profileDirectory, candidate, installedBundle
  * @param profileDirectory - resolved profile directory (host-authoritative under Desktop).
  * @param name - installed package name.
  */
-export function hasLoadableEntry(profileDirectory, name) {
+export function hasLoadableEntry(profileDirectory, name, hostDirectory) {
     const dir = join(profileDirectory, 'node_modules', name);
     if (entryArtifactExists(dir))
         return true;
@@ -980,11 +1416,75 @@ export function hasLoadableEntry(profileDirectory, name) {
     // exiting 0 was immediately followed by the market removing what it had
     // just, correctly, installed.
     const workspaceRoot = dirname(profileDirectory);
-    return bundlePatchTargets(dir)
-        .filter(target => target !== name)
-        .some(target => entryArtifactExists(join(profileDirectory, 'node_modules', target))
+    const targets = bundlePatchTargets(dir).filter(target => target !== name);
+    // #1091: a pure patch carrier may mount its OWN subpaths rather than other
+    // packages — `@wufeng0105/dsh-enhance/auto-approve/index.js`, `./ui/index.js`.
+    // Every probe below treats a target as a package directory, so those became
+    // `<dir>/auto-approve/index.js/package.json` and could never resolve: pnpm
+    // installed a carrier that shipped complete, and validateAddedPlugins
+    // reported it broken and removed it right afterwards. A target that lives
+    // inside this package names a file, and that is all this check needs to see.
+    if (targets.some(target => selfTargetExists(dir, name, target)))
+        return true;
+    if (targets.some(target => entryArtifactExists(join(profileDirectory, 'node_modules', target))
         || entryArtifactExists(join(dir, 'node_modules', target))
-        || entryArtifactExists(join(workspaceRoot, 'node_modules', target)));
+        || entryArtifactExists(join(workspaceRoot, 'node_modules', target))))
+        return true;
+    // #906: the host's OWN packages live in its install tree, not in any
+    // profile node_modules — `<install>/dsh/node_modules/...`, often inside
+    // app.asar. A carrier whose patch mounts nothing but in-box packages
+    // (@deepseek-ai/dsh-mcp-client and the like) therefore failed every root
+    // above, was reported "broken", and — through validateAddedPlugins — was
+    // uninstalled right after a successful install. `undefined` resolves the
+    // install dir lazily (only carriers pay for it); `null` means "do not look".
+    //
+    // Inside app.asar the probe is blind for EVERY @deepseek-ai/ name (the
+    // same measurement behind #676), so there identity decides instead of the
+    // filesystem — the host publishes that scope, and our own composer loads
+    // those packages from the archive at boot.
+    const host = hostDirectory === undefined ? findDshInstallDir() : hostDirectory;
+    if (host === null || targets.length === 0)
+        return false;
+    const packaged = /[/\\]app\.asar[/\\]/iu.test(host);
+    return targets.some(target => packaged && target.startsWith('@deepseek-ai/')
+        || packageResolvableFrom(join(host, 'package.json'), target));
+}
+/**
+ * Whether a patch target names a file INSIDE the carrier itself (#1091).
+ *
+ * Two spellings are in use: the package's own name as a prefix
+ * (`@scope/enhance/auto-approve/index.js`) and a relative path
+ * (`./ui/index.js`). A relative path that climbs out of the package is
+ * refused rather than followed — the point is a file this package ships.
+ */
+function selfTargetExists(dir, name, target) {
+    const relative = target.startsWith(`${name}/`)
+        ? target.slice(name.length + 1)
+        : target.startsWith('./') ? target.slice(2) : null;
+    if (relative === null || relative === '')
+        return false;
+    if (relative.split('/').includes('..'))
+        return false;
+    try {
+        return statSync(join(dir, relative)).isFile();
+    }
+    catch {
+        // Missing or unreadable: this target says nothing, and the package-dir
+        // probes below still get their chance.
+        return false;
+    }
+}
+/** Whether `target` resolves from the host's own dependency tree. */
+function packageResolvableFrom(anchorPackageJson, target) {
+    try {
+        const paths = createRequire(anchorPackageJson).resolve.paths(target) ?? [];
+        return paths.some(searchPath => existsSync(join(searchPath, target, 'package.json')));
+    }
+    catch {
+        // An unreadable anchor says nothing about the target: treat as absent
+        // rather than loadable, so the caller keeps its conservative answer.
+        return false;
+    }
 }
 /** Plugin subdirectories (depth 2) of a collection checkout, as relative paths. */
 export function pluginSubdirs(root) {
@@ -1125,6 +1625,15 @@ export function setAllowBuilds(profile, packages, explicitDir) {
     const SEG = '[A-Za-z0-9_-][A-Za-z0-9_.-]*';
     const NAME = '[A-Za-z0-9@/_.-]+';
     const SHA = '[0-9a-f]{40}';
+    // A dependency pnpm resolved from a BRANCH keys its decision by the ref,
+    // not by a commit: `name@https://codeload.github.com/o/r/tar.gz/refs/heads/main`
+    // (#1034). The ref is path segments only — no `.`/`..`, no empty piece —
+    // so it cannot walk out of the URL it is written into.
+    const REF = `refs/(?:heads|tags)/${SEG}(?:/${SEG})*`;
+    // pnpm's exact monorepo key includes the selected directory; dropping it
+    // makes approve-and-retry write only a bare name that git builds ignore.
+    const DIR = '(?!\\.{1,2}(?:/|$))[A-Za-z0-9_.-]+';
+    const SUBPATH = `path:/${DIR}(?:/${DIR})*`;
     // The stable clone-URL key: github's (#68) and, since #637, every other
     // host's — pnpm keys a git dependency by the remote it would clone, whoever
     // serves it. Optionally pinned to a commit, which is the form pnpm 11.8.0
@@ -1136,16 +1645,16 @@ export function setAllowBuilds(profile, packages, explicitDir) {
     // authorizes under `name@git+…/repo` and NOT under `…/repo.git`, so
     // requiring the suffix dropped a correctly derived key on its way out, and
     // appending it would have written one pnpm never reads.
-    const GIT_KEY_RE = new RegExp(`^${NAME}@git\\+https://[A-Za-z0-9_.-]+(?::\\d{1,5})?/${SEG}(?:/${SEG})*(?:\\.git)?(?:#${SHA})?$`);
+    const GIT_KEY_RE = new RegExp(`^${NAME}@git\\+https://[A-Za-z0-9_.-]+(?::\\d{1,5})?/${SEG}(?:/${SEG})*(?:\\.git)?(?:#${SHA}(?:&${SUBPATH})?|#${SUBPATH})?$`);
     // The commit-pinned download a host serves, which is what pnpm below 11.21
     // matches instead (#285): codeload for github, the project archive for
     // gitlab.com and bitbucket.org (#637). Each branch names its host and its
     // exact path shape.
     const ARCHIVE_KEY_RE = new RegExp(`^${NAME}@https://(?:`
-        + `codeload\\.github\\.com/${SEG}/${SEG}/tar\\.gz/${SHA}`
-        + `|bitbucket\\.org/${SEG}/${SEG}/get/${SHA}\\.tar\\.gz`
-        + `|gitlab\\.com/${SEG}(?:/${SEG})+/-/archive/${SHA}/${SEG}-${SHA}\\.tar\\.gz`
-        + ')$');
+        + `codeload\\.github\\.com/${SEG}/${SEG}/tar\\.gz/(?:${SHA}|${REF})`
+        + `|bitbucket\\.org/${SEG}/${SEG}/get/(?:${SHA}|${REF})\\.tar\\.gz`
+        + `|gitlab\\.com/${SEG}(?:/${SEG})+/-/archive/(?:${SHA}|${REF})/${SEG}-(?:${SHA}|${REF})\\.tar\\.gz`
+        + `)(?:#${SUBPATH})?$`);
     for (const pkg of packages) {
         if (/^[A-Za-z0-9@/_.-]+$/.test(pkg) || GIT_KEY_RE.test(pkg) || ARCHIVE_KEY_RE.test(pkg))
             map[pkg] = 'true';
@@ -1207,19 +1716,115 @@ export function dropUnparseableBuildKeys(profile, explicitDir) {
  * leaves the file alone rather than rewriting a line it misread.
  */
 function splitReleaseAgeExclude(entry) {
-    let text = entry.trim();
-    if (text.length >= 2
-        && (text[0] === "'" && text[text.length - 1] === "'" || text[0] === '"' && text[text.length - 1] === '"')) {
-        text = text.slice(1, -1);
-    }
+    // The caller decodes the complete YAML scalar first. Stripping quotes or
+    // whitespace here would reinterpret malformed input as a different rule.
+    const text = entry;
     const at = text.indexOf('@', text.startsWith('@') ? 1 : 0);
     if (at === -1)
-        return text === '' ? null : { name: text, selector: null };
+        return isPackageName(text) ? { name: text, selector: null } : null;
     const name = text.slice(0, at);
-    const selector = text.slice(at + 1).trim();
-    if (name === '' || selector === '')
+    const selector = text.slice(at + 1);
+    // Only exact versions and their unions can be merged without interpreting
+    // ranges, escapes or a line break inside a version as a wider exemption.
+    const number = '(?:0|[1-9][0-9]*)';
+    const prerelease = `(?:${number}|[0-9]*[A-Za-z-][0-9A-Za-z-]*)`;
+    const version = `${number}\\.${number}\\.${number}(?:-${prerelease}(?:\\.${prerelease})*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?`;
+    if (!isPackageName(name) || !new RegExp(`^${version}(?:[ \\t]*\\|\\|[ \\t]*${version})*$`).test(selector))
         return null;
     return { name, selector };
+}
+/**
+ * Whether a name read out of the file is a package name at all.
+ *
+ * The last line of defence (#820): a misread — a folded entry's unterminated
+ * quote read as a name — used to be re-emitted with the quote doubled, and the
+ * repair then ran once per operation, doubling the file each time until every
+ * pnpm command in the profile failed on it. A name that is not a package name
+ * is unreadable input, and unreadable input leaves the file alone.
+ */
+function isPackageName(name) {
+    return /^(?:@[A-Za-z0-9._~-]+\/)?[A-Za-z0-9._~-]+$/.test(name);
+}
+function readReleaseAgeBlock(file) {
+    let yaml;
+    try {
+        yaml = readFileSync(file, 'utf8');
+    }
+    catch {
+        return null;
+    }
+    // Block form only: `minimumReleaseAgeExclude:` then INDENTED lines — `- <entry>`
+    // entries, comment lines among them, and the continuations of a folded entry.
+    // Two shapes used to end the block early, each truncating the entry cut by it:
+    // a comment line inside the block (#816), and a folded entry — pnpm wrapping a
+    // long `||` union across two lines — whose continuation is indented but does
+    // not start with `-` (#820). The truncated first line is still a legal
+    // single-line match, so nothing downstream noticed: its unterminated quote
+    // read as a package name, and the repair rewrote the line it had misread, once
+    // per run. The boundary now spans every indented line, so those shapes are
+    // seen whole. Blank lines must not truncate a block either: otherwise an
+    // unreadable continuation below one could escape validation before a write.
+    const blockRe = /^minimumReleaseAgeExclude:[ \t]*\r?\n((?:(?:[ \t]+[^\r\n]*|[ \t]*#[^\r\n]*)\r?\n?|\r?\n)*)/m;
+    const block = blockRe.exec(yaml);
+    if (block === null)
+        return null;
+    const eol = /\r\n/.test(yaml) ? '\r\n' : '\n';
+    const indentMatch = /^([ \t]+)-/m.exec(block[1]);
+    const indent = indentMatch === null ? '  ' : indentMatch[1];
+    /**
+     * The block in its original order. Comment lines are kept verbatim; an
+     * entry keeps its trailing ` # …` comment, which YAML only recognises after
+     * whitespace. A `#` anywhere else in an entry is not something this can
+     * read exactly, so the file is left alone.
+     */
+    const items = [];
+    const physical = block[1].split(/\r?\n/);
+    if (physical[physical.length - 1] === '')
+        physical.pop();
+    for (let i = 0; i < physical.length; i++) {
+        const line = physical[i];
+        if (line.trim() === '' || /^[ \t]*#/.test(line)) {
+            items.push({ kind: 'comment', line });
+            continue;
+        }
+        const m = /^([ ]+)-[ ]+(\S.*)$/.exec(line);
+        if (m === null || m[1] !== indent || !/^[A-Za-z0-9._~@'"-]/.test(m[2]))
+            return null;
+        const raw = [line];
+        // Only uninterrupted, more-indented continuation lines are supported.
+        // The YAML parser, rather than a string join, determines folding/escapes.
+        while (i + 1 < physical.length) {
+            const next = physical[i + 1];
+            if (next.trim() === '' || /^[ \t]*#/.test(next))
+                break;
+            const spaces = /^ +/.exec(next)?.[0].length ?? 0;
+            if (spaces <= indent.length)
+                break;
+            raw.push(next);
+            i++;
+        }
+        let value;
+        try {
+            // Keep the pre-existing repair of single-line, unquoted scoped names
+            // (#732). YAML itself forbids a plain scalar starting with `@`.
+            value = m[2].startsWith('@') && raw.length === 1
+                ? m[2].replace(/[ \t]+#.*$/, '').trimEnd()
+                : load(raw.join('\n'), { schema: JSON_SCHEMA });
+            if (Array.isArray(value) && value.length === 1)
+                value = value[0];
+        }
+        catch {
+            return null;
+        }
+        if (typeof value !== 'string')
+            return null;
+        const rule = splitReleaseAgeExclude(value);
+        if (rule === null)
+            return null;
+        const comment = /[ \t]+(#[^\r\n]*)$/.exec(raw[raw.length - 1])?.[1] ?? null;
+        items.push({ kind: 'entry', rule, quoted: /^['"]/.test(m[2]), original: raw.join(eol), comment });
+    }
+    return { file, yaml, blockRe, eol, indent, items };
 }
 /**
  * Make a profile's `minimumReleaseAgeExclude` readable again (#732).
@@ -1260,49 +1865,66 @@ function splitReleaseAgeExclude(entry) {
  *   needed no repair or could not be repaired, in which case it is left
  *   byte-for-byte as it was.
  */
-export function mergeDuplicateReleaseAgeExcludes(profile, explicitDir) {
-    const file = join(profileDir(profile, explicitDir), 'pnpm-workspace.yaml');
-    let yaml;
-    try {
-        yaml = readFileSync(file, 'utf8');
-    }
-    catch {
-        return [];
-    }
-    // Block form only: `minimumReleaseAgeExclude:` then `- <entry>` lines.
-    const blockRe = /^minimumReleaseAgeExclude:[ \t]*\r?\n((?:[ \t]+-[^\r\n]*\r?\n?)*)/m;
-    const block = blockRe.exec(yaml);
+/**
+ * Remove one package's `minimumReleaseAgeExclude` rows (#1093).
+ *
+ * pnpm writes this key itself when it installs a version still inside the
+ * fresh-release wait, and it writes one row for the package plus one per
+ * platform subpackage. Uninstalling took the dependency out of the manifest
+ * and the lockfile but left those rows behind, pinned to versions of a package
+ * the profile no longer has. They are not only noise: they read as live policy
+ * to anyone diagnosing a release-age refusal months later.
+ *
+ * Only rows naming this package are dropped. A platform subpackage
+ * (`@typescript/typescript-darwin-arm64`) is a DIFFERENT package name, and
+ * nothing in the file says which main package it belongs to — guessing would
+ * delete policy that may still be in effect for something installed.
+ *
+ * @returns the entries removed, for the caller to log; empty when there is no
+ *   such block, no such row, or the file cannot be read exactly (in which case
+ *   it is left byte-for-byte as it was).
+ */
+export function dropReleaseAgeExcludes(profile, name, explicitDir) {
+    const block = readReleaseAgeBlock(join(profileDir(profile, explicitDir), 'pnpm-workspace.yaml'));
     if (block === null)
         return [];
-    const eol = /\r\n/.test(yaml) ? '\r\n' : '\n';
-    const indentMatch = /^([ \t]+)-/.exec(block[1]);
-    const indent = indentMatch === null ? '  ' : indentMatch[1];
-    const entries = [];
-    for (const line of block[1].split(/\r?\n/)) {
-        if (line.trim() === '')
-            continue;
-        const m = /^[ \t]+-[ \t]*(.*?)[ \t]*$/.exec(line);
-        // A `#` on the line is a comment this cannot re-emit without losing it.
-        if (m === null || m[1].includes('#'))
-            return [];
-        const rule = splitReleaseAgeExclude(m[1]);
-        if (rule === null)
-            return [];
-        entries.push({ rule, quoted: /^['"]/.test(m[1]), line });
-    }
+    const { file, yaml, blockRe, eol, items } = block;
+    const dropped = [];
+    const lines = items.flatMap(item => {
+        if (item.kind === 'comment')
+            return [item.line];
+        if (item.rule.name !== name)
+            return [item.original];
+        dropped.push(item.rule.selector === null ? item.rule.name : `${item.rule.name}@${item.rule.selector}`);
+        return [];
+    });
+    if (dropped.length === 0)
+        return [];
+    // Nothing left but comments: the key itself goes. `minimumReleaseAgeExclude:`
+    // with no rows is a null value, and pnpm rejects the file rather than
+    // reading it as an empty list.
+    const empty = lines.every(line => line.trim() === '' || /^\s*#/.test(line));
+    const replacement = empty ? '' : `minimumReleaseAgeExclude:${eol}${lines.join(eol)}${eol}`;
+    writeFileSync(file, yaml.replace(blockRe, () => replacement));
+    return dropped;
+}
+export function mergeDuplicateReleaseAgeExcludes(profile, explicitDir) {
+    const block = readReleaseAgeBlock(join(profileDir(profile, explicitDir), 'pnpm-workspace.yaml'));
+    if (block === null)
+        return [];
+    const { file, yaml, blockRe, eol, indent, items } = block;
+    const entries = items.flatMap(item => item.kind === 'entry' ? [item] : []);
     const byName = new Map();
     const order = [];
-    for (const { rule, quoted, line } of entries) {
+    for (const { rule, quoted } of entries) {
         let group = byName.get(rule.name);
         if (group === undefined) {
-            group = { selectors: new Set(), originals: [], lines: [], allVersions: false, quoted: false, count: 0 };
+            group = { selectors: new Set(), allVersions: false, quoted: false, count: 0 };
             byName.set(rule.name, group);
             order.push(rule.name);
         }
         group.count += 1;
         group.quoted = group.quoted || quoted;
-        group.originals.push(rule.selector ?? '');
-        group.lines.push(line);
         if (rule.selector === null)
             group.allVersions = true;
         else
@@ -1318,11 +1940,7 @@ export function mergeDuplicateReleaseAgeExcludes(profile, explicitDir) {
         // Several rules for one name are the #732 breakage — only the first is
         // ever read — so they become one, as the union of the versions the file
         // already lists.
-        const text = group.allVersions
-            ? name
-            : group.count === 1
-                ? `${name}@${group.originals[0] ?? ''}`
-                : `${name}@${[...group.selectors].join(' || ')}`;
+        const text = group.allVersions ? name : `${name}@${[...group.selectors].join(' || ')}`;
         // `@` cannot start a plain scalar in YAML, so a scoped name is written
         // quoted — the way pnpm itself writes one.
         const quoted = group.quoted || text.startsWith('@');
@@ -1332,11 +1950,26 @@ export function mergeDuplicateReleaseAgeExcludes(profile, explicitDir) {
         const group = byName.get(name);
         if (group === undefined)
             return false;
-        return group.count > 1 || group.lines[0] !== produced(name);
+        return group.count > 1 || name.startsWith('@') && !group.quoted;
     });
     if (rewritten.length === 0)
         return [];
-    const lines = order.map(produced);
+    // Each package's one line goes where its FIRST rule was. A later duplicate
+    // is dropped, but a comment it carried stays, as a comment line in its place.
+    const written = new Set();
+    const lines = items.flatMap(item => {
+        if (item.kind === 'comment')
+            return [item.line];
+        // A valid single rule needs no repair, even when its scalar was folded or
+        // used double quotes. Keep it verbatim when repairing another package.
+        if (!rewritten.includes(item.rule.name))
+            return [item.original];
+        const suffix = item.comment === null ? '' : ` ${item.comment}`;
+        if (written.has(item.rule.name))
+            return item.comment === null ? [] : [`${indent}${item.comment}`];
+        written.add(item.rule.name);
+        return [`${produced(item.rule.name)}${suffix}`];
+    });
     const blockText = `minimumReleaseAgeExclude:${eol}${lines.join(eol)}${eol}`;
     // A function replacement: `$&` and friends in a string replacement would
     // be read as capture references.
