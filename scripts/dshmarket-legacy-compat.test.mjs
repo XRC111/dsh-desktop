@@ -25,17 +25,26 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MOD = path.join(ROOT, 'resources/dsh-plugins/dshmarket/lib/legacy-compat.js');
 
-const { crossesLine, bridgeableDeclarations, isBridgeable, exemptionsFor, readExemptions, mergeExemptions, parseExactTarget } =
-    await import(MOD);
-// 直接用上游那套 semver 复核方向 —— 它就是 dsh gate 的镜像。
-const { satisfiesRange } = await import(path.join(ROOT, 'resources/dsh-plugins/dshmarket/lib/check.js'));
+// ⚠️ 必须走 pathToFileURL：动态 import() 只接受 file/data/node 三种 scheme。
+//    在 Windows 上直接 import('D:\\...\\x.js') 会抛
+//    ERR_UNSUPPORTED_ESM_URL_SCHEME（Received protocol 'd:'）——
+//    在 Linux runner 上却一直正常，所以这个坑只在 build-release 的
+//    windows-latest 上才暴露，本地 Linux 跑测试是看不出来的。
+const asUrl = (p) => pathToFileURL(p).href;
 
-const HOST = '0.2.1-rc.4';
+const { crossesLine, bridgeableDeclarations, isBridgeable, exemptionsFor, readExemptions, mergeExemptions, parseExactTarget } =
+    await import(asUrl(MOD));
+// 直接用上游那套 semver 复核方向 —— 它就是 dsh gate 的镜像。
+const { satisfiesRange } = await import(asUrl(path.join(ROOT, 'resources/dsh-plugins/dshmarket/lib/check.js')));
+
+// 当前内嵌运行时版本（跟版时同步这里即可）。判据与具体版本无关，
+// 但用一个真实的宿主版本能让「跨线 / 不跨线」两组断言更有代表性。
+const HOST = '0.2.2-rc.1';
 
 let failed = 0;
 let passed = 0;
