@@ -1,5 +1,5 @@
 diff --git a/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js b/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js
-index 53ed6d4..98cb9d8 100644
+index 9675e5a..b578a45 100644
 --- a/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js
 +++ b/resources/dsh-plugins/dshmarket/lib/discovery-compatibility.js
 @@ -11,7 +11,8 @@
@@ -10,11 +10,19 @@ index 53ed6d4..98cb9d8 100644
 +import { classifyPeer } from './compatibility.js';
 +import { crossesLine } from './legacy-compat.js';
  import { marketFetch } from './net.js';
- import { parseSourceUrl } from './sources.js';
- const CACHE_SCHEMA = 'dsh-market/discovery-compatibility-cache/v1';
-@@ -140,8 +141,34 @@ function declarationResult(declaration, hostVersion) {
+ import { isStableReleaseVersion } from './release-candidates.js';
+ import { activeRegion, githubRoutesFor, rememberGithubRoute, throughProxy } from './regions.js';
+@@ -190,15 +191,36 @@ function rangeResult(hostVersion, declared) {
+  */
+ function declarationResult(declaration, hostVersion) {
      const satisfied = rangeResult(hostVersion, declaration.range);
-     if (declaration.kind === 'engine' || satisfied !== false)
+-    // Only a PEER may be stretched: it is a statement of intent about the host
+-    // line, and the ecosystem is full of sloppy caret ceilings. An engine is a
+-    // plain bound, and a DEPENDENCY is an install instruction — pnpm resolves
+-    // the declared range and hoists the result, so a range that excludes the
+-    // running version means a second copy shadows the host's.
+-    if (declaration.kind !== 'peer' || satisfied !== false)
++    if (declaration.kind === 'engine' || satisfied !== false)
          return satisfied;
 -    if (crossesImplicitCeiling(hostVersion, declaration.range))
 -        return false;
@@ -365,7 +373,7 @@ index 0000000..e0eb548
 +    return { [`${name}@${version}`]: [hostVersion] };
 +}
 diff --git a/resources/dsh-plugins/dshmarket/lib/routes.js b/resources/dsh-plugins/dshmarket/lib/routes.js
-index f853463..15f3fbd 100644
+index 7aca642..c561caa 100644
 --- a/resources/dsh-plugins/dshmarket/lib/routes.js
 +++ b/resources/dsh-plugins/dshmarket/lib/routes.js
 @@ -45,6 +45,7 @@ import { asRegion, githubProxyManaged, normalizeGithubProxy, REGIONS, routesFor,
@@ -376,7 +384,7 @@ index f853463..15f3fbd 100644
  import { checkUpdates, isUpdatablePlugin, compareVersions, fetchNpmLatest, invalidateUpdates, readVersionMaturity, resolveDesktopMatureUpdate, resolveGitRemoteHead, isUpgrade, latestPublishedRecently, setUpdateRegistry, versionOnChannel } from './updates.js';
  import { isStableReleaseVersion } from './release-candidates.js';
  import { createThemeManager } from './themes.js';
-@@ -1362,8 +1363,69 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
+@@ -1417,8 +1418,69 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
              logEvent('warn', 'hot-sweep', `${name}: package removed outside the market — live mount dropped`);
          }
      }

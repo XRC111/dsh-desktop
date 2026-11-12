@@ -52,6 +52,15 @@ function record(value) {
 function text(value) {
     return typeof value === 'string' && value.trim() !== '' ? value.trim() : null;
 }
+/** True when the executor reported a completed change. */
+function landed(result) {
+    const payload = record(result.payload);
+    return result.status >= 200 && result.status < 300 && payload?.ok !== false && payload?.cancelled !== true;
+}
+/** Mark a finished result as having outlived its market instance. */
+function markReloaded(result) {
+    return { ...result, payload: { ...(record(result.payload) ?? {}), marketReloaded: true } };
+}
 /** User-facing failure text, stripped of control characters and home paths. */
 function safeMessage(value) {
     const raw = text(value);
@@ -431,7 +440,13 @@ export class DrainCoordinator {
             if (this.disposeRequested)
                 this.detach();
         }
-        if (this.disposeRequested) {
+        if (this.disposeRequested && !operation.cancelRequested && !this.barrierBroken && landed(result)) {
+            // The executor returned success: the package is on disk. The market being
+            // unloaded afterwards does not make that a cancellation (#1151).
+            result = markReloaded(result);
+            this.finishFromResult(operation, result);
+        }
+        else if (this.disposeRequested) {
             result = {
                 status: 503,
                 payload: {
@@ -455,12 +470,12 @@ export class DrainCoordinator {
                 payload: {
                     ok: false,
                     failureCode: 'AGENT_BARRIER_LOST',
-                    error: 'an Agent could not be held at the maintenance boundary; verify the installed files before retrying',
+                    error: '有会话在操作进行中恢复了活动，文件可能已经改动。先在「已安装」里看看结果，等会话空闲后再试。 / A session became active while the operation ran, so files may have changed. Check Installed for the result, then retry once sessions are idle.',
                 },
             };
             this.finish(operation, 'failed', {
                 code: 'AGENT_BARRIER_LOST',
-                message: 'an Agent could not be held at the maintenance boundary; verify the installed files before retrying',
+                message: '有会话在操作进行中恢复了活动，文件可能已经改动。先在「已安装」里看看结果，等会话空闲后再试。 / A session became active while the operation ran, so files may have changed. Check Installed for the result, then retry once sessions are idle.',
             }, null);
         }
         else {
@@ -479,7 +494,7 @@ export class DrainCoordinator {
                 if (this.barrierBroken) {
                     this.finish(operation, 'failed', {
                         code: 'AGENT_BARRIER_LOST',
-                        message: 'an Agent could not be held at the maintenance boundary; the plugin operation was not started',
+                        message: '有会话恢复了活动，这次没有改任何文件。等会话空闲后再试。 / A session became active; nothing was changed. Retry once sessions are idle.',
                     }, null);
                     return;
                 }
@@ -491,7 +506,7 @@ export class DrainCoordinator {
                     else if (this.barrierBroken) {
                         this.finish(operation, 'failed', {
                             code: 'AGENT_BARRIER_LOST',
-                            message: 'an Agent could not be held at the maintenance boundary; the plugin operation was not started',
+                            message: '有会话恢复了活动，这次没有改任何文件。等会话空闲后再试。 / A session became active; nothing was changed. Retry once sessions are idle.',
                         }, null);
                     }
                     else {
@@ -544,9 +559,13 @@ export class DrainCoordinator {
             operation.startedAt = this.now();
             this.notify(operation);
             const result = await operation.execute(operation.intent, operation.onPhase);
-            // The executor can return success after a cancel or unload landed too
-            // late for its last gate. The Host's state wins: the user asked to stop
-            // or the market is gone, so this is not reported as a completed change.
+            // A cancel wins over a late success: the user asked to stop. An unload
+            // does not: a success result means the package command finished and the
+            // files are on disk, so it is recorded as done (#1151).
+            if (this.disposeRequested && !operation.cancelRequested && !this.barrierBroken && landed(result)) {
+                this.finishFromResult(operation, markReloaded(result));
+                return;
+            }
             if (this.disposeRequested) {
                 this.finish(operation, 'cancelled', {
                     code: 'MARKET_UNLOADED',
@@ -561,7 +580,7 @@ export class DrainCoordinator {
             if (this.barrierBroken) {
                 this.finish(operation, 'failed', {
                     code: 'AGENT_BARRIER_LOST',
-                    message: 'an Agent started work while the package operation was running; verify the installed files before retrying',
+                    message: '有会话在操作进行中恢复了活动，文件可能已经改动。先在「已安装」里看看结果，等会话空闲后再试。 / A session became active while the operation ran, so files may have changed. Check Installed for the result, then retry once sessions are idle.',
                 }, null);
                 return;
             }
@@ -599,6 +618,7 @@ export class DrainCoordinator {
      */
     async drainAgents(operation) {
         operation.state = 'draining';
+        let stall = 0;
         while (!operation.cancelRequested && !this.disposeRequested && !this.barrierBroken) {
             const live = this.liveAgents();
             if (live === null)
@@ -613,14 +633,12 @@ export class DrainCoordinator {
             // turn, while the UI still called them idle. Claim only once nothing is
             // running, so waiting for one session costs the others nothing.
             const busy = unheld.some(agent => agent.status === 'running');
-            let claimed = 0;
             let waiting = unheld;
             if (!busy) {
                 for (const agent of unheld) {
                     if (operation.cancelRequested || this.disposeRequested)
                         break;
-                    if (this.claim(agent))
-                        claimed += 1;
+                    this.claim(agent);
                 }
                 const current = this.liveAgents();
                 if (current === null)
@@ -630,7 +648,8 @@ export class DrainCoordinator {
                 if (waiting.length === 0)
                     return true;
             }
-            const waitingForTurn = busy;
+            const heldBefore = this.holds.size;
+            const signature = waiting.map(agent => `${agent.id}:${String(agent.status)}`).join('\u0000');
             const activity = this.waitForActivity();
             try {
                 await Promise.race([
@@ -641,12 +660,38 @@ export class DrainCoordinator {
             finally {
                 activity.dispose();
             }
-            // A claim can fail without the Agent being busy (another maintenance
-            // task owns it). `whenIdle` then stays pending, so this yield only
-            // matters for a host that reports idle while refusing the claim. A
-            // turn that just ended retries immediately.
-            if (claimed === 0 && !waitingForTurn)
-                await new Promise(resolve => setTimeout(resolve, 25));
+            // A pass can come back with nothing changed — no hold gained and every
+            // waited-for Agent in the same state — and then re-entering the loop
+            // immediately is a busy loop. Two host shapes do that: a claim refused
+            // while the Agent reports idle (another maintenance task owns it, so
+            // `whenIdle()` resolves at once), and an Agent whose status still says
+            // `running` after its turn is over (sessions left behind by an earlier
+            // run), where `whenIdle()` also resolves at once. A profile with 81 such
+            // sessions pinned one core at 100% and grew RSS until DSH was restarted
+            // (#1134). Pause only when nothing moved: a turn that just ended changes
+            // the signature and is retried at once, which is what makes the wait end
+            // the moment the Agent is free.
+            const moved = this.holds.size !== heldBefore
+                || waiting.map(agent => `${agent.id}:${String(agent.status)}`).join('\u0000') !== signature;
+            stall = moved ? 0 : stall + 1;
+            // One pass without progress is ordinary: `whenIdle()` resolving is what
+            // the next pass claims on, and it costs nothing to retry at once. A
+            // SECOND consecutive pass with nothing changed means the wake-up came
+            // from something that will keep answering instantly — an Agent whose
+            // status still says `running` after its turn ended (sessions left behind
+            // by an earlier run), or a claim another maintenance task keeps
+            // refusing. Looping on that pinned one core at 100% and grew RSS until
+            // DSH was restarted (#1134). Pause instead; a status change or any host
+            // activity cuts the pause short, so a real turn end is claimed at once.
+            if (stall >= 2) {
+                const wake = this.waitForActivity();
+                try {
+                    await Promise.race([new Promise(resolve => setTimeout(resolve, 25)), wake.promise]);
+                }
+                finally {
+                    wake.dispose();
+                }
+            }
         }
         return false;
     }
@@ -799,6 +844,10 @@ export class DrainCoordinator {
      * succeed and hide it, so the transition itself has to stop the command.
      */
     onAgentStatus(agent, status) {
+        // Any status transition is news to whoever is waiting: a turn ending is
+        // exactly the event the drain loop is waiting for, and it also cuts short
+        // the no-progress pause (#1134).
+        this.notifyActivity();
         if (status !== 'running')
             return;
         const id = agentId(agent);

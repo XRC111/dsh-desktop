@@ -225,7 +225,7 @@ export function readUserPatchState(patchPath) {
     const inserts = [];
     let text = '';
     try {
-        text = readFileSync(patchPath, 'utf8');
+        text = readPatchText(patchPath);
     }
     catch { /* no patch file — empty state */ }
     const lines = text.split(/\r?\n/u);
@@ -579,7 +579,13 @@ export function packagePatchFlags(host, profileDirectory, names, state) {
         // host, so it is not a decision about this package (#1113): the shape a
         // package rename leaves behind.
         const applies = (id) => rowFlagApplies(state, id, composedRowName(host, id));
-        if (rows.some(id => decidedByUser(id) && applies(id) && state.disables.includes(id)))
+        // A package counts as off only when nothing of it is left running: a
+        // multi-component plugin with some components switched off is still on
+        // (#1150). One disabled row used to flip the whole package, which kept
+        // it out of 「全部更新」.
+        // Rows that name another module do not count either way (#1113).
+        const decidedRows = rows.filter(id => decidedByUser(id) && applies(id));
+        if (decidedRows.length > 0 && decidedRows.every(id => state.disables.includes(id)))
             disabled.push(name);
         if (rows.some(id => decidedByUser(id) && applies(id) && state.forced.includes(id)))
             forced.push(name);
@@ -712,6 +718,20 @@ function lastRowFlag(text, rowId, expected = null) {
  * `EACCES: permission denied, open '…'` reaching the UI tells a user nothing
  * they can act on, while the plugin's actual state has already changed.
  */
+/**
+ * The user patch as text, without a leading UTF-8 BOM.
+ *
+ * Windows Notepad saves UTF-8 with one, and `readFileSync` keeps it. js-yaml
+ * and the host strip it, so the host saw the first row while every
+ * `^`-anchored scan here missed it: a first `- id:` read as absent, and a
+ * first `[]` was not recognised as the placeholder, so a toggle appended
+ * after it and wrote a second top-level node. The market's own writes drop
+ * the BOM from then on. Throws like `readFileSync` when the file is missing.
+ */
+function readPatchText(patchPath) {
+    const text = readFileSync(patchPath, 'utf8');
+    return text.startsWith('﻿') ? text.slice(1) : text;
+}
 function writePatchFile(patchPath, contents) {
     try {
         writeFileSync(patchPath, contents);
@@ -733,7 +753,7 @@ function writePatchFile(patchPath, contents) {
 function appendPatchEntry(patchPath, block) {
     let text = '';
     try {
-        text = readFileSync(patchPath, 'utf8');
+        text = readPatchText(patchPath);
     }
     catch { /* created below */ }
     const core = text.trim();
@@ -796,7 +816,7 @@ export function disableRow(patchPath, rowId, options = {}) {
         }
         const text = (() => {
             try {
-                return readFileSync(patchPath, 'utf8');
+                return readPatchText(patchPath);
             }
             catch {
                 return '';
@@ -854,7 +874,7 @@ export function enableRow(patchPath, rowId, options = {}) {
         const state = withoutMismatchedRow(readUserPatchState(patchPath), rowId, expected);
         const text = (() => {
             try {
-                return readFileSync(patchPath, 'utf8');
+                return readPatchText(patchPath);
             }
             catch {
                 return '';
@@ -912,7 +932,7 @@ function withPlaceholderRestored(text) {
 export function removeRowBlocks(patchPath, rowIds) {
     let text = '';
     try {
-        text = readFileSync(patchPath, 'utf8');
+        text = readPatchText(patchPath);
     }
     catch {
         return { ok: true, reason: null };

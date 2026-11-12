@@ -68,14 +68,15 @@ param(
     # nightly：从 harness master 源码编译（官方 npm 无 nightly 标签）。
     # 用独立 minor 10.4.x，避免与 stable(10.1)/beta(10.2)/dev(10.3) 撞号。
     [string]$NightlyVersion    = '10.4.0',
-    # dsh 版本矩阵（2026-11-07 跟进上游 0.2.2-rc.1）
-    #   stable/beta 从 0.2.1-rc.4 升到 0.2.2-rc.1；上一版 stable 运行时是 0.2.1-rc.4，
-    #   stable -> 0.2.2-rc.1   （官方 latest/next 两个 dist-tag 都指向它，npm 2026-11-04 发布）
-    #   beta   -> 0.2.2-rc.1   （与 stable 同线：上游 next 也指向 rc.1）
-    #   dev    -> 0.2.2-alpha.3（官方 alpha dist-tag，跟进上游最新 alpha）
+    # dsh 版本矩阵（2026-11-12 跟进上游 0.2.2-rc.2）
+    #   stable -> 0.2.2-rc.1   （官方 latest 仍指向它，npm 2026-11-04 发布；本次不动）
+    #   beta   -> 0.2.2-rc.2   （官方 next，npm 2026-11-11 发布，从 rc.1 升上来）
+    #   dev    -> 0.2.2-alpha.3（官方 alpha dist-tag，未变）
     # ⚠️ 跟版必须**显式指定版本号**，不能从 latest/next 自动推导。
+    # ⚠️ 这次 next 越过了 latest：升级/回滚差分一律以 MainDshVersion(stable) 为准，
+    #    rt-021 等差分源是 stable 的历史基线，不要因为 beta 升了就动它们。
     [string]$MainDshVersion    = '0.2.2-rc.1',     # 主线 stable 内嵌 dsh（resources\dsh-runtime）
-    [string]$NextTreeDshVersion = '0.2.2-rc.1',    # build\rt-next 期望版本（beta）
+    [string]$NextTreeDshVersion = '0.2.2-rc.2',    # build\rt-next 期望版本（beta）
     [string]$DevDshVersion     = '0.2.2-alpha.3',  # build\rt-alpha 期望版本（dev）
     # 安装包外链（网盘直链）：填了就挂进对应 feed 的 files 块，客户端走外链下载安装包，
     # sha256/size 自动从 dist 同名安装包补齐（下载完照常哈希校验）。留空 = 空骨架

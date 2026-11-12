@@ -722,6 +722,38 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
             return;
         logEvent('warn', 'toggle', `${name}: kept off by this market's own record, while ${homePatchPath} enables it — that layer is not the one the market writes, so the market will not follow it. Move the row into this profile's cordis.patch.yml to make it stick (#519)`);
     }
+    /**
+     * Replay one switched-off package at boot, carrier-safe.
+     *
+     * The disable list only names a package, while a CARRIER bundle's patch
+     * also rewires foreign rows: it disables stock rows or gives them an
+     * `inject:` for a service the bundle's own gate entry provides. Disabling
+     * every matching entry would stop that gate too (the gate entry's name is
+     * `<pkg>/<row>`, so it matches the package), and the foreign rows would
+     * wait forever for a service that no longer exists — every preset pending.
+     *
+     * While such a bundle still sits in dsh.profile.bundles (an interrupted or
+     * older toggle can leave the list and the stack out of sync), reconcile it
+     * the same way the live toggle route does: remove the whole bundle so its
+     * entire patch stops applying on the next composition. Ordinary packages
+     * keep the best-effort entry disable they always had.
+     *
+     * The bundle removal edits the manifest for the NEXT composition; the
+     * current process already loaded the bundle, which is the same restart
+     * contract a live carrier toggle already has.
+     */
+    async function replayDisabledPackage(name) {
+        const carrierRows = carrierRowIds(activeProfileDir, name);
+        if (carrierRows.length > 0
+            && declaresBundle(activeProfileDir, name)
+            && readProfileBundles(activeProfileDir).includes(name)) {
+            removeProfileBundle(activeProfileDir, name);
+            logEvent('info', 'boot', `${name}: carrier removed from dsh.profile.bundles during boot replay (carrier rows: ${carrierRows.join(', ')}) — restart to finish; its gate is not disabled`);
+            return;
+        }
+        if (await themes.setEntryDisabled(name, true))
+            logEvent('info', 'boot', `plugin kept off: ${name}`);
+    }
     // Client-only packages (dsh.client without dsh.bundle) are invisible to the
     // bundle layer in every boot; the market shim-mounts them so their client
     // bundles are actually served.
@@ -736,8 +768,7 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
             if (followOutsideEnable(name))
                 continue;
             noteHomeLayerConflict(name);
-            if (await themes.setEntryDisabled(name, true))
-                logEvent('info', 'boot', `plugin kept off: ${name}`);
+            await replayDisabledPackage(name);
         }
     });
     // Self-healing guard: dsh's own patch overlay can re-update entries during
@@ -746,8 +777,15 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
     host.on?.('internal/plugin', (payload) => {
         const fiber = payload;
         const name = fiber.entry?.options?.name;
-        if (name !== undefined && disabled.has(name) && !followOutsideEnable(name))
-            void themes.setEntryDisabled(name, true);
+        if (name === undefined || !disabled.has(name) || followOutsideEnable(name))
+            return;
+        // A carrier is reconciled by removing its bundle for the next
+        // composition, not by disabling its entries. Pushing a matching entry
+        // back down here would stop the gate foreign rows inject and re-strand
+        // them in the running process; let the restart finish the switch.
+        if (carrierRowIds(activeProfileDir, name).length > 0 && declaresBundle(activeProfileDir, name))
+            return;
+        void themes.setEntryDisabled(name, true);
     });
     let installing = false;
     let restarting = false;
@@ -843,6 +881,10 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                 // The long-standing lock response stays byte-identical for ordinary
                 // contention; the drain reservation is the one callers can tell apart.
                 ...(drainReserved ? { failureCode: 'OPERATION_BUSY' } : {}),
+                // Another operation of OURS is running, not a failure: the queue waits
+                // for it instead of re-showing "another operation is running" on every
+                // retry (#1140). Additive — the fields above are unchanged.
+                busy: true,
                 error: kind === 'install' ? 'another install is already running' : 'another plugin operation is running',
             });
             return null;
@@ -922,6 +964,19 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
         let reason;
         if (enabled) {
             if (listHotMounts().includes(name)) {
+                ok = true;
+            }
+            else if (carrierRowIds(dir, name).length > 0) {
+                // A carrier replaces something: its patch disables stock rows and its
+                // own rows stand in for them, with `disabled: !!js …` guards deciding
+                // which of the two is live on THIS host. Driving those rows up in the
+                // running process clears the guards and mounts the replacement beside
+                // the stock row — a second copy of a module the host already holds
+                // (`storage form 'domain' is already mounted`), which dsh answers by
+                // exiting (#1175). Enabling is the mirror of the disable branch below
+                // (#1010): the swap needs one composition, and a carrier switch is
+                // already reported as "restart to apply" — so nothing is gained by
+                // doing it live, and the host can die trying.
                 ok = true;
             }
             else if (await themes.setEntryDisabled(name, false)) {
@@ -3222,12 +3277,22 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                         sendJson(response, 200, { compatibleVersion: null, reason: 'installed-version-unknown' });
                         return;
                     }
-                    const compatibleVersion = await findCompatibleVersion(npmName, host.version, corePackageNames(host.directory ?? null), routesFor(region).npmRegistry, undefined, currentVersion);
+                    // The update route's own rule (#991): the Desktop moves a stable npm
+                    // install only to a stable release, so a prerelease found here would
+                    // be an enabled button that answers 409 (#1161).
+                    const stableOnly = upgradeOnly && config.desktopHost === true && !SELF_NAMES.has(npmName)
+                        && isStableReleaseVersion(currentVersion);
+                    const compatibleVersion = await findCompatibleVersion(npmName, host.version, corePackageNames(host.directory ?? null), routesFor(region).npmRegistry, undefined, currentVersion, stableOnly);
                     // A compatible version is only advice until the release-age gate
                     // agrees: the dialog says "update to X", and clicking that used to
                     // dead-end on a 409 the log never mentioned. Answer both questions
                     // here, where the caller can say "in about N hours" up front.
-                    const maturity = compatibleVersion === null
+                    // An update on a CLI host has the one-shot release-age bypass (#39)
+                    // and installs a young release, the same reason checkUpdates holds
+                    // young releases on the Desktop only: there "held" would disable an
+                    // Update button that works.
+                    const ageGated = !upgradeOnly || config.desktopHost === true;
+                    const maturity = compatibleVersion === null || !ageGated
                         ? null
                         : await readVersionMaturity(npmName, compatibleVersion, config.profile, activeProfileDir);
                     logEvent('info', 'find-compatible', `${npmName}: host=${host.version}, after=${currentVersion ?? 'none'} → ${compatibleVersion ?? 'none'}`
@@ -4317,7 +4382,13 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                     // exits, install post-processing (retarget, validation, hot-mount)
                     // still holds the operation lock for a moment — the exact window
                     // where clicking the restart banner used to bounce off a 409 (#91).
-                    busy: installing || preflightActive > 0,
+                    busy: installing || preflightActive > 0
+                        // The official Desktop manager runs its own operations (an
+                        // install, or the repair of one an earlier start interrupted).
+                        // While it does, every market command is refused with
+                        // `busy: true` — so the status has to say the same, or the
+                        // client's queue retries into that refusal every 2s (#1140).
+                        || commandRuntime?.busy?.() === true,
                     // Queue drain signal for the client's install queue: the agent-file
                     // guard values are already computed for every status poll, so the
                     // client can decide when a queued operation may run without an
@@ -6132,6 +6203,25 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                         const ignoredBuilds = ok || cancelled || !failedOnBlockedBuilds(result) ? undefined : blockedBuilds(result);
                         if (ok)
                             clearBrokenPlugin(name);
+                        // #1093: the same leftover rows, on the update side. The old
+                        // version's `minimumReleaseAgeExclude` row outlives the update and
+                        // points at a build that is no longer on disk. Rows naming the
+                        // version that IS installed stay: a fresh release may need exactly
+                        // that row at the next install.
+                        if (ok && !restore) {
+                            try {
+                                const installedNow = readInstalledVersion(config.profile, name, activeProfileDir);
+                                if (installedNow !== null) {
+                                    const staleExcludes = dropReleaseAgeExcludes(config.profile, name, activeProfileDir, installedNow);
+                                    if (staleExcludes.length > 0) {
+                                        logEvent('info', 'update', `${name}: dropped ${String(staleExcludes.length)} minimumReleaseAgeExclude row(s) for versions no longer installed`);
+                                    }
+                                }
+                            }
+                            catch (error) {
+                                logEvent('warn', 'update', `${name}: could not clear old minimumReleaseAgeExclude rows — ${error instanceof Error ? error.message : String(error)}`);
+                            }
+                        }
                         // A package still installed but no longer in dsh.profile.bundles
                         // after this run stops loading and says nothing (#720). The market
                         // does not write that list from anything but the current list, so
@@ -7365,6 +7455,8 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                     sendJson(response, 403, { error: 'untrusted origin' });
                     return;
                 }
+                // Set once the package is on disk, so a failure after that point is not reported as a failed install.
+                let installLanded = false;
                 try {
                     const body = (await readJsonBody(request));
                     const drainCall = drainCallOf(request);
@@ -7763,6 +7855,7 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                         let compatibility;
                         let addedPackages = [];
                         if (ok) {
+                            installLanded = true;
                             const added = Object.keys(installed).filter(name => !before.has(name));
                             addedPackages = added;
                             if (added.length > 0) {
@@ -7900,8 +7993,25 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                                 }
                             }
                         }
-                        if (ok)
-                            clearBrokenPlugin(entry.name);
+                        // #1164: brokenPlugins is keyed by the PROFILE DEPENDENCY name —
+                        // the update path drops the declaration and records `name` there,
+                        // so the notice can be found by the package the user actually has.
+                        // A catalog entry is not that key: `entry.name` is the DISPLAY
+                        // name (the GitHub repo's casing, e.g. "DSH-better-sidebar") while
+                        // the package it installs is `entry.npm`. Clearing by the display
+                        // name was a silent no-op for every entry whose two differ, so the
+                        // spent notice outlived reloads, restarts and market upgrades
+                        // until the user dismissed it by hand. Clear by what this run
+                        // actually put into the profile, plus the entry's own package name
+                        // (a git-source entry has no `npm`, and `addedPackages` is empty
+                        // when the recovery path re-added a name the snapshot already had).
+                        if (ok) {
+                            const reinstalled = new Set(addedPackages);
+                            if (npmName !== null)
+                                reinstalled.add(npmName);
+                            for (const pkg of reinstalled)
+                                clearBrokenPlugin(pkg);
+                        }
                         logEvent(ok || cancelled ? 'info' : 'error', 'install', `${target} exit=${String(result.exitCode)}${result.timedOut ? ' TIMEOUT' : ''}${cancelled ? ' CANCELLED' : ''}${ok ? ` hot=${String(hot)}` : cancelled ? '' : ` err=${failureDetail(result)}`}`);
                         // On success a skipped build is a notice (#6); after a FAILURE the
                         // list is what offers the approve-and-retry banner, so it is sent
@@ -7992,6 +8102,15 @@ export function mountMarketRoutes(host, config, commandRuntime, agentsLookup, ho
                     if (!inProbe())
                         host.logger?.warn(`[dsh-market] install failed: ${message}`);
                     logEvent('error', 'install', `route error: ${message}`);
+                    // A plugin that brings its own host half can make the host reload the
+                    // market while this request is still checking the result. The old
+                    // instance is gone, so what it throws now says nothing about the
+                    // install: the package landed, and the new instance reports the
+                    // real state of the plugin on the next refresh.
+                    if (installLanded && disposed) {
+                        sendJson(response, 200, { ok: true, hot: true, marketReloaded: true });
+                        return;
+                    }
                     sendJson(response, 500, { error: message });
                 }
             },

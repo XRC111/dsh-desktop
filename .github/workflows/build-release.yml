@@ -199,16 +199,16 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       # ── 3) dsh 运行时树（被 gitignore，CI 必须自己拉）────────────────────
-      #   0.2.2-rc.1    → stable 线（resources/dsh-runtime）
-      #   0.2.2-rc.1    → beta 线（build/rt-next）
+      #   0.2.2-rc.1    → stable 线（resources/dsh-runtime，官方 latest）
+      #   0.2.2-rc.2    → beta 线（build/rt-next，官方 next，2026-11-11 发布）
       #   0.2.2-alpha.3 → dev 线（build/rt-alpha）
       - name: 拉取 dsh 运行时树
         shell: pwsh
         run: |
           # 主线 stable 树：装到 resources/dsh-runtime
           node scripts/fetch-dsh.mjs --to resources/dsh-runtime --version 0.2.2-rc.1
-          # beta / dev 树：beta=0.2.2-rc.1，dev=0.2.2-alpha.3
-          node scripts/fetch-dsh.mjs --to build/rt-next  --version 0.2.2-rc.1
+          # beta / dev 树：beta=0.2.2-rc.2，dev=0.2.2-alpha.3
+          node scripts/fetch-dsh.mjs --to build/rt-next  --version 0.2.2-rc.2
           node scripts/fetch-dsh.mjs --to build/rt-alpha --version 0.2.2-alpha.3
           # 升级差分源：0.1.5-rc.3 / 0.2.0-rc.2（更老的存量用户）与 0.2.1-rc.4（上一版 stable）
           node scripts/fetch-dsh.mjs --to build/rt-015 --version 0.1.5-rc.3

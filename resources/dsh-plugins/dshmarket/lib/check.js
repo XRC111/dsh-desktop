@@ -340,7 +340,7 @@ function parseSemver(value) {
  * (`>=1.2.0 <1.3.0`), so it stays as is and parses as unknown below rather
  * than being mistaken for the exact version `1.2.0`.
  */
-function expandPartialComparator(part, includePrerelease) {
+export function expandPartialComparator(part, includePrerelease) {
     const m = /^(\^|~|>=|<=|>|<)(\d+)(?:\.(\d+))?$/u.exec(part.trim());
     if (m === null)
         return [part];
