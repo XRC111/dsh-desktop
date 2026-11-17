@@ -15,6 +15,7 @@
 
 ---
 
+
 ## 简介
 
 [DeepSeek Harness](https://github.com/deepseek-ai)（dsh）是一个能力很强、但需要命令行和 Node 环境的 AI 编程代理。**DSH Desktop 不修改 Harness 一行源码**，只做一层桌面外壳：
